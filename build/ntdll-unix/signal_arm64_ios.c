@@ -2443,6 +2443,117 @@ extern void *ios_jit_current_peb(void);   /* virtual_ios.c */
 extern int ios_jit_pool_pc_is_fex( uintptr_t pc );   /* virtual_ios.c */
 static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via, void *peb );
 
+/* ios-trunc-ptr:begin
+ *
+ * Truncated stack pointers (ported from Spark, an Iridium fork).
+ *
+ * Windows gives a 64-bit process whose image lacks HIGH_ENTROPY_VA stacks and
+ * heaps that sit below 4 GB, and a game built for that can keep a pointer in a
+ * 32-bit slot: the caller does `mov ecx,[rax]` and the callee dereferences rcx.
+ * MX Bikes does exactly that with the address of a local (rcx=0x3083d320 while
+ * the stack address is 0x13083d320; the same function, the same fault, in two
+ * runs). iOS keeps the low 4 GB out of the address space, so the stack can
+ * never be placed there and the dereference faults.
+ *
+ * The truncated value keeps the low 32 bits of the real address, and a stack
+ * object is always within a few MB of the guest RSP, so the missing high bits
+ * are recoverable: take them from RSP and keep the candidate only if it lands
+ * in a plausible stack window around RSP. The caller still checks that the
+ * candidate is mapped before touching it. Pure function so a host test can
+ * compile it on its own; guest_rsp is FEX's RSP register (x23) at the fault.
+ *
+ * Returns the full address, or 0 when `addr` cannot be a truncated stack
+ * pointer. The window is [rsp - 64 KB, rsp + 16 MB): the default stack is
+ * 8 MB, and a slot boundary between RSP and the object is covered by also
+ * trying the neighbouring 4 GB slots. */
+#define IOS_TRUNC_PTR_BELOW   0x10000ull
+#define IOS_TRUNC_PTR_ABOVE   0x1000000ull
+static uint64_t ios_trunc_ptr_candidate( uint64_t guest_rsp, uint64_t addr )
+{
+    const uint64_t slot = 0x100000000ull;
+    uint64_t hi, cand;
+    int i;
+
+    if (addr < 0x10000ull || addr >= slot) return 0;   /* NULL-ish or not low */
+    if (guest_rsp < slot) return 0;                    /* no high bits to borrow */
+    hi = guest_rsp & ~(slot - 1);
+    for (i = -1; i <= 1; i++)
+    {
+        cand = (uint64_t)((int64_t)hi + (int64_t)i * (int64_t)slot) + addr;
+        if (cand >= guest_rsp - IOS_TRUNC_PTR_BELOW && cand < guest_rsp + IOS_TRUNC_PTR_ABOVE)
+            return cand;
+    }
+    return 0;
+}
+/* ios-trunc-ptr:end */
+
+/* MADEIRA_TRUNC_PTR=0 turns the recovery off. */
+static int ios_trunc_ptr_enabled( void )
+{
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv( "MADEIRA_TRUNC_PTR" ); enabled = !(e && e[0] == '0'); }
+    return enabled;
+}
+
+/* Spark: per-thread x18 trampoline slots are handed out once per thread for
+ * the session (virtual_ios.c, IOS_JIT_MAX_SLOTS). After the last fresh slot a
+ * new thread used to share slot 0 with the first thread, overwriting its TEB.
+ * Record each slot's owner and, once the fresh slots are gone, take over the
+ * slot of an exited thread instead (a dead thread cannot run its trampoline).
+ * Slot 0 is never reused. Falls back to slot 0, as before, when every owner is
+ * alive. MADEIRA_TRAMP_REUSE=0 turns the reuse off. */
+extern int ios_jit_alloc_trampoline_slot_or_fail(void);   /* virtual_ios.c */
+extern int ios_jit_trampoline_slot_limit(void);           /* virtual_ios.c */
+static thread_t ios_tramp_owner[1024];
+
+static int ios_tramp_port_dead( thread_t port )
+{
+    struct thread_basic_info info;
+    mach_msg_type_number_t length = THREAD_BASIC_INFO_COUNT;
+    kern_return_t kr;
+
+    if (!port) return 0;   /* never handed out */
+    kr = thread_info( port, THREAD_BASIC_INFO, (thread_info_t)&info, &length );
+    return kr == KERN_INVALID_ARGUMENT || kr == MACH_SEND_INVALID_DEST || kr == KERN_TERMINATED;
+}
+
+static int ios_alloc_thread_trampoline( thread_t self )
+{
+    static unsigned int reused;
+    static int enabled = -1;
+    int limit = ios_jit_trampoline_slot_limit(), slot, i;
+
+    if (limit > (int)(sizeof(ios_tramp_owner) / sizeof(ios_tramp_owner[0])))
+        limit = sizeof(ios_tramp_owner) / sizeof(ios_tramp_owner[0]);
+    /* Keep the owner's port name alive (and dead once it exits) so it cannot be
+     * recycled to a live thread while it is recorded here. */
+    mach_port_mod_refs( mach_task_self(), self, MACH_PORT_RIGHT_SEND, 1 );
+    slot = ios_jit_alloc_trampoline_slot_or_fail();
+    if (slot >= 0)
+    {
+        if (slot < limit) ios_tramp_owner[slot] = self;
+        return slot;
+    }
+    if (enabled < 0) { const char *e = getenv( "MADEIRA_TRAMP_REUSE" ); enabled = !(e && e[0] == '0'); }
+    if (enabled)
+    {
+        for (i = 1; i < limit; i++)
+        {
+            thread_t old = ios_tramp_owner[i];
+
+            if (!old || old == self || !ios_tramp_port_dead( old )) continue;
+            if (!__sync_bool_compare_and_swap( &ios_tramp_owner[i], old, self )) continue;
+            if (++reused <= 8 || !(reused & 255))
+                ERR( "[tramp-slot] reused slot %d of exited thread 0x%x for 0x%x, %u reused\n",
+                     i, old, self, reused );
+            return i;
+        }
+    }
+    ERR( "[tramp-slot] all %d slots taken%s -- thread 0x%x shares slot 0\n",
+         limit, enabled ? " by live threads" : " (MADEIRA_TRAMP_REUSE=0)", self );
+    return 0;
+}
+
 /* LSE read-modify-write atomics for the Mach alias-store emulator, each done as
  * ONE host atomic on the RW alias, which maps the same physical pages as the
  * view that faulted:
@@ -3775,6 +3886,7 @@ static void *ios_mach_exception_thread( void *arg )
                  * an access that starts inside an allocation but runs off its
                  * end is still refused there rather than resolved. */
                 int sf_low = 0;
+                int sf_trunc = 0;
                 /* literal because IOS_SUBFLOOR_FLOOR is defined further down
                  * this file; same value (0x100000000). */
                 if (!sf_real && (uint64_t)fault_addr < 0x100000000ull)
@@ -3784,9 +3896,16 @@ static void *ios_mach_exception_thread( void *arg )
                                                        unsigned long long *real_out,
                                                        void **owner_out );
                     sf_low = ios_lowalloc_translate( (uint64_t)fault_addr, 1, NULL, NULL );
+                    /* Spark: a truncated stack pointer (see ios_trunc_ptr_candidate).
+                     * x23 is FEX's guest RSP register, so this only means
+                     * something for a fault taken in translated code; the service
+                     * function re-checks the PC before it acts on it. */
+                    if (!sf_low && ios_trunc_ptr_enabled())
+                        sf_trunc = ios_trunc_ptr_candidate( (uint64_t)state.__x[23],
+                                                            (uint64_t)fault_addr ) != 0;
                 }
 
-                if (sf_real || sf_low)
+                if (sf_real || sf_low || sf_trunc)
                 {
                     /* The emulators take a ucontext. arm_thread_state64_t IS the
                      * struct a ucontext's mcontext embeds as __ss, and
@@ -14831,7 +14950,25 @@ static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *
                                            unsigned long long *real_out, void **owner_out );
         unsigned long long lo_real = 0;
         void *lo_owner = NULL;
-        if (ios_lowalloc_translate( addr, span, &lo_real, &lo_owner ))
+        uint64_t tp_real = 0;
+
+        /* Spark: a truncated stack pointer. x23 is FEX's guest RSP only in
+         * translated code, so the PC has to be in the JIT pool or region C. */
+        if (ios_trunc_ptr_enabled() && ios_fault_pc_is_jit( (uint64_t)PC_sig(ctx) ) &&
+            !ios_lowalloc_translate( addr, 1, NULL, NULL ))
+            tp_real = ios_trunc_ptr_candidate( REGn_sig( 23, ctx ), addr );
+
+        if (tp_real)
+        {
+            static unsigned long long tp_hits;
+            real = (uintptr_t)tp_real;
+            if (tp_hits++ < 16 || (tp_hits & 0xFFF) == 0)
+                dprintf( 2, "[trunc-ptr] resolved %llu access(es) through a 32-bit-truncated stack "
+                         "pointer; latest guest %#llx -> %#llx (guest rsp %#llx, pc %#llx, via=%s)\n",
+                         tp_hits, (unsigned long long)addr, (unsigned long long)tp_real,
+                         (unsigned long long)REGn_sig( 23, ctx ), (unsigned long long)PC_sig(ctx), via );
+        }
+        else if (ios_lowalloc_translate( addr, span, &lo_real, &lo_owner ))
         {
             static unsigned long long la_hits;
             real = (uintptr_t)lo_real;
@@ -16831,7 +16968,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
         extern void ios_jit_set_teb_slot(int slot, uintptr_t teb);
         extern void *ios_jit_get_trampoline(int slot);
 
-        ios_my_slot = ios_jit_alloc_trampoline_slot();
+        ios_my_slot = ios_alloc_thread_trampoline( pthread_mach_thread_np( pthread_self() ) );
         ios_jit_set_teb_slot(ios_my_slot, (uintptr_t)teb);
         ios_my_trampoline = ios_jit_get_trampoline(ios_my_slot);
         ERR("init_syscall_frame: allocated trampoline slot %d, tramp=%p, teb=%p\n",

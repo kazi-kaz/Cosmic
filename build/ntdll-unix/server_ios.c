@@ -5262,7 +5262,10 @@ NTSTATUS unixcall_wine_server_handle_to_fd( void *args )
 int server_pipe( int fd[2] )
 {
     int ret;
-#ifdef HAVE_PIPE2
+    /* iOS (from Spark): config.h comes from a macOS configure run, so HAVE_PIPE2
+     * can be set although pipe2() is weak-linked and NULL on older iOS releases.
+     * Always use pipe() + fcntl() on iOS. */
+#if defined(HAVE_PIPE2) && !defined(WINE_IOS)
     static BOOL have_pipe2 = TRUE;
 
     if (have_pipe2)
@@ -6882,6 +6885,7 @@ void server_init_process_done(void)
         /* ml875 [thread-sample]: ONE task-wide sampler (ml873 armed seven, one
          * per pseudo-process, each suspending the others' threads). Body in
          * ios_thread_sampler_main() above. */
+        /* Cosmic: Spark's MADEIRA_NO_PROBES (Quiet Diagnostics) reads as MADEIRA_PROBES=light below. */
         if (__sync_bool_compare_and_swap(&ios_ts_armed, 0, 1))
         {
             /* Madeira: MADEIRA_PROBES picks which always-on profilers start,
@@ -6891,7 +6895,7 @@ void server_init_process_done(void)
              * thread 4x per 20 s and the guest RIP profile suspends the game's
              * threads 200x in a second after that -- cheap, but not free on a
              * device whose efficiency cores are saturated (a heavy game at 1080p). */
-            const char *probes_env = getenv("MADEIRA_PROBES");
+            const char *probes_env = getenv("MADEIRA_PROBES") ?: (getenv("MADEIRA_NO_PROBES") ? "light" : NULL);
             int probes = !probes_env || !*probes_env ? 2 : !strcmp(probes_env, "0") ? 0 : !strcmp(probes_env, "light") ? 1 : 2;
             /* 1: no thread-suspending samplers ([thread-sample], [rip-profile], [cpu-split], [wprof]) and rare memory walks; [xp] unchanged */
             const char *lean_env = getenv("MADEIRA_LEAN_DIAG");

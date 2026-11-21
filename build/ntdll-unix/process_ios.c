@@ -1021,7 +1021,7 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
     pid_t pid, wret;
     int fd[2], status, err;
 
-#ifdef HAVE_PIPE2
+#if defined(HAVE_PIPE2) && !defined(WINE_IOS)
     if (pipe2( fd, O_CLOEXEC ) == -1)
 #endif
     {
@@ -1127,7 +1127,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
     char **argv;
     NTSTATUS status = STATUS_SUCCESS;
 
-#ifdef HAVE_PIPE2
+#if defined(HAVE_PIPE2) && !defined(WINE_IOS)
     if (pipe2( fd, O_CLOEXEC ) == -1)
 #endif
     {
@@ -1281,6 +1281,63 @@ static int ec_conhost_refuse( int arm64ec_session, const char *env, const WCHAR 
 static int ec_native_child_refuse( int arm64ec_session, const char *env, USHORT machine )
 {
     return arm64ec_session && machine == IMAGE_FILE_MACHINE_ARM64 && !(env && env[0] == '1');
+}
+
+/* cmd.exe started only to print "ver". CPython 3.9's platform.win32_ver()
+ * runs `cmd.exe /c "ver"` on every call, uncached, and Ren'Py 8 calls it three
+ * times at startup. Each child copies ~35 MB of DLLs into the 256 MB JIT pool
+ * and takes a 16 MB code buffer; ranges freed by an exited child lose their
+ * exec permission and are dropped, so three children filled the pool and the
+ * game then crashed loading its own DLLs (The Tribe, 2026-11-03). Refused,
+ * CreateProcess fails and Python falls back to sys.getwindowsversion(), which
+ * is what it does when "ver" fails on Windows; its two fallback spellings
+ * ("command /c ver", "cmd /c ver") are refused too. MADEIRA_CMD_VER=1 starts
+ * them anyway. Only an exact "ver" payload matches; any other cmd.exe runs. */
+static int ios_wstr_eq_nocase( const WCHAR *s, int len, const char *lit )
+{
+    int n = (int)strlen( lit ), k;
+
+    if (len != n) return 0;
+    for (k = 0; k < n; k++)
+    {
+        WCHAR c = s[k];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c != (WCHAR)lit[k]) return 0;
+    }
+    return 1;
+}
+
+static int cmd_ver_refuse( const char *env, const WCHAR *image, int image_len,
+                           const WCHAR *cmdline, int cmd_len )
+{
+    static const char * const payloads[] = { "ver", "command /c ver", "cmd /c ver" };
+    int k, start, end;
+    unsigned int p;
+
+    if (env && env[0] == '1') return 0;
+    if (!ios_image_name_is( image, image_len, "cmd.exe" ) || !cmdline || cmd_len <= 0) return 0;
+    /* skip argv[0], quoted or not */
+    k = 0;
+    while (k < cmd_len && cmdline[k] == ' ') k++;
+    if (k < cmd_len && cmdline[k] == '"')
+    {
+        for (k++; k < cmd_len && cmdline[k] != '"'; k++) ;
+        if (k < cmd_len) k++;
+    }
+    else while (k < cmd_len && cmdline[k] != ' ') k++;
+    while (k < cmd_len && cmdline[k] == ' ') k++;
+    /* "/c" or "/C" */
+    if (k + 2 > cmd_len || cmdline[k] != '/' || (cmdline[k + 1] != 'c' && cmdline[k + 1] != 'C')) return 0;
+    k += 2;
+    if (k < cmd_len && cmdline[k] != ' ' && cmdline[k] != '"') return 0;
+    while (k < cmd_len && cmdline[k] == ' ') k++;
+    start = k;
+    end = cmd_len;
+    while (end > start && (cmdline[end - 1] == ' ' || cmdline[end - 1] == 0)) end--;
+    if (end - start >= 2 && cmdline[start] == '"' && cmdline[end - 1] == '"') { start++; end--; }
+    for (p = 0; p < sizeof(payloads) / sizeof(payloads[0]); p++)
+        if (ios_wstr_eq_nocase( cmdline + start, end - start, payloads[p] )) return 1;
+    return 0;
 }
 
 /* madeira-bcd: the JIT pool's variables in every child's environment. The app
@@ -2008,6 +2065,17 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         dprintf(2, "[proc-gate] REFUSING spawn of %s (conhost in an ARM64EC session: it is aarch64 and "
                 "its threads have no CPU area for the emulator loaded into it; env.MADEIRA_EC_CONHOST=1 "
                 "starts it)\n", debugstr_us( &params->ImagePathName ));
+        return STATUS_ACCESS_DENIED;
+    }
+
+    /* cmd.exe /c ver is refused (see cmd_ver_refuse); MADEIRA_CMD_VER=1 starts it. */
+    if (cmd_ver_refuse( getenv( "MADEIRA_CMD_VER" ), params->ImagePathName.Buffer,
+                        params->ImagePathName.Length / sizeof(WCHAR),
+                        params->CommandLine.Buffer, params->CommandLine.Length / sizeof(WCHAR) ))
+    {
+        dprintf(2, "[proc-gate] REFUSING spawn of %s /c ver (each child costs ~50 MB of JIT "
+                "pool that is not given back; the caller falls back to GetVersionEx; "
+                "env.MADEIRA_CMD_VER=1 starts it)\n", debugstr_us( &params->ImagePathName ));
         return STATUS_ACCESS_DENIED;
     }
 
@@ -3889,6 +3957,49 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                 handle, (unsigned int)exit_code,
                 (unsigned long long)g_wine_dispatcher_count,
                 (unsigned long long)g_wine_unix_call_count);
+            /* iOS-Madeira: FEX's Windows shims end the process from an
+             * unimplemented API with 0xFE000000 | file tag << 16 | __LINE__
+             * (Source/Windows/Common/Priv.h, UNIMPLEMENTED()). Name it, since
+             * the status means nothing to Wine. 0xfe63002c, WinAPI/Misc.cpp:44,
+             * is RaiseException: a C++ throw inside the CPU backend. */
+            if (((unsigned int)exit_code & 0xff000000u) == 0xfe000000u)
+                dprintf( 2, "[fex-unimpl] exit 0x%08x is FEX's UNIMPLEMENTED() stub: file tag '%c', "
+                            "line %u (Common/WinAPI/Misc.cpp:44 = RaiseException, a C++ throw)\n",
+                         (unsigned int)exit_code,
+                         (char)(((unsigned int)exit_code >> 16) & 0x7f) >= 0x20 ?
+                             (char)(((unsigned int)exit_code >> 16) & 0x7f) : '?',
+                         (unsigned int)exit_code & 0xffffu );
+            /* task #24: Thumper's settings page deliberately calls
+             * ExitProcess(-1) from a fresh thread with no preceding
+             * exception — the deciding code is invisible. Dump the calling
+             * thread's guest x64 state: RIP, gregs, and return-address-
+             * looking qwords on the guest stack (attributed offline via the
+             * [jit-pool]/load-order tables). FEX state layout: rip@0x18,
+             * gregs@0x20 (CoreState.h); cpuarea+0x30 = FEX state ptr (same
+             * offset the [fault_rip] probe uses). dprintf not ERR — this
+             * must survive err-channel muting. */
+            {
+                TEB *cur_teb = NtCurrentTeb();
+                CHPE_V2_CPU_AREA_INFO *cpuarea = cur_teb ? cur_teb->ChpeV2CpuAreaInfo : NULL;
+                void *fex_state = cpuarea ? *(void **)((char *)cpuarea + 0x30) : NULL;
+                if (fex_state)
+                {
+                    const uint64_t *fx = (const uint64_t *)fex_state;
+                    uint64_t rip = fx[0x18 / 8];
+                    const uint64_t *gregs = &fx[0x20 / 8];
+                    uint64_t sbase = (uint64_t)cpuarea->EmulatorStackBase;
+                    uint64_t slimit = (uint64_t)cpuarea->EmulatorStackLimit;
+                    uint64_t rsp = 0;
+                    int gi, hits = 0;
+                    dprintf(2, "[term-stack] rip=%llx stack=[%llx..%llx]\n",
+                            (unsigned long long)rip, (unsigned long long)slimit,
+                            (unsigned long long)sbase);
+                    dprintf(2, "[term-stack] g0-7: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                            gregs[0], gregs[1], gregs[2], gregs[3],
+                            gregs[4], gregs[5], gregs[6], gregs[7]);
+                    dprintf(2, "[term-stack] g8-15: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                            gregs[8], gregs[9], gregs[10], gregs[11],
+                            gregs[12], gregs[13], gregs[14], gregs[15]);
             /* task #24: Thumper's settings page deliberately calls
              * ExitProcess(-1) from a fresh thread with no preceding
              * exception — the deciding code is invisible. Dump the calling

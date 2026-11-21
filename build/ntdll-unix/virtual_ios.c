@@ -4191,6 +4191,25 @@ int ios_jit_alloc_trampoline_slot(void)
     return slot;
 }
 
+/* Spark: like ios_jit_alloc_trampoline_slot, but -1 instead of the slot-0
+ * fallback once every slot has been handed out, so signal_arm64_ios.c can reuse
+ * the slot of an exited thread first. Slot 0 itself only goes to the first
+ * thread, while the counter is still small. */
+int ios_jit_alloc_trampoline_slot_or_fail(void)
+{
+    int slot;
+
+    if (__atomic_load_n(&ios_jit_next_slot, __ATOMIC_RELAXED) >= IOS_JIT_MAX_SLOTS) return -1;
+    slot = ios_jit_alloc_trampoline_slot();
+    if (!slot && __atomic_load_n(&ios_jit_next_slot, __ATOMIC_RELAXED) > IOS_JIT_MAX_SLOTS) return -1;
+    return slot;
+}
+
+int ios_jit_trampoline_slot_limit(void)
+{
+    return IOS_JIT_MAX_SLOTS;
+}
+
 /* Write TEB address to a specific trampoline slot */
 void ios_jit_set_teb_slot(int slot, uintptr_t teb)
 {
@@ -5334,6 +5353,69 @@ uintptr_t ios_jit_anon_alias_lookup_rx(uintptr_t fault_addr)
         }
     }
     return 0;
+}
+
+/* Decide whether an image's base-relocation directory can be applied to its
+ * JIT-pool copy (ported from Spark). Some executables carry a directory entry that does not point
+ * at relocation blocks: Ren'Py's launcher stub and pythonw.exe have
+ * IMAGE_FILE_RELOCS_STRIPPED set and a directory (RVA 0x1e000/0x1f000, size
+ * 0x68) that lies inside .rsrc. Reading resource bytes as blocks produced wild
+ * block RVAs and the copy loop wrote through them, which killed the process.
+ *
+ * The directory is refused when it leaves the image, lies inside .rsrc, or a
+ * block is malformed (size 1..7, odd, past the end of the directory, or a block
+ * RVA outside the image). A block size of 0 ends the table, as the apply loops
+ * already treat it. A well-formed directory is accepted unchanged, so images
+ * that relocate correctly today behave as before.
+ * rw_image: writable view of the image; pe_off: offset of the PE header. */
+static int ios_reloc_dir_valid(const char *rw_image, size_t image_size, unsigned int pe_off,
+                               unsigned int rva, unsigned int size, const char **why)
+{
+    unsigned short num_sec, opt_sz;
+    const char *sec;
+    unsigned int pos = 0;
+    int s;
+
+    if (!rva && !size) { *why = "no directory"; return 0; }
+    if (!rva || !size) { *why = "directory has an RVA or a size but not both"; return 0; }
+    if ((unsigned long long)rva + size > image_size) { *why = "directory is outside the image"; return 0; }
+
+    num_sec = *(const unsigned short *)(rw_image + pe_off + 6);
+    opt_sz  = *(const unsigned short *)(rw_image + pe_off + 0x14);
+    sec = rw_image + pe_off + 0x18 + opt_sz;
+    if ((unsigned long long)pe_off + 0x18 + opt_sz + 40ull * num_sec <= image_size)
+    {
+        for (s = 0; s < num_sec; s++, sec += 40)
+        {
+            unsigned int sec_vsz = *(const unsigned int *)(sec + 8);
+            unsigned int sec_rva = *(const unsigned int *)(sec + 12);
+            if (rva >= sec_rva && rva < (unsigned long long)sec_rva + sec_vsz &&
+                !memcmp(sec, ".rsrc\0\0\0", 8))
+            {
+                *why = "directory lies inside .rsrc";
+                return 0;
+            }
+        }
+    }
+
+    while (pos + 8 <= size)
+    {
+        unsigned int block_rva  = *(const unsigned int *)(rw_image + rva + pos);
+        unsigned int block_size = *(const unsigned int *)(rw_image + rva + pos + 4);
+        if (!block_size) break;
+        if (block_size < 8 || (block_size & 1) || block_size > size - pos)
+        {
+            *why = "malformed block size";
+            return 0;
+        }
+        if (block_rva >= image_size)
+        {
+            *why = "block RVA outside the image";
+            return 0;
+        }
+        pos += block_size;
+    }
+    return 1;
 }
 
 void ios_jit_set_reloc_info(void *pe_base, uint64_t pe_image_base, intptr_t delta,
@@ -13532,12 +13614,32 @@ static void clear_arm64ec_range( const void *addr, size_t size );
  * are cleared so a reused range starts with a clean call-routing slate. */
 static void ios_sc_grants_owner_died( void *peb );
 
+/* Spark: a child's ntdll copy is never reused (2026-10-12, MX Bikes and
+ * Pseudoregalia). Its range came back from the freelist to the next image, and
+ * that image then ran zeros or stray data in the pages that had been the dead
+ * child's ntdll .data: wevtsvc.dll, a winedevice driver and nsi.dll each faulted
+ * at +0x174d74, +0x1791d4 and +0x179644 of the same reclaimed ntdll copy, in two
+ * sessions, although the copy-verify read-back right after each copy was clean.
+ * Something still writes the dead child's ntdll globals after the grace
+ * period. Until that writer is found, the copy stays out of the freelist
+ * (about 2 MB of pool per exited child). MADEIRA_POOL_REUSE_NTDLL=1 restores
+ * reuse. Set by the child-ntdll copy below; read under ios_pool_lock. */
+static void *ios_child_ntdll_pe;
+static size_t ios_pool_quarantined;
+
 void ios_jit_reclaim_process( void *peb )
 {
     size_t total = 0;
-    int ranges = 0, maps_killed = 0, aliases_killed = 0;
+    int ranges = 0, maps_killed = 0, aliases_killed = 0, quarantined = 0;
     int i, j;
     char *rx_base = (char *)ios_jit_rx_base_global;
+    static int reuse_ntdll = -1;
+
+    if (reuse_ntdll < 0)
+    {
+        const char *e = getenv( "MADEIRA_POOL_REUSE_NTDLL" );
+        reuse_ntdll = e && *e == '1';
+    }
 
     /* madeira-bcd: its Social Club reservations go when the next helper asks */
     ios_sc_grants_owner_died( peb );
@@ -13562,6 +13664,7 @@ void ios_jit_reclaim_process( void *peb )
     for (i = 0; i < ios_pool_ledger_count; )
     {
         size_t off, size;
+        int holds_ntdll = 0;
         if (ios_pool_ledger[i].peb != peb) { i++; continue; }
         off  = ios_pool_ledger[i].off;
         size = ios_pool_ledger[i].size;
@@ -13576,6 +13679,8 @@ void ios_jit_reclaim_process( void *peb )
             if (!ios_jit_mappings[j].pe_base) continue;
             if (jb >= rx_base + off && jb < rx_base + off + size)
             {
+                if (ios_child_ntdll_pe && ios_jit_mappings[j].pe_base == ios_child_ntdll_pe)
+                    holds_ntdll = 1;
                 ios_jit_mappings[j].size = 0;
                 __sync_synchronize();
                 ios_jit_mappings[j].pe_base = NULL;
@@ -13669,6 +13774,16 @@ void ios_jit_reclaim_process( void *peb )
                          (unsigned long)off, (unsigned long)size, fcur, fmax );
         }
 
+        /* Spark: a range that held a child's ntdll copy stays out of reuse
+         * (see ios_child_ntdll_pe); MADEIRA_POOL_REUSE_NTDLL=1 reuses it. */
+        if (holds_ntdll && !reuse_ntdll)
+        {
+            ios_pool_quarantined += size;
+            quarantined++;
+            ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];
+            continue;
+        }
+
         /* madeira-bcd: a range in the big-image slot frees the slot (after the
          * grace) instead of going on the freelist, where small images would
          * carve it up. */
@@ -13741,6 +13856,10 @@ void ios_jit_reclaim_process( void *peb )
                 peb, ranges, (unsigned long)total, IOS_POOL_REUSE_GRACE_SEC,
                 maps_killed, aliases_killed,
                 (unsigned long)jit_pool_offset, ios_pool_free_count);
+    if (quarantined)
+        dprintf(2, "[jit-pool] RECLAIM peb=%p: child ntdll copy kept out of the freelist "
+                "(%d range(s); 0x%lx quarantined in total; MADEIRA_POOL_REUSE_NTDLL=1 reuses it)\n",
+                peb, quarantined, (unsigned long)ios_pool_quarantined);
 
     /* ml983: only now is the fixed-base window occupant safe to retire. This is
      * deliberately AFTER the ledger walk, not before it: the flag is what lets
@@ -20234,6 +20353,19 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     unsigned int reloc_rva = *(unsigned int *)(rw_image + pe_off + 0xB0);
                     unsigned int reloc_sz  = *(unsigned int *)(rw_image + pe_off + 0xB4);
 
+                    if (reloc_rva || reloc_sz)
+                    {
+                        const char *reloc_why = "";
+                        if (!ios_reloc_dir_valid(rw_image, image_size, pe_off, reloc_rva, reloc_sz, &reloc_why))
+                        {
+                            ERR("iOS JIT:   [reloc-skip] ignoring the base-relocation directory RVA=0x%x size=0x%x: %s (image_size=0x%lx, characteristics=0x%x)\n",
+                                reloc_rva, reloc_sz, reloc_why, (unsigned long)image_size,
+                                (unsigned int)*(unsigned short *)(rw_image + pe_off + 0x16));
+                            reloc_rva = 0;
+                            reloc_sz = 0;
+                        }
+                    }
+
                     if (reloc_rva && reloc_sz && delta)
                     {
                         char *reloc_data = rw_image + reloc_rva;
@@ -20264,7 +20396,9 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
                                 if (type == 10)  /* IMAGE_REL_BASED_DIR64 */
                                 {
-                                    uint64_t *fixup = (uint64_t *)(rw_image + block_rva + off);
+                                    uint64_t *fixup;
+                                    if ((unsigned long long)block_rva + off + 8 > image_size) continue;
+                                    fixup = (uint64_t *)(rw_image + block_rva + off);
                                     uint64_t val = *fixup;
                                     if (val >= pe_image_base && val < pe_image_base + image_size)
                                     {
@@ -20650,6 +20784,7 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
     rw_dest = (char *)ios_jit_rw_base_global + offset;
     rx_dest = (char *)ios_jit_rx_base_global + offset;
     src = (char *)m->pe_base;
+    ios_child_ntdll_pe = m->pe_base;   /* Spark: reclaim keeps this copy's range out of reuse */
 
     memcpy(rw_dest, src, m->size);
     /* task #34: verify HERE, before relocations/x18 patching legitimately
@@ -20717,7 +20852,9 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
             {
                 if ((entries[j] >> 12) == 10)  /* IMAGE_REL_BASED_DIR64 */
                 {
-                    uint64_t *fixup = (uint64_t *)(rw_dest + block_rva + (entries[j] & 0xFFF));
+                    uint64_t *fixup;
+                    if ((unsigned long long)block_rva + (entries[j] & 0xFFF) + 8 > m->size) continue;
+                    fixup = (uint64_t *)(rw_dest + block_rva + (entries[j] & 0xFFF));
                     if (*fixup >= pe_image_base && *fixup < pe_image_base + m->size)
                     {
                         *fixup += child_delta;
@@ -36455,6 +36592,8 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
 
                                 /* Only fix entries within the synced region */
                                 if (fixup_rva < rgn_off_start || fixup_rva + 8 > rgn_off_end)
+                                    continue;
+                                if ((size_t)fixup_rva + 8 > img_size)   /* Spark: inside the image too */
                                     continue;
 
                                 {

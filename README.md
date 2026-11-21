@@ -24,6 +24,13 @@ cache all lean on atomics. FEX's *generated* code already picks CPU features at
 run time; these flags speed up FEX itself (decoding, IR passes, block
 compilation), which is where translation stutter comes from.
 
+**Spark fixes:** the runtime fixes from
+[Spark](https://github.com/kazi-kaz/Spark) that upstream had not already made
+are merged in (truncated stack pointers, trampoline-slot and ntdll-range reuse,
+relocation-directory checks, `cmd /c ver`, Ren'Py click and cursor fixes). See
+[COSMIC-SPARK-FIXES.md](COSMIC-SPARK-FIXES.md) for what was ported, what upstream
+already covers, and each fix's switch.
+
 **Requirements:** iOS 26 or later on an A13 or newer chip (every iPhone that
 runs iOS 26), JIT through StikDebug or the built-in helper, as in Madeira.
 Bundle ID `com.kazikaz.cosmic`, so it installs next to Madeira.

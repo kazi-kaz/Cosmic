@@ -2627,6 +2627,25 @@ static void ios_click_focus( const MSG *msg )
         winios_click_focus( msg->hwnd, "click" );
 }
 #endif
+/* iOS: the top-level window of hwnd when NtUserGetAncestor( GA_ROOT ) cannot
+ * say. GA_ROOT answers 0 for the game's own window here (list_window_parents
+ * fails), so a click's activation had no window to work on: Ren'Py's window
+ * never became active, foreground or focused and no key press ever reached it
+ * (MyFluffyNeighbor, 2026-11-05). GA_PARENT reads the window's own parent
+ * pointer and does not need that list. Returns 0 for the desktop itself. */
+static HWND ios_top_level_window( HWND hwnd )
+{
+    HWND desktop = get_desktop_window(), top = get_full_window_handle( hwnd ), parent;
+    int guard;
+
+    for (guard = 0; top && guard < 32; guard++)
+    {
+        parent = NtUserGetAncestor( top, GA_PARENT );
+        if (!parent || parent == desktop) break;
+        top = parent;
+    }
+    return top == desktop ? 0 : top;
+}
 
 /***********************************************************************
  *          process_mouse_message
@@ -2860,6 +2879,15 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
         {
             HWND hwndTop = NtUserGetAncestor( msg->hwnd, GA_ROOT );
 
+            if (!hwndTop)
+            {
+                static unsigned int root_fallback;
+                hwndTop = ios_top_level_window( msg->hwnd );
+                if (++root_fallback <= 4)
+                    ERR( "[click-activate] GA_ROOT(%p) answered 0; top-level window is %p (#%u)\n",
+                         msg->hwnd, hwndTop, root_fallback );
+            }
+
             if ((get_window_long( hwndTop, GWL_STYLE ) & (WS_POPUP|WS_CHILD)) != WS_CHILD)
             {
                 UINT ret = send_message( msg->hwnd, WM_MOUSEACTIVATE, (WPARAM)hwndTop,
@@ -2876,7 +2904,29 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
                     /* fall through */
                 case MA_ACTIVATE:
                 case 0:
-                    if (!set_foreground_window( hwndTop, TRUE, FALSE )) eat_msg = TRUE;
+                    if (!set_foreground_window( hwndTop, TRUE, FALSE ))
+                    {
+                        /* iOS: Wine discards the press when the window can't be
+                         * brought to the front. The session shows one game and nothing
+                         * else can be in front of it, so a failure here only ever
+                         * cost the game its taps: Ren'Py's window never became
+                         * foreground, every tap's button-down was eaten, and only
+                         * drags worked (SDL rebuilds a press from MK_LBUTTON on
+                         * WM_MOUSEMOVE). Make the window active within its own
+                         * thread instead and deliver the press. */
+                        static unsigned int fg_fail;
+                        static int eat = -1;
+                        DWORD error = NtCurrentTeb()->LastErrorValue;
+                        /* MADEIRA_EAT_UNFOCUSED_CLICK=1: Wine's behaviour (discard the press) */
+                        if (eat < 0) { const char *e = getenv( "MADEIRA_EAT_UNFOCUSED_CLICK" ); eat = e && e[0] == '1'; }
+                        if (eat) { eat_msg = TRUE; break; }
+                        if (get_window_thread( hwndTop, NULL ) == GetCurrentThreadId())
+                            set_active_window( hwndTop, NULL, TRUE, TRUE, 0 );
+                        if (++fg_fail <= 8 || !(fg_fail & 255))
+                            ERR( "[click-activate] set_foreground_window(%p) failed (error %u, #%u); "
+                                 "press delivered, window made active in its thread\n",
+                                 hwndTop, (unsigned int)error, fg_fail );
+                    }
                     break;
                 default:
                     WARN( "unknown WM_MOUSEACTIVATE code %d\n", ret );
