@@ -416,8 +416,9 @@ final class MetalBackedView: UIView {
     /// left-button only, so these go through winios_pointer with ABSOLUTE.
     private func tmAbsoluteClick(down: UInt32, up: UInt32, at p: CGPoint) {
         let (x, y) = mapPoint(p)
+        let upFlags = up | F_ABS
         postSurfacePointer(x, y, down | F_ABS)
-        postSurfacePointer(x, y, up | F_ABS)
+        afterTapHold { [weak self] in self?.postSurfacePointer(x, y, upFlags) }
     }
 
     private func touchModeBegan(_ touches: Set<UITouch>) {
@@ -497,7 +498,7 @@ final class MetalBackedView: UIView {
         case 1:
             let (x, y) = mapPoint(mid)
             postSurfaceTouchDown(x, y)
-            postSurfaceTouchUp(x, y)
+            afterTapHold { [weak self] in self?.postSurfaceTouchUp(x, y) }
         case 2: tmAbsoluteClick(down: F_RDOWN, up: F_RUP, at: mid)
         case 3: tmAbsoluteClick(down: F_MDOWN, up: F_MUP, at: mid)
         default: break
@@ -563,6 +564,22 @@ final class MetalBackedView: UIView {
         guard let v = getenv(name), let i = Int(String(cString: v)) else { return def }
         return i
     }
+    /// Cosmic: how long a tap holds its button before releasing it. A press and
+    /// release in the same instant land between two of a game's input polls, so
+    /// games that read the button state each frame (DirectInput GetDeviceState:
+    /// MX Bikes took only half-second holds, i.e. the long-press drag) never see
+    /// the click. MADEIRA_TAP_HOLD_MS, default 60 ms (about four frames at 60 Hz);
+    /// 0 releases at once, as before.
+    private static let tapHold: TimeInterval = {
+        guard let v = getenv("MADEIRA_TAP_HOLD_MS"), let ms = Int(String(cString: v)), ms >= 0 else { return 0.06 }
+        return TimeInterval(min(ms, 500)) / 1000
+    }()
+
+    private func afterTapHold(_ release: @escaping () -> Void) {
+        if Self.tapHold <= 0 { release(); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.tapHold, execute: release)
+    }
+
     private func postPointer(_ flags: UInt32, data: Int32 = 0) {
         postSurfacePointer(Int32(Self.cursor.x), Int32(Self.cursor.y), flags, data: UInt32(bitPattern: data))
     }
@@ -774,7 +791,7 @@ final class MetalBackedView: UIView {
                 if !twoFingerMoved && now - twoFingerStartTime < 0.40
                     && !InputSettings.shared.relative {   // ml643: see touchesBegan
                     postPointer(F_RDOWN)
-                    postPointer(F_RUP)
+                    afterTapHold { [weak self] in guard let self else { return }; self.postPointer(self.F_RUP) }
                 }
                 twoFingerActive = false
             }
@@ -798,7 +815,7 @@ final class MetalBackedView: UIView {
         if !movedBeyondSlop && now - touchStartTime < 0.5 && !InputSettings.shared.relative {
             fputs("[trackpad] ended: click\n", stderr)
             postPointer(F_LDOWN)
-            postPointer(F_LUP)
+            afterTapHold { [weak self] in guard let self else { return }; self.postPointer(self.F_LUP) }
         }
     }
 
