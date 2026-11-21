@@ -820,6 +820,45 @@ final class MetalBackedView: UIView {
     }
 }
 
+/// Cosmic: a mouse button for relative (mouse-look) mode, where a tap on the
+/// game deliberately does not click (ml643: every small aim adjustment would
+/// fire). Press and hold like a real button: down at touch-down, up at lift.
+struct HoldMouseButtonView: View {
+    let label: String
+    let down: UInt32
+    let up: UInt32
+    @State private var isDown = false
+
+    var body: some View {
+        Text(label)
+            .font(.system(size: 14, weight: .semibold, design: .monospaced))
+            .foregroundColor(.white)
+            .frame(minWidth: 40, minHeight: 32)
+            .background(Color.white.opacity(isDown ? 0.35 : 0.15))
+            .cornerRadius(6)
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        if !isDown {
+                            isDown = true
+                            Self.post(down)
+                        }
+                    }
+                    .onEnded { _ in
+                        isDown = false
+                        Self.post(up)
+                    }
+            )
+    }
+
+    private static func post(_ flags: UInt32) {
+        // Relative mode posts motion, not positions: a button event carries no move.
+        guard let event = HardwareInput.shared.surfacePointerEvent(x: 0, y: 0, flags: flags) else { return }
+        winios_pointer(event.x, event.y, event.flags, event.data)
+        fputs("[trackpad] relative-mode button flags=0x\(String(flags, radix: 16))\n", stderr)
+    }
+}
+
 /// Arrow-key button with press/hold/release semantics. DragGesture with
 /// zero minimum distance fires onChanged at touch-down (key down once)
 /// and onEnded at lift (key up) — unlike Button, which only taps.
@@ -1491,6 +1530,12 @@ struct ContentView: View {
                     // the close control; matchedGeometryEffect animates the slide.
                     pointerToggleButton
                     pointerModeToggle
+                    if input.relative {
+                        // Cosmic: a tap does not click in mouse-look (ml643), so
+                        // the left/right buttons that comment promises live here.
+                        HoldMouseButtonView(label: "L", down: 0x2, up: 0x4)   // F_LDOWN / F_LUP
+                        HoldMouseButtonView(label: "R", down: 0x8, up: 0x10)  // F_RDOWN / F_RUP
+                    }
                     pointerSensSlider
                 } else {
                     Group {
