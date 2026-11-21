@@ -50,3 +50,11 @@ Host checks from Spark: `tests/host/check-trunc-ptr.py`, `check-ntdll-quarantine
   `env.PYGAME_SDL2_AVOID_GL=1` in a game's config still sets it.
 - `[resv-map]` WoW64 mapping diagnostics (logging only).
 - Iridium's app, interface, Steam framework and build system.
+
+## Cosmic's own runtime fixes
+
+| Fix | Files | Switch |
+|---|---|---|
+| A Wine syscall stub that calls through a dispatcher slot its DLL has not filled yet is sent to the syscall dispatcher instead of address 0. MX Bikes via Madeira Dock: comctl32 called a win32u syscall before win32u's DllMain, because the native-ARM64 Dock session loads win32u late from `sysx64` (the mixed-arch fallback) | `build/ntdll-unix/signal_arm64_ios.c` | `MADEIRA_SYSCALL_SLOT=0` |
+
+Host check: `tests/host/check-syscall-slot.py` (decodes the stub from the crash log).
