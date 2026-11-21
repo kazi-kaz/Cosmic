@@ -52,13 +52,23 @@ with tempfile.TemporaryDirectory() as tmp:
     r = subprocess.run([str(exe)], capture_output=True, text=True)
     if r.returncode: print(r.stdout + r.stderr); sys.exit(1)
 
-rec = source[source.index("static int ios_syscall_slot_recover( ucontext_t *context )"):]
-rec = rec[:rec.index("\n}\n")]
-assert "ios_fault_pc_is_jit( lr - 20 )" in rec, "only stubs in the JIT pool or region C"
-assert "|| value)" in rec, "only a slot that is really NULL"
-assert rec.index("PC_sig( context ) = (ULONG_PTR)__wine_syscall_dispatcher;") > rec.index("|| value)")
-assert 'getenv( "MADEIRA_SYSCALL_SLOT" )' in rec
-segv = source[source.index("static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )"):]
-segv = segv[:segv.index("ios_fault_is_foreign(")]
-assert "if (!PC_sig( context ) && ios_syscall_slot_recover( context )) return;" in segv, "runs first in segv_handler"
+tgt = source[source.index("static uint64_t ios_syscall_slot_target( uint64_t pc, uint64_t lr, uint64_t x8, uint64_t x9 )"):]
+tgt = tgt[:tgt.index("\n}\n")]
+assert "ios_fault_pc_is_jit( lr - 20 )" in tgt, "only stubs in the JIT pool or region C"
+assert "|| value)" in tgt, "only a slot that is really NULL"
+assert tgt.index("return (uint64_t)(uintptr_t)__wine_syscall_dispatcher;") > tgt.index("|| value)")
+assert 'getenv( "MADEIRA_SYSCALL_SLOT" )' in tgt
+# Claimed on the Mach exception thread, right after the state fetch and before
+# the sub-floor service, every diagnostic and the guest-exception delivery.
+mach = source[source.index("static void *ios_mach_exception_thread( void *arg )"):]
+claim = mach.index("ios_syscall_slot_target( 0, state.__lr, state.__x[8], state.__x[9] )")
+assert mach.index("kr = thread_get_state( thread, ARM_THREAD_STATE64,") < claim
+assert claim < mach.index("ml939: THE SUB-FLOOR SERVICE BELONGS HERE")
+assert claim < mach.index("ios_mach_deliver_guest_exception( thread, &state,")
+block = mach[claim:mach.index("goto cosmic_exc_reply;", claim)]
+assert "__darwin_arm_thread_state64_set_pc_fptr( state, (void *)(uintptr_t)target );" in block
+assert "thread_set_state( thread, ARM_THREAD_STATE64, (thread_state_t)&state, count );" in block
+assert "handled = 1;" in block
+assert mach.index("cosmic_exc_reply:") < mach.index("reply.ret_code = handled ? KERN_SUCCESS : KERN_FAILURE;")
+assert "ios_syscall_slot_recover" not in source, "the segv_handler path is gone (ml939)"
 print("PASS syscall-slot")

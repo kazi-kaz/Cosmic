@@ -2953,35 +2953,36 @@ static uint64_t ios_syscall_stub_slot( const uint32_t w[5], uint64_t lr )
 }
 /* ios-syscall-slot:end */
 
-/* Sends such a call where the slot would have: the syscall dispatcher, with
- * every register as the stub left it (x8 = id, x9 = caller, x30 = the stub's
- * ret). The slot itself is left alone, so win32u's DllMain still runs its full
- * set-up when its turn comes. Returns 1 when the fault was this and the thread
- * now continues in the dispatcher. MADEIRA_SYSCALL_SLOT=0 turns it off. */
-static int ios_syscall_slot_recover( ucontext_t *context )
+/* Where such a call should go: the syscall dispatcher, with every register as
+ * the stub left it (x8 = id, x9 = caller, x30 = the stub's ret). Returns the
+ * dispatcher's address when pc is 0, the five words before lr are a syscall
+ * stub in the JIT pool and the slot it loaded really is still NULL; 0
+ * otherwise. The slot itself is left alone, so win32u's DllMain still does its
+ * full set-up when its turn comes. Called from the Mach exception thread, which
+ * owns the faulting thread's state (resuming from segv_handler corrupts FEX,
+ * see ml939). MADEIRA_SYSCALL_SLOT=0 turns it off. */
+static uint64_t ios_syscall_slot_target( uint64_t pc, uint64_t lr, uint64_t x8, uint64_t x9 )
 {
     static int enabled = -1;
     static unsigned int hits;
-    uint64_t lr = (uint64_t)LR_sig( context ), slot, value = 1;
+    uint64_t slot, value = 1;
     uint32_t w[5];
     mach_vm_size_t got = 0;
 
     if (enabled < 0) { const char *e = getenv( "MADEIRA_SYSCALL_SLOT" ); enabled = !(e && e[0] == '0'); }
-    if (!enabled || PC_sig( context ) || lr < 20 || !ios_fault_pc_is_jit( lr - 20 )) return 0;
+    lr &= 0x0000007fffffffffull;
+    if (!enabled || pc || lr < 20 || !ios_fault_pc_is_jit( lr - 20 )) return 0;
     if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(lr - 20), sizeof(w),
                                 (mach_vm_address_t)w, &got ) != KERN_SUCCESS || got != sizeof(w)) return 0;
     if (!(slot = ios_syscall_stub_slot( w, lr ))) return 0;
     if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)slot, sizeof(value),
                                 (mach_vm_address_t)&value, &got ) != KERN_SUCCESS || got != sizeof(value) || value)
         return 0;   /* only a slot that really is still NULL */
-    REGn_sig( 16, context ) = (ULONG_PTR)__wine_syscall_dispatcher;
-    PC_sig( context ) = (ULONG_PTR)__wine_syscall_dispatcher;
     if (++hits <= 16 || !(hits & 255))
         dprintf( 2, "[syscall-slot] syscall 0x%llx from %#llx: dispatcher slot %#llx still NULL "
                  "(its DLL's DllMain has not run yet); sent to the dispatcher, #%u\n",
-                 (unsigned long long)REGn_sig( 8, context ), (unsigned long long)REGn_sig( 9, context ),
-                 (unsigned long long)slot, hits );
-    return 1;
+                 (unsigned long long)x8, (unsigned long long)x9, (unsigned long long)slot, hits );
+    return (uint64_t)(uintptr_t)__wine_syscall_dispatcher;
 }
 
 /* A checked read (mach_vm_read_overwrite): 1 when all len bytes at addr were read. Never faults. */
@@ -3895,6 +3896,21 @@ static void *ios_mach_exception_thread( void *arg )
         {
             uintptr_t fault_addr = (uintptr_t)req->code[1];
 #ifdef WINE_IOS
+            /* Cosmic: a syscall stub that branched through a dispatcher slot its
+             * DLL has not filled in yet (ios_syscall_slot_target). Claimed first,
+             * before any diagnostic or delivery path sees a PC-0 fault. */
+            if (req->exception == EXC_BAD_ACCESS && !__darwin_arm_thread_state64_get_pc( state ))
+            {
+                uint64_t target = ios_syscall_slot_target( 0, state.__lr, state.__x[8], state.__x[9] );
+                if (target)
+                {
+                    state.__x[16] = target;
+                    __darwin_arm_thread_state64_set_pc_fptr( state, (void *)(uintptr_t)target );
+                    thread_set_state( thread, ARM_THREAD_STATE64, (thread_state_t)&state, count );
+                    handled = 1;
+                    goto cosmic_exc_reply;
+                }
+            }
             /* ml939: THE SUB-FLOOR SERVICE BELONGS HERE, NOT IN segv_handler.
              *
              * ml938 put it in segv_handler and the emulation itself was correct --
@@ -8605,7 +8621,9 @@ dispatch_guest_fault:
             }
         }
 
+cosmic_exc_reply:
         /* Build reply */
+        ;
         ios_exc_reply_t reply;
         reply.head.msgh_bits = MACH_MSGH_BITS( MACH_MSGH_BITS_REMOTE(req->head.msgh_bits), 0 );
         reply.head.msgh_size = sizeof(reply);
@@ -12166,10 +12184,6 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     DWORD64 esr = get_fault_esr( context );
 #ifdef WINE_IOS
     int dbg_ok;
-
-    /* Cosmic: a syscall stub called through a dispatcher slot its DLL has not
-     * filled in yet (ios_syscall_slot_recover). Before anything else. */
-    if (!PC_sig( context ) && ios_syscall_slot_recover( context )) return;
 
     /* ml481 (#85): decide FOREIGN-ness before anything that could allocate —
      * ios_make_wine_logging_safe() itself is the call that deadlocked in ml480. */
