@@ -3990,37 +3990,6 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                     uint64_t sbase = (uint64_t)cpuarea->EmulatorStackBase;
                     uint64_t slimit = (uint64_t)cpuarea->EmulatorStackLimit;
                     uint64_t rsp = 0;
-                    int gi, hits = 0;
-                    dprintf(2, "[term-stack] rip=%llx stack=[%llx..%llx]\n",
-                            (unsigned long long)rip, (unsigned long long)slimit,
-                            (unsigned long long)sbase);
-                    dprintf(2, "[term-stack] g0-7: %llx %llx %llx %llx %llx %llx %llx %llx\n",
-                            gregs[0], gregs[1], gregs[2], gregs[3],
-                            gregs[4], gregs[5], gregs[6], gregs[7]);
-                    dprintf(2, "[term-stack] g8-15: %llx %llx %llx %llx %llx %llx %llx %llx\n",
-                            gregs[8], gregs[9], gregs[10], gregs[11],
-                            gregs[12], gregs[13], gregs[14], gregs[15]);
-            /* task #24: Thumper's settings page deliberately calls
-             * ExitProcess(-1) from a fresh thread with no preceding
-             * exception — the deciding code is invisible. Dump the calling
-             * thread's guest x64 state: RIP, gregs, and return-address-
-             * looking qwords on the guest stack (attributed offline via the
-             * [jit-pool]/load-order tables). FEX state layout: rip@0x18,
-             * gregs@0x20 (CoreState.h); cpuarea+0x30 = FEX state ptr (same
-             * offset the [fault_rip] probe uses). dprintf not ERR — this
-             * must survive err-channel muting. */
-            {
-                TEB *cur_teb = NtCurrentTeb();
-                CHPE_V2_CPU_AREA_INFO *cpuarea = cur_teb ? cur_teb->ChpeV2CpuAreaInfo : NULL;
-                void *fex_state = cpuarea ? *(void **)((char *)cpuarea + 0x30) : NULL;
-                if (fex_state)
-                {
-                    const uint64_t *fx = (const uint64_t *)fex_state;
-                    uint64_t rip = fx[0x18 / 8];
-                    const uint64_t *gregs = &fx[0x20 / 8];
-                    uint64_t sbase = (uint64_t)cpuarea->EmulatorStackBase;
-                    uint64_t slimit = (uint64_t)cpuarea->EmulatorStackLimit;
-                    uint64_t rsp = 0;
                     unsigned callsites = 0;
                     int guest_diag;
                     int gi, hits = 0;

@@ -293,6 +293,11 @@ echo ""
 echo "Results: $SUCCEEDED succeeded, $FAILED failed"
 if [ -n "$FAILED_FILES" ]; then
     echo "Failed:$FAILED_FILES"
+    # Cosmic: show why (the compiler output otherwise stays in obj/*.err).
+    for f in $FAILED_FILES; do
+        echo "--- $f.err (first errors) ---"
+        grep -m 20 -B2 -A3 "error:" "$OBJ_DIR/$f.err" 2>/dev/null || tail -40 "$OBJ_DIR/$f.err" 2>/dev/null
+    done
 fi
 
 echo ""
