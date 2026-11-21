@@ -7,6 +7,10 @@
 # not to overwrite the shipped loader as the first experiment, and keeping it
 # separate means the D3D11 path cannot regress while this is unfinished.
 set -eu
+# Cosmic: -O3, tuned for Apple A13 and newer (every iOS 26 iPhone): LSE atomics
+# and Apple scheduling instead of the ARMv8.0 baseline. COSMIC_PROFILE=stock
+# builds with the original Madeira flags.
+if [ "${COSMIC_PROFILE:-fast}" = stock ]; then COSMIC_OPT="-O2"; else COSMIC_OPT="-O3 -mcpu=apple-a13"; fi
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../.." && pwd)"
 MINGW="$REPO_ROOT/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin"
@@ -99,10 +103,10 @@ fi
 echo "=== madeira_d3d12.dll (arm64ec) ==="
 # ml1310: DXMT's BCn decoders, for BC uploads on GPUs without BC sampling.
 for cpp in "$SRC/mad_bcn.cpp" "$REPO_ROOT/dxmt/src/dxmt/dxmt_bcn.cpp"; do
-    "$MINGW/arm64ec-w64-mingw32-clang++" -c -O2 -std=c++17 -fno-exceptions -fno-rtti \
+    "$MINGW/arm64ec-w64-mingw32-clang++" -c $COSMIC_OPT -std=c++17 -fno-exceptions -fno-rtti \
         -I"$REPO_ROOT/dxmt/src/dxmt" -o "$OUT/$(basename "$cpp" .cpp).o" "$cpp"
 done
-"$MINGW/arm64ec-w64-mingw32-clang" -shared -O2 -Wall ${EXTRA[@]+"${EXTRA[@]}"} \
+"$MINGW/arm64ec-w64-mingw32-clang" -shared $COSMIC_OPT -Wall ${EXTRA[@]+"${EXTRA[@]}"} \
     -o "$OUT/madeira_d3d12.dll" "$SRC/madeira_d3d12.c" "$OUT/mad_bcn.o" "$OUT/dxmt_bcn.o" "$SRC/d3d12.def" \
     -I"$SRC" -I"$REPO_ROOT/madeira-d3d12/src" -I"$REPO_ROOT/dxmt/src/winemetal" \
     -L"$REPO_ROOT/dxmt/build-arm64ec/src/winemetal" -lwinemetal \
@@ -116,7 +120,7 @@ echo "  exports: $("$MINGW/llvm-objdump" --private-headers "$OUT/d3d12.dll" 2>/d
 # The Agility SDK half: D3D12SDKVersion plus forwarders to d3d12.dll. It ships
 # next to d3d12.dll; nothing loads it unless madeira.cfg d3d12-core-dll is set.
 echo "=== d3d12core.dll (arm64ec) ==="
-"$MINGW/arm64ec-w64-mingw32-clang" -shared -O2 -Wall \
+"$MINGW/arm64ec-w64-mingw32-clang" -shared $COSMIC_OPT -Wall \
     -o "$OUT/d3d12core.dll" "$SRC/d3d12core.c" "$SRC/d3d12core.def"
 echo "  built $(ls -l "$OUT/d3d12core.dll" | awk '{print $5}') bytes, $("$MINGW/llvm-readobj" --coff-exports "$OUT/d3d12core.dll" | grep -c 'ForwardedTo: d3d12\.') forwarders to d3d12.dll"
 

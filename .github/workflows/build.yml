@@ -5,9 +5,25 @@ on:
     branches: [main, 'codex/pr-build-*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Compiler profile: fast (Cosmic: -O3, Apple A13+ tuning) or stock (Madeira flags)'
+        type: choice
+        options: [fast, stock]
+        default: fast
+      lto:
+        description: 'Link-time optimisation for the FEX modules (experimental)'
+        type: choice
+        options: ['0', '1']
+        default: '0'
 
 permissions:
   contents: read
+
+# Cosmic build profile. ci-input-key.sh puts both in every cache key.
+env:
+  COSMIC_PROFILE: ${{ inputs.profile || 'fast' }}
+  COSMIC_LTO: ${{ inputs.lto || '0' }}
 
 concurrency:
   group: ipa-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -75,7 +91,7 @@ jobs:
           python3 tools/build/runtime-components.py ipa dist/Madeira.ipa
       - uses: actions/upload-artifact@v4
         with:
-          name: Madeira-ipa
+          name: Cosmic-ipa
           path: dist/Madeira.ipa
           if-no-files-found: error
           overwrite: true
@@ -402,8 +418,37 @@ jobs:
           path: dist/Madeira.ipa
       - uses: actions/upload-artifact@v4
         with:
-          name: Madeira-ipa
+          name: Cosmic-ipa
           path: dist/Madeira.ipa
           if-no-files-found: error
           overwrite: true
           compression-level: 0
+
+  # Pushes to main publish the IPA as the rolling "nightly" pre-release, so it
+  # can be downloaded straight to a phone for sideloading.
+  nightly:
+    needs: [app, reuse]
+    if: always() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && (needs.app.result == 'success' || needs.reuse.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Cosmic-ipa
+          path: dist
+      - name: Publish nightly pre-release
+        run: |
+          mv dist/Madeira.ipa dist/Cosmic.ipa
+          notes="Cosmic built from ${GITHUB_SHA::7} (profile: ${COSMIC_PROFILE}, LTO: ${COSMIC_LTO}). Unsigned: sideload it with your own Apple ID, then enable JIT."
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release upload nightly dist/Cosmic.ipa --clobber
+            gh release edit nightly --notes "$notes" --prerelease
+            git_ref="refs/tags/nightly"
+            gh api -X PATCH "repos/$GH_REPO/git/$git_ref" -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          else
+            gh release create nightly dist/Cosmic.ipa --target "$GITHUB_SHA" --prerelease --title "Cosmic nightly" --notes "$notes"
+          fi

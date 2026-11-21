@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Cosmic: tune FEX for Apple A13 and newer (COSMIC_PROFILE=stock: Madeira's
+# original tuning). COSMIC_LTO=1 also turns on link-time optimisation.
+if [ "${COSMIC_PROFILE:-fast}" = stock ]; then COSMIC_FEX_CPU=generic; else COSMIC_FEX_CPU=apple-a13; fi
+if [ "${COSMIC_LTO:-0}" = 1 ]; then COSMIC_FEX_LTO=ON; else COSMIC_FEX_LTO=OFF; fi
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}"
 SRC="$ROOT/FEX"
@@ -44,9 +48,9 @@ cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DBUILD_STEAM_SUPPORT=OFF \
   -DENABLE_FEX_ALLOCATOR=OFF \
   -DENABLE_ASSERTIONS=OFF \
-  -DENABLE_LTO=OFF \
+  -DENABLE_LTO="$COSMIC_FEX_LTO" \
   -DENABLE_CCACHE=OFF \
-  -DTUNE_CPU=generic \
+  -DTUNE_CPU="$COSMIC_FEX_CPU" \
   -DTUNE_ARCH=generic
 
 # The Xcode project links these archives from FEX/build-ios.

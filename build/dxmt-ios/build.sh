@@ -4,6 +4,10 @@
 #
 # Produces: libdxmt_unix.a
 set -eu
+# Cosmic: -O3, tuned for Apple A13 and newer (every iOS 26 iPhone): LSE atomics
+# and Apple scheduling instead of the ARMv8.0 baseline. COSMIC_PROFILE=stock
+# builds with the original Madeira flags.
+if [ "${COSMIC_PROFILE:-fast}" = stock ]; then COSMIC_OPT="-O2"; else COSMIC_OPT="-O3 -mcpu=apple-a13"; fi
 
 BUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$BUILD_DIR/../.." && pwd)"
@@ -19,7 +23,7 @@ OUT_LIB="$BUILD_DIR/libdxmt_unix.a"
 
 mkdir -p "$OBJ_DIR"
 
-COMMON_FLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=18.0 -fblocks -O2"
+COMMON_FLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=18.0 -fblocks $COSMIC_OPT"
 INCLUDES="-I$DXMT_ROOT/include -I$DXMT_ROOT/libs -I$DXMT_SRC/winemetal -I$DXMT_SRC/airconv"
 INCLUDES_DIRECTX="-I$DXMT_ROOT/include/native/directx -I$DXMT_ROOT/include/native/windows"
 INCLUDES_SHADERS="-I$BUILD_DIR/shader-headers"

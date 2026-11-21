@@ -1,3 +1,60 @@
+# Cosmic
+
+Cosmic is a performance-tuned build of [Madeira](https://github.com/willfaust/madeira)
+for running Windows PC games on a non-jailbroken iPhone with JIT. It keeps
+Madeira's whole runtime (Wine 11 for ARM64EC, FEX-Emu, DXMT for Direct3D 9-11 on
+Metal, madeira-d3d12 for Direct3D 12 on Metal, plus the MoltenVK, KosmicKrisp,
+DXVK and VKD3D-Proton stages) and changes how the hot paths are compiled.
+
+## What Cosmic changes
+
+| Component | Madeira | Cosmic (`fast` profile) |
+|---|---|---|
+| FEXCore (native, linked into the app) | ARMv8.0 `generic` | `-mcpu=apple-a13` |
+| FEX ARM64EC JIT (`xtajit64.dll`) | `cortex-a78` | `-mcpu=apple-a13` |
+| FEX WoW64 JIT (`xtajit.dll`, 32-bit games) | ARMv8.0 | `-mcpu=apple-a13` |
+| DXMT native (D3D9-11 to Metal, shader conversion) | `-O2` | `-O3 -mcpu=apple-a13` |
+| madeira-d3d12 ARM64EC modules | `-O2` | `-O3 -mcpu=apple-a13` |
+| Wine ntdll/win32u unix side, wineserver thread | `-O2`, ARMv8.0 | `-O3 -mcpu=apple-a13` |
+
+The ARMv8.0 baseline compiles every atomic operation as a load/store-exclusive
+retry loop; A13 tuning uses the single-instruction LSE atomics and Apple's
+scheduling model. Wine's synchronisation, the wineserver thread and FEX's code
+cache all lean on atomics. FEX's *generated* code already picks CPU features at
+run time; these flags speed up FEX itself (decoding, IR passes, block
+compilation), which is where translation stutter comes from.
+
+**Requirements:** iOS 26 or later on an A13 or newer chip (every iPhone that
+runs iOS 26), JIT through StikDebug or the built-in helper, as in Madeira.
+Bundle ID `com.kazikaz.cosmic`, so it installs next to Madeira.
+
+These flag changes are not yet benchmarked on a device. To compare, build the
+`stock` profile and time the same scene.
+
+## Building
+
+GitHub Actions builds an unsigned IPA on every push to `main`
+(`.github/workflows/build.yml`, on GitHub's `xcode-27` macOS runners). Pushes to
+`main` publish it as the **nightly** pre-release; every run also keeps it as the
+`Cosmic-ipa` artifact. The first build takes several hours (LLVM and FEX); later
+runs reuse the caches.
+
+Run the workflow by hand (Actions > Build IPA > Run workflow) to choose:
+
+- `profile`: `fast` (default) or `stock` (Madeira's original flags)
+- `lto`: `1` turns on link-time optimisation for the FEX modules (experimental)
+
+Locally on a Mac: `COSMIC_PROFILE=fast ./tools/build-ipa.sh` (the output keeps
+the upstream name, `dist/Madeira.ipa`).
+
+## License and credit
+
+Cosmic is GPL-3.0-or-later with the Madeira Converter Exception, like Madeira,
+and builds on the work of Will Faust and Madeira's contributors (credited below).
+The upstream README follows.
+
+---
+
 <p align="center">
   <img src="docs/assets/banner.png" alt="Madeira — Bringing PC gaming to your iPhone." width="100%">
 </p>

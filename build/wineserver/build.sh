@@ -1,5 +1,9 @@
 #!/bin/bash
 set -e
+# Cosmic: -O3, tuned for Apple A13 and newer (every iOS 26 iPhone): LSE atomics
+# and Apple scheduling instead of the ARMv8.0 baseline. COSMIC_PROFILE=stock
+# builds with the original Madeira flags.
+if [ "${COSMIC_PROFILE:-fast}" = stock ]; then COSMIC_OPT="-O2"; else COSMIC_OPT="-O3 -mcpu=apple-a13"; fi
 
 BUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$BUILD_DIR/../.." && pwd)"
@@ -13,7 +17,7 @@ OBJ_DIR="$BUILD_DIR/obj"
 mkdir -p "$OBJ_DIR"
 
 CC_FLAGS=(
-    -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 -O2
+    -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 $COSMIC_OPT
     -I"$WINE_SRC/include" -I"$WINE_SRC/include/wine"
     -I"$WINE_SRC/build-macos/include"
     -I"$BUILD_DIR" -I"$WINE_SRC/server"
@@ -133,7 +137,7 @@ fi
 echo "=== Building kill wrapper (without kill macro) ==="
 echo -n "  wineserver_ios_kill... "
 # Compile WITHOUT -include wineserver_ios_kill.h to avoid recursive macro
-KILL_FLAGS=(-arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 -O2
+KILL_FLAGS=(-arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 $COSMIC_OPT
     -I"$BUILD_DIR" -DWINE_IOS=1 -Wno-implicit-function-declaration)
 if xcrun -sdk iphoneos clang "${KILL_FLAGS[@]}" -c "$BUILD_DIR/wineserver_ios_kill.c" -o "$OBJ_DIR/wineserver_ios_kill.o" 2>"$OBJ_DIR/err-kill.txt"; then
     echo "OK"

@@ -9,6 +9,10 @@
 # gets the stock ExitToX64, after which every x64 DLL entry point crashes.
 # Reconfigure on each run so a partial configure and changed build options recover.
 set -eu
+# Cosmic: tune FEX for Apple A13 and newer (COSMIC_PROFILE=stock: Madeira's
+# original tuning). COSMIC_LTO=1 also turns on link-time optimisation.
+if [ "${COSMIC_PROFILE:-fast}" = stock ]; then COSMIC_FEX_CPU=cortex-a78; else COSMIC_FEX_CPU=apple-a13; fi
+if [ "${COSMIC_LTO:-0}" = 1 ]; then COSMIC_FEX_LTO=ON; else COSMIC_FEX_LTO=OFF; fi
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export PATH="$R/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin:$PATH"
 B="$R/FEX/build-arm64ec"
@@ -18,10 +22,10 @@ cmake -S "$R/FEX" -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_DISABLE_FIND_PACKAGE_fmt=ON -DCMAKE_DISABLE_FIND_PACKAGE_range-v3=ON \
     -DCMAKE_DISABLE_FIND_PACKAGE_unordered_dense=ON \
     -DCMAKE_TOOLCHAIN_FILE="$R/FEX/Data/CMake/toolchain_mingw.cmake" \
-    -DMINGW_TRIPLE=arm64ec-w64-mingw32 -DTUNE_CPU=cortex-a78 \
+    -DMINGW_TRIPLE=arm64ec-w64-mingw32 -DTUNE_CPU="$COSMIC_FEX_CPU" \
     -DFEX_IOS_HOST_BUILD=ON -DCMAKE_C_FLAGS=-DFEX_IOS_HOST=1 \
     -DCMAKE_CXX_FLAGS=-DFEX_IOS_HOST=1 -DCMAKE_ASM_FLAGS=-DFEX_IOS_HOST=1 \
-    -DENABLE_LTO=OFF -DENABLE_FEX_ALLOCATOR=ON -DENABLE_JEMALLOC_GLIBC_ALLOC=ON -DENABLE_OFFLINE_RUNTIME=ON \
+    -DENABLE_LTO="$COSMIC_FEX_LTO" -DENABLE_FEX_ALLOCATOR=ON -DENABLE_JEMALLOC_GLIBC_ALLOC=ON -DENABLE_OFFLINE_RUNTIME=ON \
     -DBUILD_FEXCONFIG=ON -DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON \
     -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DENABLE_ASSERTIONS=OFF \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5

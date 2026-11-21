@@ -1,5 +1,9 @@
 #!/bin/bash
 set -e
+# Cosmic: -O3, tuned for Apple A13 and newer (every iOS 26 iPhone): LSE atomics
+# and Apple scheduling instead of the ARMv8.0 baseline. COSMIC_PROFILE=stock
+# builds with the original Madeira flags.
+if [ "${COSMIC_PROFILE:-fast}" = stock ]; then COSMIC_OPT="-O2"; else COSMIC_OPT="-O3 -mcpu=apple-a13"; fi
 
 BUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$BUILD_DIR/../.." && pwd)"
@@ -17,7 +21,7 @@ compile_one() {
     echo -n "  $out... "
     if xcrun -sdk iphoneos clang \
         -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 \
-        -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing \
+        $COSMIC_OPT -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing \
         -Wno-implicit-function-declaration -Wno-int-conversion \
         -include "$WINE_BUILD/include/config.h" \
         -include "$BUILD_DIR/shims/wine_ios_exit.h" \

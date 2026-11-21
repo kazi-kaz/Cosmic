@@ -37,6 +37,7 @@ while i<len(args):
  a=args[i]
  if a in ['-arch','-isysroot']:i+=2;continue
  if a.startswith('-miphoneos-version-min='):i+=1;continue
+ if a.startswith('-mcpu='):i+=1;continue
  clean.append(a);i+=1
 sys.exit(subprocess.run([os.environ['TEST_CC'],'-I'+os.environ['TEST_SDK'],'-Werror']+clean).returncode)
 ''')
