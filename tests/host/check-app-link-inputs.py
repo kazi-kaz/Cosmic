@@ -44,6 +44,9 @@ with tempfile.TemporaryDirectory(prefix='madeira-app-link-') as folder:
     tls_check = native_build[native_build.index('if [ ${#GNUTLS_DEFS[@]} -gt 0 ]; then'):
                              native_build.index('# OpenGL:')]
     tls_probe = 'set -euo pipefail\nOBJ_DIR=$1\nGNUTLS_DEFS=(enabled)\n' + tls_check
+    # Wine 11.22: bcrypt has no unix library any more (PE-only on libs/symcrypt),
+    # so build.sh checks the tables of secur32 and crypt32 only.
+    TLS_MODULES = ['secur32', 'crypt32']
 
     def compile_tls(module, missing=None):
         names = [f'{module}_{table}' for table in ['unix_call_funcs', 'unix_call_wow64_funcs']]
@@ -53,22 +56,22 @@ with tempfile.TemporaryDirectory(prefix='madeira-app-link-') as folder:
         subprocess.run(['xcrun', 'clang', '-x', 'c', '-c', '-', '-o', str(folder / f'{module}_unixlib.o')],
                        input=source, text=True, check=True)
 
-    for module in ['bcrypt', 'secur32', 'crypt32']:
+    for module in TLS_MODULES:
         compile_tls(module)
     result = subprocess.run(['bash', '-c', tls_probe, 'tls-probe', str(folder)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    for module in ['bcrypt', 'secur32', 'crypt32']:
+    for module in TLS_MODULES:
         for table in ['unix_call_funcs', 'unix_call_wow64_funcs']:
             compile_tls(module, f'{module}_{table}')
             result = subprocess.run(['bash', '-c', tls_probe, 'tls-probe', str(folder)], capture_output=True, text=True)
             assert result.returncode != 0 and f'{module} did not build its {table} table' in result.stderr, result.stderr
         compile_tls(module)
-    for module in ['bcrypt', 'secur32', 'crypt32']:
+    for module in TLS_MODULES:
         (folder / f'{module}_unixlib.o').unlink()
     result = subprocess.run(['bash', '-c', tls_probe.replace('GNUTLS_DEFS=(enabled)', 'GNUTLS_DEFS=()'),
                              'tls-probe', str(folder)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    print('PASS real TLS objects require all six defined backend tables; disabled GnuTLS skips the check')
+    print('PASS real TLS objects require all four defined backend tables; disabled GnuTLS skips the check')
 
     def run_probe(name, source, flags=()):
         path = folder / name
