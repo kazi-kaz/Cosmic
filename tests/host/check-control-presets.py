@@ -223,6 +223,8 @@ sizes = '\n'.join(function(content, signature) for signature in ('static func di
 canvas = function(content, 'private func editorCanvas(')
 zones_src = (app / 'GestureZones.swift').read_text()
 panel_geometry = ('enum MappingPanel {\n    struct Placement { var center: CGPoint; var size: CGSize }\n'
+                  # 0.2.72: placement() picks its sizes by env.MADEIRA_CONTROL_PANEL_HIG
+                  + '    static var higEnabled = false\n'
                   + function(content, 'static func frame(control: TouchControl, screen: CGSize) -> CGRect {') + '\n'
                   + function(content, 'static func placement(control: TouchControl, screen: CGSize, radius r: CGFloat) -> Placement {')
                   + '\n}\nenum GestureZonePanel {\n'
@@ -280,35 +282,36 @@ var canvasControl = TouchControl()
 editor.controls = [canvasControl]
 var canvasZone = GestureZone(); canvasZone.x = 0.4; canvasZone.w = 0.4
 editorZones.zones = [canvasZone]
-let area = editorCanvas(canvasScreen)
+let area = editorCanvas(canvasScreen, top: 0)
 require(!area.contains(CGPoint(x: 400, y: 200)), "a control overlapping a zone is excluded from canvas taps")
 require(!area.contains(CGPoint(x: 600, y: 300)), "zone taps stay with the zone editor")
 require(area.contains(CGPoint(x: 720, y: 380)), "empty space takes dismissal taps")
 EditorZones.enabled = false
-require(editorCanvas(canvasScreen).contains(CGPoint(x: 600, y: 300)), "disabled zones do not block dismissal")
+require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 600, y: 300)), "disabled zones do not block dismissal")
 EditorZones.enabled = true; editorZones.zones = []
-require(editorCanvas(canvasScreen).contains(CGPoint(x: 490, y: 200)), "canvas starts beyond a normal-size control")
+require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 490, y: 200)), "canvas starts beyond a normal-size control")
 editor.controls[0].scale = 3
-require(!editorCanvas(canvasScreen).contains(CGPoint(x: 490, y: 200)), "the tap exclusion follows a resized control")
+require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 490, y: 200)), "the tap exclusion follows a resized control")
 editor.controls[0].action = .pad("RT"); editor.controls[0].scale = 1
-require(!editorCanvas(canvasScreen).contains(CGPoint(x: 445, y: 200)), "wide shoulder controls keep their full touch region")
+require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 445, y: 200)), "wide shoulder controls keep their full touch region")
 editor.controls = []; editor.selected = nil; editorZones.selected = nil
-require(!editorCanvas(canvasScreen).contains(CGPoint(x: 400, y: 30)), "the top bar's taps never reach the dismissal")
-require(!editorCanvas(canvasScreen).contains(CGPoint(x: 10, y: 60)), "the top bar strip spans the screen")
-require(editorCanvas(canvasScreen).contains(CGPoint(x: 400, y: 80)), "below the top bar dismisses")
+require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 400, y: 30)), "the top bar's taps never reach the dismissal")
+require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 10, y: 60)), "the top bar strip spans the screen")
+require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 400, y: 80)), "below the top bar dismisses")
+require(!editorCanvas(canvasScreen, top: 20).contains(CGPoint(x: 400, y: 80)), "the top bar grows by the safe-area inset")
 var panelControl = TouchControl(); panelControl.nx = 0.2; panelControl.ny = 0.2
 editor.controls = [panelControl]; editor.selected = panelControl.id
 let panelFrame = MappingPanel.frame(control: panelControl, screen: canvasScreen)
-require(!editorCanvas(canvasScreen).contains(CGPoint(x: panelFrame.midX, y: panelFrame.midY)), "an open control panel's taps stay with the panel")
-require(!editorCanvas(canvasScreen).contains(CGPoint(x: panelFrame.minX + 2, y: panelFrame.maxY - 2)), "the panel's corner stays with the panel")
-require(editorCanvas(canvasScreen).contains(CGPoint(x: 790, y: 390)), "outside the panel still dismisses")
+require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: panelFrame.midX, y: panelFrame.midY)), "an open control panel's taps stay with the panel")
+require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: panelFrame.minX + 2, y: panelFrame.maxY - 2)), "the panel's corner stays with the panel")
+require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 790, y: 390)), "outside the panel still dismisses")
 editor.selected = nil
-require(editorCanvas(canvasScreen).contains(CGPoint(x: panelFrame.midX, y: panelFrame.midY)), "a closed panel does not block dismissal")
+require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: panelFrame.midX, y: panelFrame.midY)), "a closed panel does not block dismissal")
 var panelZone = GestureZone(); panelZone.x = 0.0; panelZone.w = 0.2
 editorZones.zones = [panelZone]; editorZones.selected = panelZone.id
 let column = GestureZonePanel.column(zone: panelZone, screen: canvasScreen)
 require(column.minX > 400, "a zone on the left gets its panel on the right")
-require(!editorCanvas(canvasScreen).contains(CGPoint(x: column.midX, y: 200)), "an open zone panel's taps stay with the panel")
+require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: column.midX, y: 200)), "an open zone panel's taps stay with the panel")
 #endif
 '''
 tests = tests.replace('__EDITOR_SIZE_TESTS__', editor_tests)
