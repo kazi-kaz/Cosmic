@@ -87,38 +87,15 @@ static void master_socket_poll_event( struct fd *fd, int event );
 
 static const struct object_ops master_socket_ops =
 {
-    sizeof(struct master_socket),  /* size */
-    &no_type,                      /* type */
-    master_socket_dump,            /* dump */
-    no_add_queue,                  /* add_queue */
-    NULL,                          /* remove_queue */
-    NULL,                          /* signaled */
-    NULL,                          /* satisfied */
-    no_signal,                     /* signal */
-    no_get_fd,                     /* get_fd */
-    default_get_sync,              /* get_sync */
-    default_map_access,            /* map_access */
-    default_get_sd,                /* get_sd */
-    default_set_sd,                /* set_sd */
-    no_get_full_name,              /* get_full_name */
-    no_lookup_name,                /* lookup_name */
-    no_link_name,                  /* link_name */
-    NULL,                          /* unlink_name */
-    no_open_file,                  /* open_file */
-    no_kernel_obj_list,            /* get_kernel_obj_list */
-    no_close_handle,               /* close_handle */
-    master_socket_destroy          /* destroy */
+    .size    = sizeof(struct master_socket),
+    .type    = &no_type,
+    .dump    = master_socket_dump,
+    .destroy = master_socket_destroy,
 };
 
 static const struct fd_ops master_socket_fd_ops =
 {
-    NULL,                          /* get_poll_events */
-    master_socket_poll_event,      /* poll_event */
-    NULL,                          /* flush */
-    NULL,                          /* get_fd_type */
-    NULL,                          /* ioctl */
-    NULL,                          /* queue_async */
-    NULL                           /* reselect_async */
+    .poll_event = master_socket_poll_event,
 };
 
 
@@ -174,51 +151,54 @@ void *set_reply_data_size( data_size_t size )
 static const struct object_attributes empty_attributes;
 
 /* return object attributes from the current request */
-const struct object_attributes *get_req_object_attributes( const struct security_descriptor **sd,
-                                                           struct unicode_str *name,
-                                                           struct object **root )
+bool get_req_object_attributes( struct object_params *params )
 {
     const struct object_attributes *attr = get_req_data();
     data_size_t size = get_req_data_size();
 
-    if (root) *root = NULL;
+    params->root = NULL;
+    params->sd   = NULL;
 
     if (!size)
     {
-        *sd = NULL;
-        name->len = 0;
-        return &empty_attributes;
+        params->name.len = 0;
+        params->attr     = 0;
+        params->objattr  = &empty_attributes;
+        return true;
     }
-
     if ((size < sizeof(*attr)) || (size - sizeof(*attr) < attr->sd_len) ||
         (size - sizeof(*attr) - attr->sd_len < attr->name_len))
     {
         set_error( STATUS_ACCESS_VIOLATION );
-        return NULL;
+        return false;
     }
     if (attr->sd_len && !sd_is_valid( (const struct security_descriptor *)(attr + 1), attr->sd_len ))
     {
         set_error( STATUS_INVALID_SECURITY_DESCR );
-        return NULL;
+        return false;
     }
     if ((attr->name_len & (sizeof(WCHAR) - 1)) || attr->name_len >= 65534)
     {
         set_error( STATUS_OBJECT_NAME_INVALID );
-        return NULL;
+        return false;
     }
-    if (root && attr->rootdir && attr->name_len)
+    if (attr->rootdir && attr->name_len)
     {
-        if (!(*root = get_handle_obj( current->process, attr->rootdir, 0, NULL ))) return NULL;
+        if (!(params->root = get_handle_obj( current->process, attr->rootdir, 0, NULL ))) return false;
     }
-    *sd = attr->sd_len ? (const struct security_descriptor *)(attr + 1) : NULL;
-    name->len = attr->name_len;
-    name->str = (const WCHAR *)(attr + 1) + attr->sd_len / sizeof(WCHAR);
-    return attr;
+    if (attr->sd_len) params->sd = (const struct security_descriptor *)(attr + 1);
+
+    params->name.len = attr->name_len;
+    params->name.str = (const WCHAR *)(attr + 1) + attr->sd_len / sizeof(WCHAR);
+    params->attr     = attr->attributes;
+    params->objattr  = attr;
+    return true;
 }
 
 /* return a pointer to the request data following an object attributes structure */
-const void *get_req_data_after_objattr( const struct object_attributes *attr, data_size_t *len )
+const void *get_req_data_after_objattr( const struct object_params *params, data_size_t *len )
 {
+    const struct object_attributes *attr = params->objattr;
     data_size_t size = (sizeof(*attr) + (attr->sd_len & ~1) + (attr->name_len & ~1) + 3) & ~3;
 
     if (attr == &empty_attributes || size >= get_req_data_size())
@@ -727,10 +707,55 @@ int ios_doorbell_poll_thread( unsigned int tid )
     return again;
 }
 
+#include <time.h>   /* clock_gettime_nsec_np, [io-stuck] rev 3 */
+/* [io-stuck] rev 3 (LOG ONLY): what read_request last saw for each thread, and
+ * the owning thread's state for fd_ios.c ios_dump_io_stuck. io-stuck rev 2
+ * found Battle.net.exe request pipes with a whole request unread while the
+ * server thread is RUNNING; this says whether the server tried to read them
+ * and what read() answered. Indexed by Wine tid / 4. */
+#define IOS_IOSTUCK_TIDS 16384
+static struct { unsigned int calls, fails; int ret, err; unsigned long long t_ns; } ios_iostuck_rd[IOS_IOSTUCK_TIDS];
+
+static void ios_iostuck_note( struct thread *thread, int ret, int err )
+{
+    unsigned int idx = thread->id >> 2;
+    if (idx >= IOS_IOSTUCK_TIDS) return;
+    ios_iostuck_rd[idx].fails++;
+    ios_iostuck_rd[idx].ret = ret;
+    ios_iostuck_rd[idx].err = err;
+    ios_iostuck_rd[idx].t_ns = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
+}
+
+/* 1 and a line in buf when obj is a thread (called from fd_ios.c) */
+int ios_iostuck_thread_fmt( struct object *obj, struct fd *fd, char *buf, size_t len )
+{
+    struct thread *t;
+    unsigned int idx;
+    unsigned long long now = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
+
+    if (!obj || !obj->ops || obj->ops->type != &thread_type) return 0;
+    t = (struct thread *)obj;
+    idx = t->id >> 2;
+    if (idx < IOS_IOSTUCK_TIDS && ios_iostuck_rd[idx].t_ns)
+        snprintf( buf, len, "thread=%04x pid=%04x state=%d this-is-its-request-fd=%d req_toread=%u "
+                  "read_request calls=%u failed=%u last-fail ret=%d errno=%d %llums ago",
+                  t->id, t->process ? t->process->id : 0, (int)t->state, t->request_fd == fd, t->req_toread,
+                  ios_iostuck_rd[idx].calls, ios_iostuck_rd[idx].fails, ios_iostuck_rd[idx].ret,
+                  ios_iostuck_rd[idx].err, (now - ios_iostuck_rd[idx].t_ns) / 1000000ull );
+    else
+        snprintf( buf, len, "thread=%04x pid=%04x state=%d this-is-its-request-fd=%d req_toread=%u "
+                  "read_request calls=%u failed=0",
+                  t->id, t->process ? t->process->id : 0, (int)t->state, t->request_fd == fd, t->req_toread,
+                  idx < IOS_IOSTUCK_TIDS ? ios_iostuck_rd[idx].calls : 0 );
+    return 1;
+}
+
 /* read a request from a thread */
 void read_request( struct thread *thread )
 {
     int ret;
+
+    if ((thread->id >> 2) < IOS_IOSTUCK_TIDS) ios_iostuck_rd[thread->id >> 2].calls++;   /* [io-stuck] */
 
     if (!thread->req_toread)  /* no pending request */
     {
@@ -768,6 +793,7 @@ void read_request( struct thread *thread )
     }
 
 error:
+    ios_iostuck_note( thread, ret, ret < 0 ? errno : 0 );   /* [io-stuck] rev 3, log only */
     if (!ret)  /* closed pipe */
     {
         /* ml586: this kill was previously SILENT — the 0060-family autopsy
@@ -823,7 +849,9 @@ int receive_fd( struct process *process )
         struct thread *thread;
 
         if (data.tid) thread = get_thread_from_id( data.tid );
-        else thread = (struct thread *)grab_object( get_process_first_thread( process ));
+        /* srv-add-first-thread: an empty thread list logs "receive_fd BAD ... cause=no-thread"
+         * below instead of calling grab_object( NULL ) (the 0.2.37-0.2.40 hang) */
+        else if ((thread = get_process_first_thread( process ))) grab_object( thread );
 
         if (!thread || thread->process != process || thread->state == TERMINATED)
         {
@@ -1023,8 +1051,10 @@ static void master_socket_poll_event( struct fd *fd, int event )
         ws_log("[wineserver] create_process returned %p", (void*)process);
         if (process)
         {
+            struct thread *thread;
             ws_log("[wineserver] calling create_thread...");
-            create_thread( -1, process, NULL );
+            thread = create_thread( -1, process, NULL );
+            if (thread) add_process_thread( process, thread );
             ws_log("[wineserver] create_thread done, releasing...");
             release_object( process );
             ws_log("[wineserver] client fully connected!");
@@ -1051,9 +1081,23 @@ void master_socket_handle_client(int client_fd)
 
     if (process)
     {
+        struct thread *thread;
+        const char *off;
+
         ws_log("[wineserver] calling create_thread...");
-        create_thread( -1, process, NULL );
-        ws_log("[wineserver] create_thread done, releasing...");
+        thread = create_thread( -1, process, NULL );
+        /* Wine 11.22 moved add_process_thread() out of create_thread() into its callers.
+         * The 11.22 port added it to master_socket_poll_event above but not to this iOS
+         * twin, which is the path every Madeira process takes (the socketpair bypass).
+         * Without it the process has no threads: the first send_fd from the client
+         * (init step 7, tid 0) reaches receive_fd -> get_process_first_thread() == NULL ->
+         * grab_object( NULL ), and the server thread never returns (0.2.40 log, [init-hang]:
+         * "pc ... = grab_object+0", "lr ... = receive_fd+0x184", passes frozen at 402).
+         * Off: env MADEIRA_SRV_ADD_FIRST_THREAD=0 (restores the 0.2.37-0.2.40 hang). */
+        off = getenv( "MADEIRA_SRV_ADD_FIRST_THREAD" );
+        if (thread && !(off && off[0] == '0' && !off[1])) add_process_thread( process, thread );
+        ws_log("[wineserver] create_thread done (thread %04x, process %04x), releasing...",
+               thread ? thread->id : 0, process->id);
         release_object( process );
         ws_log("[wineserver] client fully connected!");
     }

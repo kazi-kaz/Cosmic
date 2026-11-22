@@ -16,14 +16,14 @@ invalidates and untraps the whole host page (each RWX 4 KB page with its own
 untrap protection), and hot SMC pages are tracked per host page. Both
 modules.
 
-Applies on willfaust/FEX 6fb1b50 (Madeira's FEX pin). The shipped
+Applies on FEX a77d5687 (Madeira's FEX pin: Nick's line + FEX-2611). The shipped
 app/Madeira/aarch64-windows/xtajit.dll and arm64ec-windows/xtajit64.dll are
-built from 6fb1b50 + this patch with build/fex-wow64/build.sh and
+built from a77d5687 + the patches with build/fex-wow64/build.sh and
 build/fex-arm64ec/build.sh (llvm-mingw 20260421). Madeira-only: not for
 FEX-Emu.
 
 diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
-index 09149a6aa..073d558bc 100644
+index b11f2bec0..b62bd1965 100644
 --- a/Source/Windows/Common/InvalidationTracker.cpp
 +++ b/Source/Windows/Common/InvalidationTracker.cpp
 @@ -27,6 +27,20 @@ extern "C" void ios_fex_mono_arm(uint64_t Base, uint64_t End);
@@ -47,7 +47,7 @@ index 09149a6aa..073d558bc 100644
  namespace FEX::Windows {
  uint64_t InvalidationTracker::OwnedSharedMutex::Self() {
  #ifdef FEX_IOS_HOST
-@@ -537,25 +551,37 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+@@ -644,25 +658,37 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
    if (NeedsInvalidate) {
      // MADEIRA: a page that turns hot here is invalidated below as usual, once: from then on nothing
      // compiled from it relies on the write trap.
@@ -92,7 +92,7 @@ index 09149a6aa..073d558bc 100644
        if (Locked) {
          CTX.GetCodeInvalidationMutex().unlock();
        }
-@@ -580,7 +606,7 @@ bool InvalidationTracker::IsHotSMCPage(uint64_t Address) const {
+@@ -687,7 +713,7 @@ bool InvalidationTracker::IsHotSMCPage(uint64_t Address) const {
    if (!Used) {
      return false;
    }
@@ -101,7 +101,7 @@ index 09149a6aa..073d558bc 100644
    for (uint32_t i = 0; i < Used; ++i) {
      if (HotPages[i].load(std::memory_order_acquire) == Page) {
        return true;
-@@ -600,7 +626,7 @@ bool InvalidationTracker::CountSMCWriteFault(uint64_t Page) {
+@@ -707,7 +733,7 @@ bool InvalidationTracker::CountSMCWriteFault(uint64_t Page) {
    }
  
    // Direct-mapped: a page evicted by another one simply starts counting again.
@@ -110,7 +110,7 @@ index 09149a6aa..073d558bc 100644
    if (Slot.Page != Page || Now - Slot.WindowStart > Frequency) {
      Slot = {Page, Now, 0};
    }
-@@ -964,7 +990,10 @@ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uin
+@@ -1071,7 +1097,10 @@ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uin
  }
  
  bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked) {
@@ -122,7 +122,7 @@ index 09149a6aa..073d558bc 100644
    std::shared_lock Lock(IntervalsLock);
  
    if (SMCDetectionDisabled) {
-@@ -998,12 +1027,12 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
+@@ -1105,12 +1134,12 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
        } else {
          // MADEIRA: never write-protect a hot page again; protect the runs of pages around it.
          uint64_t RunBegin = Address;

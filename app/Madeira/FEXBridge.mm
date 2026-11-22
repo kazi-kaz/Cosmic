@@ -218,15 +218,32 @@ static bool g_exit_jmp_set = false;
 // Minimal SyscallHandler for FEXCore
 // Handles basic syscalls so FEXCore can initialize and run trivial x86 code
 // ---------------------------------------------------------------------------
+// The syscall number and first three arguments (FEX-2611 dropped HLE::SyscallArguments).
+struct BridgeSyscallArgs {
+    uint64_t Argument[4];
+};
+
 class iOSSyscallHandler : public FEXCore::HLE::SyscallHandler {
 public:
-    iOSSyscallHandler() {
-        OSABI = FEXCore::HLE::SyscallOSABI::OS_LINUX64;
-    }
+    iOSSyscallHandler() = default;
 
     static std::atomic<int> syscall_count;
 
-    uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame *Frame, FEXCore::HLE::SyscallArguments *Args) override {
+    /* FEX-2611 API: HandleSyscall gets only the frame, a syscall ends its block, and the handler
+     * writes the result to RAX and steps RIP past the 2-byte `syscall` itself (as FEX's Linux
+     * front end does). */
+    void HandleSyscall(FEXCore::Core::CpuStateFrame *Frame) override {
+        auto &Regs = Frame->State.gregs;
+        BridgeSyscallArgs ArgsStorage {};
+        ArgsStorage.Argument[0] = Regs[FEXCore::X86State::REG_RAX];
+        ArgsStorage.Argument[1] = Regs[FEXCore::X86State::REG_RDI];
+        ArgsStorage.Argument[2] = Regs[FEXCore::X86State::REG_RSI];
+        ArgsStorage.Argument[3] = Regs[FEXCore::X86State::REG_RDX];
+        Regs[FEXCore::X86State::REG_RAX] = HandleSyscallImpl(Frame, &ArgsStorage);
+        Frame->State.rip += 2;
+    }
+
+    uint64_t HandleSyscallImpl(FEXCore::Core::CpuStateFrame *Frame, BridgeSyscallArgs *Args) {
         syscall_count.fetch_add(1);
         // Args[0] = RAX (syscall number), Args[1] = RDI, Args[2] = RSI, Args[3] = RDX, ...
         uint64_t SyscallNum = Args->Argument[0];
@@ -238,9 +255,7 @@ public:
             auto buf = reinterpret_cast<const char*>(Args->Argument[2]);
             size_t count = Args->Argument[3];
 
-            // NOTE: On non-Windows, syscall does NOT have FLAGS_BLOCK_END.
-            // The JIT-compiled block continues past the syscall instruction.
-            // Do NOT modify Frame->State.rip here — the JIT handles continuation.
+            // HandleSyscall above steps RIP past the syscall and stores the result in RAX.
 
             if (fd == 1 || fd == 2) {
                 // stdout/stderr
@@ -269,8 +284,6 @@ public:
         }
         default:
             fex_log("[x86] Unhandled syscall %llu", SyscallNum);
-            // Do NOT modify rip — syscall is non-block-ending on non-Windows,
-            // so the JIT continues past it inline.
             return -38; // ENOSYS
         }
     }
@@ -430,8 +443,7 @@ bool fex_initialize(void) {
     // Step 5: Create HostFeatures for Apple A15 (iPhone 13 Pro)
     fex_log("  Creating HostFeatures...");
     FEXCore::HostFeatures Features{};
-    Features.DCacheLineSize = 64;
-    Features.ICacheLineSize = 64;
+    Features.DCacheLineLog2 = 4;      // 64-byte lines (FEX-2611: 4 << DCacheLineLog2)
     Features.SupportsCacheMaintenanceOps = true;
     Features.SupportsAES = true;
     Features.SupportsCRC = true;
@@ -443,9 +455,9 @@ bool fex_initialize(void) {
     Features.SupportsFCMA = true;
     Features.SupportsFlagM = true;
     Features.SupportsFlagM2 = true;
-    Features.SupportsAVX = false;     // No SVE on A15
-    Features.SupportsSVE128 = false;
-    Features.SupportsSVE256 = false;
+    Features.ProcessFeatures.SupportsAVX = false;     // No SVE on A15
+    Features.ProcessFeatures.SupportsSVE128 = false;
+    Features.ProcessFeatures.SupportsSVE256 = false;
     // A15 has 6 performance + 2 efficiency cores
     Features.CPUMIDRs.resize(8, 0x611F0250); // A15 Firestorm MIDR (approximate)
 
@@ -668,7 +680,12 @@ int64_t fex_test_execute(void) {
     fex_log("Creating FEX thread (RIP=0x%llx, RSP=0x%llx)...",
             (unsigned long long)code_addr, (unsigned long long)stack_addr);
 
-    auto *Thread = g_ctx->CreateThread(code_addr, stack_addr);
+    auto *Thread = g_ctx->CreateThread();
+    if (Thread) {
+        // FEX-2611 API: CreateThread takes no RIP/RSP; set them on the new frame.
+        Thread->CurrentFrame->State.rip = code_addr;
+        Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP] = stack_addr;
+    }
     if (!Thread) {
         fex_log("FAIL: CreateThread returned null");
         for (int i = 0; i < num_mapped; i++) ::munmap(mapped_regions[i].addr, mapped_regions[i].size);

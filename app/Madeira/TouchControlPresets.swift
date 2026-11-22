@@ -111,6 +111,11 @@ struct ControlPresetScreen: Equatable {
 enum ControlPresetLayout {
     static let xboxID = "builtin.xbox"
     static let xboxName = "Xbox controller"
+    /// The keyboard built-in: a WASD stick on the left, the keys and mouse buttons most
+    /// PC games want on the right, and a look zone over the right half. It does not need
+    /// touch XInput (no pad buttons).
+    static let wasdID = "builtin.wasd"
+    static let wasdName = "WASD keyboard"
     /// Mirrors `TouchControlsModel.baseDiameter`.
     static let baseDiameter = 64.0
 
@@ -132,6 +137,64 @@ enum ControlPresetLayout {
         let z = c.action.controlSize(diameter: CGFloat(baseDiameter * c.scale))
         return CGRect(x: c.nx * s.width - Double(z.width) / 2, y: c.ny * s.height - Double(z.height) / 2,
                       width: Double(z.width), height: Double(z.height))
+    }
+
+    /// The built-in keyboard layout, placed in points from the safe-area edges like
+    /// `xbox(for:)` and then normalised to the screen it is loaded on:
+    ///
+    ///   Esc (top left corner)                                  Tab (top right corner)
+    ///   Shift above the WASD stick, Ctrl on its right (bottom left)
+    ///   Bottom right, a grid from the corner: R click above L click in the rightmost
+    ///   column, then Space and E, then Enter and F. The look zone is `wasdZones()`.
+    static func wasd(for screen: ControlPresetScreen) -> [TouchControl] {
+        let s = screen.landscape
+        let W = s.width, H = s.height
+        guard W > 0, H > 0 else { return [] }
+        let k = min(max(H / 400, 1.0), 1.3)
+        let (L, R, T, B) = margins(s)
+        var out: [TouchControl] = []
+        func add(_ action: ControlAction, _ scale: Double, _ x: Double, _ y: Double) {
+            var c = TouchControl()
+            c.action = action
+            c.scale = scale
+            c.nx = x / W
+            c.ny = y / H
+            out.append(c)
+        }
+        let keyScale = 0.85 * k, key = baseDiameter * keyScale, step = key + 8 * k
+
+        // WASD stick: bottom left, clear of the home indicator.
+        let stickScale = 1.6 * k, stick = baseDiameter * stickScale
+        let stickX = L + 12 * k + stick / 2, stickY = H - B - 12 * k - stick / 2
+        add(.joystickWASD, stickScale, stickX, stickY)
+        // Shift above the stick, Ctrl on its right, level with its lower edge.
+        add(.key(0x10), keyScale, stickX, stickY - stick / 2 - 10 * k - key / 2)
+        add(.key(0x11), keyScale, stickX + stick / 2 + 10 * k + key / 2, stickY + stick / 2 - key / 2)
+
+        // Esc and Tab: the top corners, beside the overlay's own top band.
+        let cornerY = T + 6 * k + key / 2
+        add(.key(0x1B), keyScale, L + 6 * k + key / 2, cornerY)
+        add(.key(0x09), keyScale, W - R - 6 * k - key / 2, cornerY)
+
+        // Right side: a grid of keys from the bottom right corner, the clicks in the
+        // rightmost column under the thumb.
+        func column(_ i: Double) -> Double { W - R - 6 * k - key / 2 - i * step }
+        func row(_ j: Double) -> Double { H - B - 12 * k - key / 2 - j * step }
+        add(.mouseLeft, keyScale, column(0), row(0))
+        add(.mouseRight, keyScale, column(0), row(1))
+        add(.key(0x20), keyScale, column(1), row(0))   // Space
+        add(.key(0x45), keyScale, column(1), row(1))   // E
+        add(.key(0x0D), keyScale, column(2), row(0))   // Enter
+        add(.key(0x46), keyScale, column(2), row(1))   // F
+        return out
+    }
+
+    /// The keyboard built-in's look zone: the right half of the screen, under the buttons.
+    static func wasdZones() -> [GestureZone] {
+        var z = GestureZone()
+        z.kind = .look
+        z.x = 0.5; z.y = 0.08; z.w = 0.5; z.h = 0.9
+        return [z]
     }
 
     /// The built-in controller layout, using the editor's controller mappings:
@@ -235,6 +298,8 @@ struct ControlPresetStore: Equatable {
     static let builtIns: [ControlPreset] = [
         ControlPreset(id: ControlPresetLayout.xboxID, name: ControlPresetLayout.xboxName,
                       controls: ControlPresetLayout.xbox(for: .referencePhone)),
+        ControlPreset(id: ControlPresetLayout.wasdID, name: ControlPresetLayout.wasdName,
+                      controls: ControlPresetLayout.wasd(for: .referencePhone), zones: ControlPresetLayout.wasdZones()),
     ]
     static let maxNameLength = 40
 
@@ -268,6 +333,36 @@ struct ControlPresetStore: Equatable {
         var n = 1
         while named("Custom Layout \(n)") != nil { n += 1 }
         return "Custom Layout \(n)"
+    }
+
+    /// "<name> copy", then "<name> copy 2", ...: the lowest one not taken, cut so
+    /// the whole name stays inside the length limit.
+    func copyName(of name: String) -> String {
+        let base = String(Self.clean(name).prefix(Self.maxNameLength - 8))
+        var n = 1
+        while true {
+            let candidate = n == 1 ? "\(base) copy" : "\(base) copy \(n)"
+            if named(candidate) == nil { return candidate }
+            n += 1
+        }
+    }
+
+    enum RenameResult: Equatable {
+        case renamed
+        case refusedBuiltIn       // built-ins keep their names
+        case refusedTaken         // another layout already has that name
+        case refusedEmpty
+    }
+
+    /// Rename a user layout. A name any OTHER layout has (built-ins included) is
+    /// refused; the layout's own name, in any case, is allowed (fixes capitals).
+    mutating func rename(id: String, to name: String) -> RenameResult {
+        guard let i = user.firstIndex(where: { $0.id == id }) else { return .refusedBuiltIn }
+        let n = Self.clean(name)
+        guard !n.isEmpty else { return .refusedEmpty }
+        if let other = named(n), other.id != id { return .refusedTaken }
+        user[i].name = n
+        return .renamed
     }
 
     enum SaveResult: Equatable {
@@ -334,8 +429,9 @@ struct ControlPresetStore: Equatable {
     /// loaded on.
     static func layout(of p: ControlPreset, screen: ControlPresetScreen?) -> [TouchControl] {
         var controls = p.controls
-        if p.id == ControlPresetLayout.xboxID, let screen {
-            let fitted = ControlPresetLayout.xbox(for: screen)
+        if let screen {
+            let fitted = p.id == ControlPresetLayout.xboxID ? ControlPresetLayout.xbox(for: screen)
+                : p.id == ControlPresetLayout.wasdID ? ControlPresetLayout.wasd(for: screen) : []
             if !fitted.isEmpty { controls = fitted }
         }
         return controls.map { c in
@@ -403,7 +499,7 @@ final class ControlPresetsModel: ObservableObject {
 
     /// What the layout menu lists.
     var available: [ControlPreset] {
-        (Self.touchPad ? ControlPresetStore.builtIns : []) + store.user
+        ControlPresetStore.builtIns.filter { $0.id != ControlPresetLayout.xboxID || Self.touchPad } + store.user
     }
 
     var active: ControlPreset? { TouchControlsModel.shared.layoutID.flatMap { store.preset($0) } }
@@ -439,7 +535,7 @@ final class ControlPresetsModel: ObservableObject {
 
     /// The landscape screen the overlay is laid out on.
     static func currentScreen() -> ControlPresetScreen {
-        let window = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let window = UIApplication.shared.phoneScenes.compactMap { $0 as? UIWindowScene }
             .flatMap(\.windows).first { $0.isKeyWindow }
         guard let window, window.bounds.width > 0 else { return .referencePhone }
         let i = window.safeAreaInsets
@@ -469,7 +565,7 @@ final class ControlPresetsModel: ObservableObject {
         GestureZonesModel.shared.selected = nil
         GestureZonesModel.shared.zones = ControlPresetStore.zones(of: p)
         m.layoutID = p.id
-        log("loaded layout=\(ControlPresetStore.isBuiltIn(p.id) ? "xbox" : "custom") controls=\(controls.count) reason=\(reason)")
+        log("loaded layout=\(ControlPresetStore.isBuiltIn(p.id) ? p.id : "custom") controls=\(controls.count) reason=\(reason)")
     }
 
     /// Keep the unsaved on-screen controls as the next "Custom Layout N".
@@ -503,6 +599,29 @@ final class ControlPresetsModel: ObservableObject {
         m.editing = true
         log("created custom layout")
         return true
+    }
+
+    /// Copy a layout (a built-in too) as a new custom layout and make the copy
+    /// the active one. A built-in's copy is laid out for this screen first.
+    @discardableResult func duplicate(_ id: String) -> Bool {
+        guard !readOnly, let p = store.preset(id) else { return false }
+        var s = store
+        let controls = ControlPresetStore.layout(of: p, screen: Self.currentScreen())
+        let zones = ControlPresetStore.zones(of: p)
+        guard case .created(let newID) = s.save(name: s.copyName(of: p.name), controls: controls, zones: zones) else { return false }
+        store = s
+        persist()
+        load(newID, screen: Self.currentScreen(), reason: "duplicate")
+        return true
+    }
+
+    /// Rename a custom layout.
+    func rename(_ id: String, to name: String) -> ControlPresetStore.RenameResult {
+        guard !readOnly else { return .refusedBuiltIn }
+        var s = store
+        let r = s.rename(id: id, to: name)
+        if r == .renamed { store = s; persist(); log("renamed custom layout") }
+        return r
     }
 
     /// Delete a custom layout. The on-screen copy of a deleted active layout
@@ -552,7 +671,7 @@ final class ControlPresetsModel: ObservableObject {
 /// the overlay's round top-bar button; `.row` is a labelled row of the library
 /// session's Session menu.
 struct ControlLayoutMenu: View {
-    enum Style { case glass, row }
+    enum Style { case glass, row, card }
 
     @ObservedObject private var presets = ControlPresetsModel.shared
     @ObservedObject private var m = TouchControlsModel.shared
@@ -561,20 +680,28 @@ struct ControlLayoutMenu: View {
     /// editor was opened (a library session saves the game's profile, and closes
     /// its menu to show the editor).
     private let didChoose: ((_ openedEditor: Bool) -> Void)?
+    /// The card style's "Edit this layout" item (the Session menu's Edit controls tile does the same).
+    private let onEdit: (() -> Void)?
 
-    init(style: Style = .glass, didChoose: ((_ openedEditor: Bool) -> Void)? = nil) {
+    init(style: Style = .glass, onEdit: (() -> Void)? = nil, didChoose: ((_ openedEditor: Bool) -> Void)? = nil) {
         self.style = style
+        self.onEdit = onEdit
         self.didChoose = didChoose
     }
 
     private enum Choice: Equatable { case load(String), create }
     @State private var pending: Choice?
     @State private var confirmDelete: ControlPreset?
+    @State private var renaming: ControlPreset?
+    @State private var renameText = ""
+    @State private var renameProblem: String?
 
     var body: some View {
         Group {
             if style == .row {
                 LabeledContent("Controller layout") { menu }
+            } else if style == .card {
+                menu.buttonStyle(.plain)
             } else {
                 menu
             }
@@ -597,6 +724,26 @@ struct ControlLayoutMenu: View {
         } message: {
             Text("The controls on screen are not saved in a layout.")
         }
+        .alert("Rename layout", isPresented: shown($renaming)) {
+            TextField("Name", text: $renameText)
+            Button("Rename") {
+                guard let p = renaming else { return }
+                renaming = nil
+                switch presets.rename(p.id, to: renameText) {
+                case .renamed: didChoose?(false)
+                case .refusedTaken: renameProblem = "Another layout already has that name."
+                case .refusedEmpty: renameProblem = "A layout needs a name."
+                case .refusedBuiltIn: renameProblem = "Built-in layouts keep their names. Copy it first."
+                }
+            }
+            Button("Cancel", role: .cancel) { renaming = nil }
+        }
+        .alert("Could not rename", isPresented: Binding(get: { renameProblem != nil },
+                                                        set: { if !$0 { renameProblem = nil } })) {
+            Button("OK", role: .cancel) { renameProblem = nil }
+        } message: {
+            Text(renameProblem ?? "")
+        }
         .alert("Delete \u{201C}\(confirmDelete?.name ?? "")\u{201D}?", isPresented: shown($confirmDelete)) {
             Button("Delete", role: .destructive) {
                 if let p = confirmDelete, presets.delete(p.id) { didChoose?(false) }
@@ -617,10 +764,22 @@ struct ControlLayoutMenu: View {
                     }
                 }
             }
+            if let onEdit {
+                Button("Edit this layout", systemImage: "slider.horizontal.3", action: onEdit)
+            }
             if !presets.readOnly {
                 Button("Create new layout", systemImage: "plus") { request(.create) }
             }
+            if let a = presets.active, !presets.readOnly {
+                Button("Copy \u{201C}\(a.name)\u{201D}", systemImage: "plus.square.on.square") {
+                    if presets.duplicate(a.id) { didChoose?(false) }
+                }
+            }
             if let a = presets.active, !ControlPresetStore.isBuiltIn(a.id), !presets.readOnly {
+                Button("Rename\u{2026}", systemImage: "pencil") {
+                    renameText = a.name
+                    renaming = a
+                }
                 Button("Delete \u{201C}\(a.name)\u{201D}", systemImage: "trash", role: .destructive) {
                     confirmDelete = a
                 }
@@ -639,6 +798,20 @@ struct ControlLayoutMenu: View {
                     Text(presets.active?.name ?? "Custom")
                     Image(systemName: "chevron.up.chevron.down").font(.caption)
                 }
+            case .card:
+                // A full-width card on the Session menu's main page, in the same fill as the FPS and Aspect cards.
+                HStack {
+                    Text("Touch layout").foregroundStyle(.primary)
+                    Spacer()
+                    HStack(spacing: 4) {
+                        Text(presets.active?.name ?? "Custom")
+                        Image(systemName: "chevron.up.chevron.down").font(.caption)
+                    }.foregroundStyle(Color.accentColor)
+                }
+                .padding(.horizontal, 14).padding(.vertical, 12)
+                .frame(maxWidth: .infinity)
+                .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 14))
+                .contentShape(Rectangle())
             }
         }
         .accessibilityLabel("Controller layout")

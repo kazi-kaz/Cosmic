@@ -86,6 +86,7 @@ enum BCDLaunch {
     /// A start from upstream's library: this game's madeira-bcd options. The
     /// FPS limit is the entry's (upstream's FPS picker, which offers 40 FPS too).
     static func applyLibrary(_ entry: LibraryEntry) {
+        applyVCRTArm64(entry)
         if entry.desktop == true {
             applyExtras(avx: false, wineVCRT: false, nvidia: false, profile: nil)
             return
@@ -132,6 +133,49 @@ enum BCDLaunch {
         }
         if let entry, entry.desktop != true, isUnityIL2CPP(entry) { return ("1", "Unity IL2CPP game (GameAssembly.dll)") }
         return nil
+    }
+
+    /// The ARM64 Visual C++ runtime marker (env.MADEIRA_VCRT_ARM64_KEY, written by
+    /// build/ntdll-unix/server_ios.c) for an Unreal Engine game. Its bootstrap program
+    /// sees an ARM64 machine and asks for "Microsoft Visual C++ 2015-2022
+    /// Redistributable (arm64)" on every start (Satisfactory exits with 0x2329, and
+    /// Subnautica 2 does the same); installing the x64 one or wine-vcrt changes nothing.
+    /// Set to 1 here for an Unreal game, unset for every other start so one game's value
+    /// never carries over. A line in madeira.cfg or the game's own file is exported after
+    /// this and wins (0 turns it off for that game). env.MADEIRA_VCRT_ARM64_AUTO = 0 in
+    /// madeira.cfg turns the automatic choice off.
+    static func applyVCRTArm64(_ entry: LibraryEntry?) {
+        guard let entry, entry.desktop != true, MadeiraConfig.flag("MADEIRA_VCRT_ARM64_AUTO"), isUnreal(entry) else {
+            unsetenv("MADEIRA_VCRT_ARM64_KEY")
+            return
+        }
+        setenv("MADEIRA_VCRT_ARM64_KEY", "1", 1)
+        LogStore.shared.log("[vcrt-arm64] Unreal game: MADEIRA_VCRT_ARM64_KEY=1 (automatic; a line in madeira.cfg or the game's config wins, env.MADEIRA_VCRT_ARM64_AUTO = 0 turns this off)")
+    }
+
+    /// A packaged Unreal Engine game keeps an Engine folder (with Binaries or Extras)
+    /// next to its bootstrap program. The game's folder is checked, and for a program
+    /// started below it (a direct Steam start of Binaries\Win64\*-Shipping.exe) each
+    /// folder between the two.
+    static func isUnreal(_ entry: LibraryEntry) -> Bool {
+        guard let url = LibraryEntry.hostURL(ofWindowsPath: entry.windowsPath) else { return false }
+        var isDir: ObjCBool = false
+        let fm = FileManager.default
+        let folder = (fm.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue ? url : url.deletingLastPathComponent())
+            .resolvingSymlinksInPath().standardizedFileURL
+        var candidates = [folder]
+        if let launched = LibraryEntry.hostURL(ofWindowsPath: entry.launchWindowsPath)?.resolvingSymlinksInPath().standardizedFileURL,
+           launched.path.hasPrefix(folder.path + "/") {
+            var dir = launched.deletingLastPathComponent()
+            while dir.path.hasPrefix(folder.path + "/") { candidates.append(dir); dir = dir.deletingLastPathComponent() }
+        }
+        return candidates.contains { dir in
+            let engine = dir.appendingPathComponent("Engine", isDirectory: true)
+            return ["Binaries", "Extras"].contains { sub in
+                var d: ObjCBool = false
+                return fm.fileExists(atPath: engine.appendingPathComponent(sub).path, isDirectory: &d) && d.boolValue
+            }
+        }
     }
 
     /// A Unity IL2CPP build keeps GameAssembly.dll next to its exe. A direct Steam
@@ -235,5 +279,119 @@ enum D3D9Identity {
             changed = true
         }
         return changed ? lines.joined(separator: "\n") : nil
+    }
+}
+
+/// A library game that ran out of JIT pool (`[jit-pool] EXHAUSTED`, which ends many
+/// big games at start: Slay the Spire 2 with Steam code 45, Satisfactory before its
+/// logo) gets the two lines that fixed those games added to its own config:
+/// `pool-split = 1` (about 880 MB instead of 560-630 MB) and
+/// `env.MADEIRA_X64_IMAGE_NOCOPY = 1` (pure-x64 DLLs are not copied into the pool).
+/// The pool is set up once per app run, so they apply after Madeira is reopened, and
+/// the alert at the end of the session says so. A key the game's config already sets,
+/// to any value, is left alone, so a player's `pool-split = 0` stays.
+/// `env.MADEIRA_JIT_POOL_AUTO = 0` turns this off.
+enum JITPoolAuto {
+    static let lines: [(key: String, value: String)] = [("pool-split", "1"), ("env.MADEIRA_X64_IMAGE_NOCOPY", "1")]
+
+    /// The lines `text` does not set yet.
+    static func missing(_ text: String) -> [(key: String, value: String)] {
+        let values = GameProfile.parse(text)
+        return lines.filter { values[$0.key] == nil }
+    }
+
+    /// `text` with the missing lines added, or nil when nothing is missing.
+    static func added(to text: String) -> String? {
+        let add = missing(text)
+        guard !add.isEmpty else { return nil }
+        var out = text
+        if !out.isEmpty, !out.hasSuffix("\n") { out += "\n" }
+        out += "# Added by Madeira: this game ran out of JIT memory\n"
+        out += add.map { "\($0.key) = \($0.value)" }.joined(separator: "\n") + "\n"
+        return out
+    }
+
+    /// Adds the missing lines to the game's config. Returns true when it changed it.
+    static func apply(windowsPath: String, title: String) -> Bool {
+        guard MadeiraConfig.flag("MADEIRA_JIT_POOL_AUTO") else {
+            LogStore.shared.log("[jit-pool-auto] \(title): ran out of JIT memory; automatic settings are off (MADEIRA_JIT_POOL_AUTO=0)")
+            return false
+        }
+        let file = GameProfile(windowsPath: windowsPath)
+        let text = file.text
+        guard let out = added(to: text) else {
+            LogStore.shared.log("[jit-pool-auto] \(title): ran out of JIT memory; its config already sets pool-split and MADEIRA_X64_IMAGE_NOCOPY")
+            return false
+        }
+        let keys = missing(text).map(\.key).joined(separator: ", ")
+        file.text = out
+        guard file.text == out else {
+            LogStore.shared.log("[jit-pool-auto] \(title): could not write its config", level: .error)
+            return false
+        }
+        LogStore.shared.log("[jit-pool-auto] \(title): ran out of JIT memory; added \(keys) to its config for the next start")
+        return true
+    }
+
+    /// The starting screen's words when the pool ran out before the game came up
+    /// (LibraryModel.poolRestartNote). `added`: this start added the lines; otherwise the
+    /// config already had them (or MADEIRA_JIT_POOL_AUTO=0) and a fresh run may still get
+    /// a bigger pool from iPadOS.
+    static var startHeadline: String { L("Not enough memory") }
+    static func startMessage(_ title: String, added: Bool) -> String {
+        added
+            ? String(format: L("%@ ran out of JIT memory, so Madeira gave it bigger memory settings. Tap Close Madeira (the round arrow below), then open Madeira again: %@ starts by itself."), title, title)
+            : String(format: L("%@ ran out of JIT memory. Tap Close Madeira (the round arrow below), then open Madeira again; that often gives more memory, and %@ starts by itself."), title, title)
+    }
+
+    /// The alert after the session.
+    static func message(_ title: String) -> String {
+        "\(title) ran out of JIT memory, so Madeira gave it bigger JIT memory settings. To use them, close Madeira (swipe it away in the app switcher), open it again and start \(title)."
+    }
+}
+
+/// short-map-notice: the user address map (TASK_VM_INFO.max_address) is shorter than 512 GB although the
+/// extended-virtual-addressing entitlement is there. Sentry, Nov 16 2026: an iPhone19,4 launched with
+/// address-map=[...,0x7180000000) 454GB and 3.3 GB free for every Slay the Spire 2, Tetris Effect, Mina
+/// the Hollower and Hades II start (0 of 33 worked) and with 512GB and 8.1 GB free earlier that day.
+/// Madeira's guest band [0x7000000000, 0x8000000000) is then 6 GB instead of 16 GB. A 63 GB map (iOS 26
+/// without the entitlement) is a different case and is not covered here.
+enum ShortMap {
+    /// The map's size in GB when it is shorter than 512 GB but still past 0x7000000000, else nil.
+    static var gigabytes: UInt64? {
+        var low: UInt64 = 0, high: UInt64 = 0
+        guard jit_task_map_range(&low, &high), high > 0x7000000000, high < 0x8000000000 else { return nil }
+        return high >> 30
+    }
+    static var headline: String { L("Less memory space than usual") }
+    static func message(_ title: String, gigabytes: UInt64) -> String {
+        String(format: L("iOS gave Madeira a smaller memory map for this start (%llu GB instead of 512 GB), and big games like %@ often fail that way. Tap Close Madeira (the round arrow below), restart the iPhone, open Madeira first, then start %@."), gigabytes, title, title)
+    }
+}
+
+/// respawn-guard: the Wine side refused a new copy of a program that had already started
+/// itself again 3 times inside 60 s with each copy closing within 6 s (Fallout: New Vegas
+/// with FalloutNV.exe swapped in for FalloutNVLauncher.exe started itself 32 times until one
+/// copy ran out of memory). At the session's end the player is told; nothing else changes
+/// (a Steam starts choice stays as it is). env.MADEIRA_RESPAWN_GUARD = 0 turns it off.
+enum RespawnGuard {
+    static var enabled: Bool { MadeiraConfig.flag("MADEIRA_RESPAWN_GUARD", fallback: true) }
+
+    static func reset() { madeira_respawn_guard_reset() }
+
+    /// The stopped program's file name, nil when the guard did not act this session.
+    static func stoppedProgram() -> String? {
+        guard enabled else { return nil }
+        var buf = [CChar](repeating: 0, count: 512)
+        guard madeira_respawn_guard_image(&buf, Int32(buf.count)) > 0 else { return nil }
+        let path = String(cString: buf)
+        return path.split(whereSeparator: { $0 == "\\" || $0 == "/" }).last.map(String.init) ?? path
+    }
+
+    /// The note for the player, nil when the guard did not act.
+    static func finish(_ entry: LibraryEntry?) -> String? {
+        guard let program = stoppedProgram(), let entry else { return nil }
+        LogStore.shared.log("[respawn-guard] \(entry.title): \(program) kept starting itself; stopped")
+        return String(format: L("%@ kept restarting itself (%@), so Madeira stopped it."), entry.title, program)
     }
 }

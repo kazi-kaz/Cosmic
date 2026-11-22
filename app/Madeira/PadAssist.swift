@@ -245,7 +245,7 @@ final class PadAssistSensors: @unchecked Sendable {
     }
 
     @MainActor private func updateOrientation() {
-        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        let scene = UIApplication.shared.phoneScenes.compactMap { $0 as? UIWindowScene }.first
         let raw = scene?.interfaceOrientation.rawValue ?? 3
         lock.lock(); orientationValue = raw; lock.unlock()
     }

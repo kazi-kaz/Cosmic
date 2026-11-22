@@ -31,6 +31,15 @@ final class LicenseListBox {
         }
     }
 
+    /// Add packages Steam just granted (RequestFreeLicense) to the list the library
+    /// reads, so the new game shows without waiting for Steam's own new list. Does
+    /// nothing before the first list has come; Steam's next push replaces it all.
+    func add(_ ids: [UInt32]) {
+        guard var list = packageIDs else { return }
+        for id in ids where !list.contains(id) { list.append(id) }
+        packageIDs = list
+    }
+
     /// Forget the current list so the next `value(timeout:)` waits for a
     /// fresh push instead of returning a pre-reconnect list.
     func reset() {

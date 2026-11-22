@@ -50,6 +50,10 @@
 #include <mach/mach_vm.h>
 #include <servers/bootstrap.h>
 
+/* 11.22: struct context_data keeps x0-x17 in x0[18] and x19-x30 in x19[12] (x18 is the platform register). */
+#define IOS_CTX_X(c, i) (*((i) < 18 ? &(c)->integer.arm64_regs.x0[(i)] : &(c)->integer.arm64_regs.x19[(i) - 19]))
+
+
 static mach_port_t server_mach_port;
 
 void sigchld_callback(void)
@@ -435,7 +439,15 @@ int send_thread_signal( struct thread *thread, int sig )
  * one is derived rather than documented, so it is VALIDATED at runtime and any
  * implausible value makes the whole substitution fall through. */
 #define IOS_TEB_SYSCALL_FRAME_OFF  0x378
-#define IOS_TEB_KERNEL_STACK_OFF   0x3a8
+/* ml1122 (Wine 11.22): the kernel stack pointer is no longer in the TEB. The unix thread
+ * data moved to its own block (struct thread_data, unix_private.h): 64 KiB holding the
+ * header and the signal stack, then the 1 MiB kernel stack. virtual_ios.c init_teb()
+ * stores that block's address in teb_data.cpu_data[15] = TEB + 0x2f0 + 15*8 (the same
+ * slot signal_arm64_ios.c calls IOS_TEB_THREAD_DATA_SLOT), so the kernel stack base is
+ * that address + 0x10000. Still validated by the callers (kstack < frame, sp in range),
+ * so a wrong value falls through as before. */
+#define IOS_TEB_THREAD_DATA_OFF    0x368
+#define IOS_THREAD_DATA_KSTACK_OFF 0x10000
 /* struct syscall_frame (unix/signal_arm64.c): x[29] 000, fp 0e8, lr 0f0, sp 0f8,
  * pc 100, cpsr 108; sizeof == 0x330. */
 #define IOS_SCF_FP    0x0e8
@@ -485,6 +497,16 @@ static int ios_safe_read( uint64_t addr, void *buf, unsigned int size )
                                 (mach_vm_size_t)size, (mach_vm_address_t)buf, &got ))
         return 0;
     return got == size;
+}
+
+/* kernel stack base of the thread that owns `teb` (see IOS_TEB_THREAD_DATA_OFF) */
+static int ios_read_kernel_stack( uint64_t teb, uint64_t *kstack )
+{
+    uint64_t data = 0;
+
+    if (!ios_safe_read( teb + IOS_TEB_THREAD_DATA_OFF, &data, 8 ) || !data || (data & 0xffff)) return 0;
+    *kstack = data + IOS_THREAD_DATA_KSTACK_OFF;
+    return 1;
 }
 
 /* ================= ml730 REAL THREAD SUSPENSION (opt-in) =================
@@ -686,7 +708,7 @@ static uint64_t ios_wow_syscall_frame( struct thread *thread, uint64_t sp )
 
     if (!thread->teb) return 0;
     if (!ios_safe_read( (uint64_t)thread->teb + IOS_TEB_SYSCALL_FRAME_OFF, &frame, 8 ) ||
-        !ios_safe_read( (uint64_t)thread->teb + IOS_TEB_KERNEL_STACK_OFF, &kstack, 8 ))
+        !ios_read_kernel_stack( (uint64_t)thread->teb, &kstack ))
         return 0;
     if (!frame || !kstack || (frame & 7) || kstack >= frame || sp < kstack || sp > frame) return 0;
     return frame;
@@ -794,9 +816,9 @@ int ios_apply_resume_context( struct thread *thread, const struct context_data *
         if (native->flags & SERVER_CTX_INTEGER)
         {
             for (i = 0; i < 29; i++)
-                if (i != 18) *(uint64_t *)(f + i * 8) = native->integer.arm64_regs.x[i];
-            *(uint64_t *)(f + IOS_SCF_FP) = native->integer.arm64_regs.x[29];
-            *(uint64_t *)(f + IOS_SCF_LR) = native->integer.arm64_regs.x[30];
+                if (i != 18) *(uint64_t *)(f + i * 8) = IOS_CTX_X( native, i );
+            *(uint64_t *)(f + IOS_SCF_FP) = native->integer.arm64_regs.x19[10];
+            *(uint64_t *)(f + IOS_SCF_LR) = native->integer.arm64_regs.x19[11];
         }
         *(uint64_t *)(f + IOS_SCF_SP)   = native->ctl.arm64_regs.sp;
         *(uint64_t *)(f + IOS_SCF_PC)   = native->ctl.arm64_regs.pc;
@@ -926,9 +948,9 @@ int ios_fill_thread_context( struct thread *thread,
         native->ctl.arm64_regs.sp     = arm.__sp;
         native->ctl.arm64_regs.pc     = arm.__pc;
         native->ctl.arm64_regs.pstate = arm.__cpsr;
-        for (i = 0; i < 29; i++) native->integer.arm64_regs.x[i] = arm.__x[i];
-        native->integer.arm64_regs.x[29] = arm.__fp;
-        native->integer.arm64_regs.x[30] = arm.__lr;
+        for (i = 0; i < 29; i++) if (i != 18) IOS_CTX_X( native, i ) = arm.__x[i];
+        native->integer.arm64_regs.x19[10] = arm.__fp;
+        native->integer.arm64_regs.x19[11] = arm.__lr;
         have_native = 1;
     }
 
@@ -968,7 +990,7 @@ int ios_fill_thread_context( struct thread *thread,
         uint64_t frame = 0, kstack = 0;
         uint64_t sp = native->ctl.arm64_regs.sp;
         if (ios_safe_read( (uint64_t)thread->teb + IOS_TEB_SYSCALL_FRAME_OFF, &frame, 8 ) &&
-            ios_safe_read( (uint64_t)thread->teb + IOS_TEB_KERNEL_STACK_OFF, &kstack, 8 ) &&
+            ios_read_kernel_stack( (uint64_t)thread->teb, &kstack ) &&
             frame && kstack && !(frame & 7) && kstack < frame && sp >= kstack && sp <= frame)
         {
             unsigned char f[IOS_SCF_SIZE];
@@ -1019,7 +1041,7 @@ int ios_fill_thread_context( struct thread *thread,
             uint64_t sp = native->ctl.arm64_regs.sp;
             uint64_t mach_pc = native->ctl.arm64_regs.pc;   /* before substitution */
             if (ios_safe_read( (uint64_t)thread->teb + IOS_TEB_SYSCALL_FRAME_OFF, &frame, 8 ) &&
-                ios_safe_read( (uint64_t)thread->teb + IOS_TEB_KERNEL_STACK_OFF, &kstack, 8 ) &&
+                ios_read_kernel_stack( (uint64_t)thread->teb, &kstack ) &&
                 frame && kstack && !(frame & 7) && kstack < frame &&
                 sp >= kstack && sp <= frame)
             {
@@ -1033,9 +1055,9 @@ int ios_fill_thread_context( struct thread *thread,
                         unsigned int i;
                         static int n_sub;
                         for (i = 0; i < 29; i++)
-                            native->integer.arm64_regs.x[i] = *(uint64_t *)(f + i * 8);
-                        native->integer.arm64_regs.x[29] = *(uint64_t *)(f + IOS_SCF_FP);
-                        native->integer.arm64_regs.x[30] = *(uint64_t *)(f + IOS_SCF_LR);
+                            if (i != 18) IOS_CTX_X( native, i ) = *(uint64_t *)(f + i * 8);
+                        native->integer.arm64_regs.x19[10] = *(uint64_t *)(f + IOS_SCF_FP);
+                        native->integer.arm64_regs.x19[11] = *(uint64_t *)(f + IOS_SCF_LR);
                         native->ctl.arm64_regs.sp     = fsp;
                         native->ctl.arm64_regs.pc     = fpc;
                         native->ctl.arm64_regs.pstate = *(uint32_t *)(f + IOS_SCF_CPSR);

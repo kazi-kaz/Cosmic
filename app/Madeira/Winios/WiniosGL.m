@@ -288,6 +288,8 @@ uint64_t madeira_frame_count(void) {
     return madeira_get_present_count() + atomic_load_explicit(&gl_present_count, memory_order_relaxed);
 }
 
+extern void winios_note_game_picture(void);   // Winios.m, cover-window
+
 // The presenter behind *state, created on first use for hwnd's layer.
 static MadeiraGLPresenter *presenter_get(void **state, void *hwnd) {
     MadeiraGLPresenter *p = (__bridge MadeiraGLPresenter *)*state;
@@ -296,6 +298,7 @@ static MadeiraGLPresenter *presenter_get(void **state, void *hwnd) {
         if (!layer) return nil;
         p = [MadeiraGLPresenter new];
         p->layer = layer;
+        winios_note_game_picture();   // cover-window: the session has a picture now
         p->device = layer.device ?: MTLCreateSystemDefaultDevice();
         p->queue = [p->device newCommandQueue];
         p->queue.label = @"winios-gl present";

@@ -27,9 +27,9 @@ enum MadeiraConfig {
         "jumbo-mb", "jumbo-keep-mb", "iat-noexec", "vmwatch", "no-local-read", "vsps-fill",
     ]
 
-    static var documents: URL? {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-    }
+    /// Looked up once: FileManager.urls(for:in:) touches the file system on every call, and the
+    /// library asked for it (through all()) many times per redraw on the main thread.
+    static let documents: URL? = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
     static var url: URL? { documents?.appendingPathComponent(fileName) }
     static var present: Bool { url.map { FileManager.default.fileExists(atPath: $0.path) } ?? false }
 
@@ -38,8 +38,23 @@ enum MadeiraConfig {
     /// Cached: the library reads switches while it builds a page, which is the main thread in the middle
     /// of a scroll, and reading and parsing the file each time cost frames. Each call stats the file (a change by
     /// anyone is seen at once) and parses it again only when its modification time or size moved.
+    /// The stat itself is skipped when the last one was under a second ago: during a download the
+    /// library redraws several times a second and every card read switches, so the main thread spent
+    /// most of its time in stat (Test 12 log, Nov 11). Madeira's own writes call invalidate().
     static func all() -> [String: String] {
         guard let u = url else { return [:] }
+        let now = ProcessInfo.processInfo.systemUptime
+        cache.lock.lock()
+        // [cfg-calls]: says in the log when the cache is read hundreds of times a second (a screen
+        // redrawing in a loop), once per 10 s at most.
+        cache.calls += 1
+        if now - cache.windowStart >= 10 {
+            let rate = Double(cache.calls) / (now - cache.windowStart)
+            if cache.windowStart > 0, rate > 200 { fputs("[cfg-calls] madeira.cfg read \(Int(rate)) times a second\n", stderr) }
+            cache.calls = 0; cache.windowStart = now
+        }
+        if let hit = cache.value, now - cache.checkedAt < 1.0 { cache.lock.unlock(); return hit }
+        cache.lock.unlock()
         var info = stat()
         #if os(Linux)   // the host checks compile this file on Linux, where stat has st_mtim
         let stamp: String = stat(u.path, &info) == 0 ? "\(info.st_mtim.tv_sec).\(info.st_mtim.tv_nsec).\(info.st_size)" : ""
@@ -48,8 +63,9 @@ enum MadeiraConfig {
         #endif
         cache.lock.lock()
         defer { cache.lock.unlock() }
+        cache.checkedAt = now
         if let hit = cache.value, cache.stamp == stamp { return hit }
-        let parsed = stamp.isEmpty ? [:] : ((try? String(contentsOf: u, encoding: .utf8)).map(parse) ?? [:])
+        let parsed = stamp.isEmpty ? [:] : (readText(u).map(parse) ?? [:])
         cache.value = parsed; cache.stamp = stamp; cache.exists = !stamp.isEmpty
         return parsed
     }
@@ -59,6 +75,9 @@ enum MadeiraConfig {
         var value: [String: String]?
         var stamp = ""
         var exists = false
+        var checkedAt: TimeInterval = -1_000
+        var calls = 0
+        var windowStart: TimeInterval = 0
     }
     private static let cache = Cache()
     /// `present`, from the same cache as `all()`: no file system call per read.
@@ -77,6 +96,15 @@ enum MadeiraConfig {
             if !k.isEmpty { out[k] = v }
         }
         return out
+    }
+
+    /// [cfg-lossy-decode] A config file as text. One byte that is not valid UTF-8 (a pasted Latin 1
+    /// character, a cut multi-byte one) used to make the whole read fail, so every other key looked
+    /// unset and the next write dropped them all (upstream issue 617). Now the file always decodes: bad bytes
+    /// become U+FFFD and every key stays. nil only when the file cannot be read at all.
+    nonisolated static func readText(_ url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
     }
 
     /// The value for `key`, trimmed, or nil when unset. Falls back to the legacy
@@ -105,7 +133,7 @@ enum MadeiraConfig {
     /// with the same parser GameProfile uses.
     static func gameValue(_ key: String) -> String? {
         guard let p = getenv("MADEIRA_CFG_GAME"), case let path = String(cString: p), !path.isEmpty,
-              let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+              let text = readText(URL(fileURLWithPath: path)) else { return nil }
         return parse(text)[key].flatMap { $0.isEmpty ? nil : $0 }
     }
 
@@ -131,7 +159,7 @@ enum MadeiraConfig {
         let pairs = parse(text ?? "")
         guard let u = gameURL else { return [:] }
         if let profileURL {
-            let profileText = (try? String(contentsOf: profileURL, encoding: .utf8)) ?? ""
+            let profileText = readText(profileURL) ?? ""
             let profilePairs = parse(profileText)
             if pairs.isEmpty || text == nil {
                 try? FileManager.default.removeItem(at: u)
@@ -188,7 +216,7 @@ enum MadeiraConfig {
     static func set(_ key: String, _ value: String?) -> Bool {
         guard let u = url else { return false }
         if !present { migrateLegacy(log: { _ in }) }
-        let text = (try? String(contentsOf: u, encoding: .utf8)) ?? ""
+        let text = readText(u) ?? ""
         var lines = text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" }).map(String.init)
         if lines.last == "" { lines.removeLast() }
         lines.removeAll { line in

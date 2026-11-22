@@ -45,13 +45,38 @@ INT_READERS = {"madeira_cfg_int", "mad_cfg_int_pe"}
 # Titles, kinds and fixed choices for options with a dedicated Settings row.
 # "choices" are (value, label); the empty value means "remove the key".
 OVERLAY = {
+    # Read through DockInstallers.separateSession (a key string, not flag("...")), so the scan does not find it.
+    "env.MADEIRA_DOCK_INSTALL_SEPARATE": {"category": "Steam & Dock", "title": "", "kind": "bool", "default": "",
+                "sources": ["app/Madeira/DockInstallers.swift"],
+                "note": "unset: only a game whose own lines hold an address-space layout line (env.MADEIRA_RDR2_VA_HOLD, "
+                        "env.MADEIRA_SC_PA_POOLS) runs its one-time installs in a session of their own and starts after a "
+                        "restart; every other game starts right after them in the same session. 1: always a session of their "
+                        "own; 0: never"},
+    # (shared-configs) app/Madeira/SharedConfigs.swift.
+    "env.MADEIRA_BULK_ACTIONS": {"category": "App & front end", "title": "All games: Reset All and Verify All", "kind": "bool", "default": "1",
+                "note": "The Settings section that resets or verifies every game at once. 0 hides it (madeira.cfg only). Read when Settings opens."},
+    "env.MADEIRA_SHARED_CONFIGS": {"category": "App & front end", "title": "Shared settings from other players", "kind": "bool", "default": "1",
+                "note": "Settings other players said work for a game, approved by Madeira, used as that game's recommended settings when it has no list of its own; Madeira asks Keep or Undo the first time. 0 turns it off. Read at app start."},
+    "env.MADEIRA_KILLLIST": {"category": "App & front end", "title": "Switches the team turned off", "kind": "bool", "default": "1",
+                "note": "A signed list from the Madeira team of switches to keep off for a build, so a fix that breaks games can be turned off without a new app; a line in madeira.cfg or the game's own config still wins. 0 ignores the list. Read at app start."},
     # Madeira in the background (app/Madeira/BackgroundRun.swift, build/ntdll-unix/audio_null_ios.c).
+    "env.MADEIRA_LIBRARY_COVER_CACHE": {"category": "App & front end", "title": "Library covers from the cover cache", "kind": "bool", "default": "1",
+                "note": "On by default: the SwiftUI cards (list layouts, the original grid, the GOG, itch.io, Epic Games and EA "
+                        "sections) take their covers from the zoomable grid's cover cache: downsampled off the main thread, kept "
+                        "in memory and on disk, so a big library scrolls without covers popping in again. 0: AsyncImage, as before. "
+                        "Read at app start."},
     "background-run": {"category": "App & front end", "title": "Keep a game running in the background (minutes)",
                 "kind": "int", "default": "10", "sources": ["app/Madeira/BackgroundRun.swift"],
                 "note": "Minutes a running game keeps going after you switch apps or lock the screen, so a long load "
                         "finishes while you are away. Loading and other CPU work go on; drawing waits until Madeira is "
                         "back (background-pause). The game's sound is muted meanwhile. 0: iOS pauses the game within "
                         "seconds, as before. A game's own config can set it. [bg-run] lines in the log."},
+    # Apple Pencil as a mouse (app/Madeira/ContentView.swift, MetalBackedView).
+    "pencil-mouse": {"category": "App & front end", "title": "Apple Pencil as a mouse",
+                "kind": "bool", "default": "0", "sources": ["app/Madeira/ContentView.swift"],
+                "note": "1: the Apple Pencil acts as a mouse. Touching the screen is a left press and drag as before; "
+                        "hovering above it moves the pointer; squeezing an Apple Pencil Pro right-clicks where it is. "
+                        "Ignored in mouse-look (relative) mode. A game's own config can set it. [pencil] line in the log."},
     "background-gpu-gate": {"category": "App & front end", "title": "Hold GPU work in the background",
                 "kind": "bool", "default": "1", "sources": ["app/Madeira/BackgroundRun.swift"],
                 "note": "On by default. While Madeira is not the active app, any thread other than the app's main "
@@ -77,6 +102,11 @@ OVERLAY = {
                 "kind": "int", "default": "10",
                 "note": "Default 10 ms between pasted characters. Range 1-100 ms; use a longer interval for games "
                         "that miss fast text input. Enforced at delivery as well as queueing. Restart the session after changing it."},
+    "env.MADEIRA_OPEN_LINKS": {"category": "Windows, display & input", "kind": "bool", "default": "1",
+                "note": "On by default: when a game asks Windows to open a web page (winebrowser.exe with an "
+                        "http or https address, such as DREDGE's Epic sign-in), the address is opened in Safari. "
+                        "0 does not hand the address to the app (winebrowser.exe still starts and ends with code 1, "
+                        "as before)."},
     "env.MADEIRA_DOCK_STEAM_RUN": {"category": "Steam & Dock", "kind": "bool", "default": "1",
                 "note": "On by default: when a game in a Madeira Dock session asks Steam to start another game "
                         "(steam.exe with steam://run/<App ID>, as Black Ops II's campaign does for Zombies), "
@@ -136,6 +166,23 @@ OVERLAY = {
                         "pool: reusable 3 seconds later, once no thread runs in them. Before, they stayed in use "
                         "until Madeira closed, and a game started after many such exits got 16 MB code buffers and "
                         "ran slowly. 0 keeps them in use, as before."},
+    "env.MADEIRA_JIT_SMALL_NOTICE": {"category": "Memory & JIT pool", "title": "Banner when the JIT pool came out smaller",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: once a game is up, a banner says JIT memory is small this time whenever iPadOS "
+                        "gave the pool less than asked (nearly every start without pool-split, and most games are fine). "
+                        "A start that really runs out says Not enough memory either way."},
+    "env.MADEIRA_JIT_POOL_NOTICE_NOW": {"category": "Memory & JIT pool", "title": "Say at once when a game ran out of JIT memory",
+                "kind": "bool", "default": "1",
+                "note": "Default on. When a library game's start runs out of JIT pool ([jit-pool] EXHAUSTED) while the "
+                        "starting screen is up, the screen says Not enough memory at once and offers Close Madeira; the "
+                        "next app run starts the game by itself. 0: the start waits for Steam's code 45 and the alert "
+                        "comes after the session, as before."},
+    "env.MADEIRA_JIT_POOL_AUTO": {"category": "Memory & JIT pool", "title": "Bigger JIT pool for a game that ran out",
+                "kind": "bool", "default": "1",
+                "note": "Default on. A library game whose session logs [jit-pool] EXHAUSTED gets pool-split = 1 and "
+                        "env.MADEIRA_X64_IMAGE_NOCOPY = 1 added to its own config (a key it already sets, to any value, "
+                        "stays as it is), and the alert after the session asks for Madeira to be reopened, since the pool "
+                        "is set up once per app run. 0: nothing is added. Read when the pool runs out."},
     "env.MADEIRA_X64_IMAGE_NOCOPY": {"category": "Memory & JIT pool", "title": "Pure-x64 images without a JIT-pool copy",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: an x64-only image (not ARM64EC hybrid, not a Wine builtin) in a 64-bit "
@@ -165,6 +212,14 @@ OVERLAY = {
                 "note": "The largest new reservation the swap tier backs whole: 256 MB in wide (at most 4 GB), 8 GB in "
                         "broad (at most 16 GB). 9216 with broad coverage (swap-mode = 2) also backs Red Dead "
                         "Redemption 2's 8960 MB heap with the file. Read at session start."},
+    "env.MADEIRA_STACK_SPILL_AUTO": {"category": "Memory & JIT pool", "title": "A new thread's stack may use the kernel's pick after the band refused it",
+                "kind": "bool", "default": "1",
+                "note": "Default on. When Wine's furniture band has no room for a new thread's stack (the request that "
+                        "ends in \"[thr-create] FAILED at emulator stack\" or \"kernel stack\"), the kernel places it "
+                        "anywhere still free instead of the thread failing. Nothing changes while the band has room. "
+                        "Deep Rock Galactic on Direct3D 12, RimWorld and Survivalist: Invisible Strain stopped creating "
+                        "threads this way with 16 GB free above the band. 0: such a thread fails, as before. Log "
+                        "marker [stack-spill-auto]. Read at session start."},
     "env.MADEIRA_THREAD_STACK_SPILL": {"category": "Memory & JIT pool", "title": "New threads may use the kernel's pick when memory space is full",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: a new thread's 1 MB kernel stack (and its emulator stack) is looked for from "
@@ -461,6 +516,23 @@ OVERLAY = {
                         "furniture, the V8 and Oilpan cages, the FEX arena), the largest free gap, and whether Red "
                         "Dead Redemption 2's 8960 MB reserve fits; 64 censuses at most. Logging only, changes no "
                         "placement; read at session start."},
+    "env.MADEIRA_RUN_LEDGER": {"category": "Debugging / logs", "title": "Keep a one-line history of game runs", "kind": "bool", "default": "1",
+                "note": "One line per game launch (game, build, result, length) kept in a small file for Get Help and shared logs. 0 stops keeping it. Read at app start."},
+    "env.MADEIRA_KEEP_LASTGOOD": {"category": "Debugging / logs", "title": "Keep the last good and last failed log per game", "kind": "bool", "default": "1",
+                "note": "Saves the log of each game's last run that worked and last run that failed, so Get Help can show both. 0 stops saving them."},
+    "env.MADEIRA_LOG_SETTINGS": {"category": "Debugging / logs", "title": "Put the game's settings in the log summary", "kind": "bool", "default": "1",
+                "note": "Adds the game's settings to the top of its run in the log. 0 leaves them out."},
+    "env.MADEIRA_LOG_LASTRUN": {"category": "Debugging / logs", "title": "Add the last run to Get Help reports", "kind": "bool", "default": "1",
+                "note": "Adds the game's previous run to a Get Help report and shared log. 0 leaves it out."},
+    "env.MADEIRA_REPORT_CRASH_BLOCK": {"category": "Debugging / logs", "title": "Keep the crash report block in Get Help", "kind": "bool", "default": "1",
+                "note": "Keeps Wine's [crash-report] block, line for line, in Get Help reports and shared logs. 0 treats it like any other lines."},
+    "env.MADEIRA_SHOWN_STEP_DIRECT": {"category": "Debugging / logs", "title": "Record the game-shown step directly", "kind": "bool", "default": "1",
+                "note": "Writes the game shown step into the run summary when a frame or the game's window made the screen go, instead of only reading it back from the log. 0 goes back to the log read alone."},
+    # (remote-recs) app/Madeira/RemoteRecs.swift.
+    "env.MADEIRA_REMOTE_RECS": {"category": "App & front end", "title": "Game lists from the Madeira server", "kind": "bool", "default": "1",
+                "note": "A newer recommended list for a game, signed by Madeira and downloaded without a new app version, replaces the built-in list in configs nobody changed. A line you wrote always wins. 0 turns it off. Read at app start."},
+    "env.MADEIRA_JIT_PORT_PROBE": {"category": "App & front end", "title": "Tell a silent device from a VPN problem", "kind": "bool", "default": "1",
+                "note": "When Enable JIT fails with LocalDevVPN on and the device answering on its pairing port, Madeira asks the JIT port too (0.4 s) and, if it is silent, says so instead of blaming LocalDevVPN. 0 keeps the old message."},
     "env.MADEIRA_EC_HOOK_TRACE": {"category": "Debugging / logs", "title": "Log code patches the emulated copy misses",
                 "kind": "bool", "default": "0",
                 "note": "Default off, logging only. 1 compares executable PE sections and their pool copies before "
@@ -518,12 +590,62 @@ OVERLAY = {
                 "note": "ml2250: a 32-bit thread that has waited this many seconds without a timeout for an SRW lock held by shared owners has every 32-bit thread of its process logged once ([srw-hang]: x86 registers, EBP chain, module-resolved stack words), so the holders are named. Logs 116-119: Steam's 32-bit web helper stopped at start that way. 0: off."},
     "env.MADEIRA_SRW_HANG_KILL_S": {"category": "Exceptions & threads", "title": "End a process stuck on an SRW lock", "kind": "int", "default": "",
                 "note": "ml2250: unset (default): never. N: once a 32-bit thread has waited N seconds for an SRW lock as above, the wineserver ends its process, as TerminateProcess from another process would, so a parent that restarts its helper gets a new one (Steam restarts its web helper). At most 3 per app run. The Steam Big Picture list sets 40."},
+    "env.MADEIRA_NULL_CALL_TRACE": {"category": "x86 emulation (FEX)", "title": "FEX: log what jumped to address 0", "kind": "bool", "default": "1",
+                "note": "[null-call] (LOG ONLY): when an x64 program jumps to guest address 0, log the stack top, the bytes of the call before it and the registers (first 4 per process). Nothing else changes. 0: no log. Also off when env.MADEIRA_LOW_RIP_FAULT = 0."},
+    "env.MADEIRA_KB_STUBS": {"category": "Wine core", "title": 'Wine: export 497 kernelbase stub functions', "kind": 'bool', "default": '0',
+                "note": "[kb-stubs]: off by default: the 497 kernelbase.dll functions Windows has and this port lacks stay hidden from the export name table. 1: they are exported by name and a call to one logs 'unimplemented function kernelbase.dll.<name>' (for a game whose anti-tamper walks every kernelbase export, such as Black Ops III). Put it in that game's own config. Read at process start."},
+    "env.MADEIRA_MF_SYSMEM_FALLBACK": {"category": "Wine core", "title": 'Media Foundation: memory buffers when the video texture cannot be made', "kind": 'bool', "default": '1',
+                "note": "[mf-sysmem]: on (default): when the graphics layer cannot make a video texture for a Media Foundation sample pool (NV12 on DXMT, Resident Evil Village's intro video), the pool uses memory buffers instead of failing. 0: the old failure. Log lines start with [mf-sysmem]."},
+    "env.MADEIRA_MF_READER_LOG": {"category": "Wine core", "title": 'Media Foundation: log why a source reader fails', "kind": 'bool', "default": '1',
+                "note": "[mf-reader] (LOG ONLY): log each failed step of making a source reader with the stream's name and content type, first 32 lines per process. 0: no log."},
+    "env.MADEIRA_GUEST_MACHINE_X64": {"category": "Wine core", "title": 'Wine: tell x86/x64 programs the PC is x64', "kind": 'bool', "default": '1',
+                "note": "[guest-machine-x64]: on (default): an x86 or x64 program that asks for the native machine (IsWow64Process2, PROCESSOR_ARCHITEW6432) is told AMD64 instead of ARM64. 0: the host's real answer. ARM64 programs and the Windows installer keep the real answer."},
+    "env.MADEIRA_KI_LEGACY_FRAME": {"category": "Wine core", "title": 'Wine: old exception frame for hooked KiUserExceptionDispatcher', "kind": 'text', "default": '',
+                "note": "[ki-legacy-frame]: unset: an x64 program that hooks KiUserExceptionDispatcher (Overwatch's loader) gets the old, smaller frame layout. 2: keep the new frame and only drop CONTEXT_XSTATE. 0: off, the Wine 11 frame."},
+    "env.MADEIRA_ZINK_INT_ATTRIBS": {"category": "Windows, display & input", "title": "OpenGL on Zink: integer vertex inputs", "kind": "bool", "default": "1",
+                "note": "[zink-madeira]: on (default, MoltenVK only): a vertex shader input declared int or uint that is fed from a float, normalized or scaled vertex format gets the same-size integer format, because Metal refuses such a pipeline and Zink then skips the draws (Vintage Story). 0: the old formats. 1 also turns it on for other Vulkan drivers."},
+    "env.MADEIRA_NULL_CALL_DUMP": {"category": "x86 emulation (FEX)", "title": "FEX: dump code and stack around a jump to address 0", "kind": "bool", "default": "1",
+                "note": "[null-dump] (LOG ONLY): once per process, when an x64 program jumps to guest address 0, hex-dump the code before the return address and the stack top (about 300 log lines). Nothing else changes. 0: no dump. Needs env.MADEIRA_NULL_CALL_TRACE on."},
+    "env.MADEIRA_CCALL_PEEK_FIXUP": {"category": "Wine core", "title": "Wine: survive a protected x64 call target", "kind": "bool", "default": "1",
+                "note": "[ccall-peek]: on (default): when the call check reads the first bytes of an x64 call target that the program keeps unreadable (Overwatch's encrypted code), the fault no longer ends the program: the emulator runs the target and the program gets its normal x64 fault. 0: the old crash."},
+    "env.MADEIRA_KB_NTCS": {"category": "Wine core", "title": "Wine: kernelbase NtCreateSection export", "kind": "bool", "default": "1",
+                "note": "[kb-ntcs]: only matters with env.MADEIRA_KB_STUBS = 1: kernelbase.dll then also exports a working NtCreateSection that calls ntdll's (for Black Ops III's anti-tamper export walk). 0: hide that one export even with MADEIRA_KB_STUBS on."},
+    "env.MADEIRA_FFS_PEEK_FIXUP": {"category": "x86 emulation (FEX)", "title": "FEX: survive a protected x64 call target", "kind": "bool", "default": "1",
+                "note": "[ffs-peek]: on (default): when the call shortcut reads the first bytes of an x64 call target that the program keeps unreadable (Overwatch's encrypted code) and that read faults, FEX falls back to normal emulation so the program gets its normal x64 fault. 0: the old crash. Works together with env.MADEIRA_CCALL_PEEK_FIXUP."},
+    "env.MADEIRA_WILD_EXEC_PROBE": {"category": "Wine core", "title": "Wine: log a jump into unknown memory", "kind": "bool", "default": "1",
+                "note": "[wild-exec] (LOG ONLY): when an x64 program's execute fault lands outside every loaded module, log the guest registers and the top of the stack, the first few times. Nothing else changes. 0: no log."},
+    "env.MADEIRA_WILD_EXEC_DUMP": {"category": "Wine core", "title": "Wine: dump memory around a jump into unknown memory", "kind": "text", "default": "",
+                "note": "[wild-exec] (LOG ONLY, optional): with env.MADEIRA_WILD_EXEC_PROBE on, also dump the stack and code around the unknown address when an x64 program's execute fault lands outside every module. Unset: no dump. Used to find where a protected game jumps to."},
+    "env.MADEIRA_BLOCK_RING_AT": {"category": "x86 emulation (FEX)", "title": "FEX: dump the block ring at one program address", "kind": "text", "default": "",
+                "note": "[block-ring] (LOG ONLY): a hex offset into the main program. The first time FEX compiles the block at that address, it logs the thread's whole block ring once. Needs BLOCK_RING=1. Unset: off."},
+    "env.MADEIRA_FLIGHT_CHANNELS": {"category": "Wine core", "title": "Flight recorder: channels", "kind": "text", "default": "",
+                "note": "env.MADEIRA_FLIGHT_CHANNELS = trace+seh,trace+module: the Wine debug channels the flight recorder keeps in its ring instead of the default set (only trace+name and warn+name entries). The ring's last 60 s are copied into the log when a game run ends. Read once per Madeira launch."},
+    "env.MADEIRA_FLIGHT_MB": {"category": "Wine core", "title": "Flight recorder: ring size (MB)", "kind": "text", "default": "8",
+                "note": "env.MADEIRA_FLIGHT_MB = 16: the flight recorder's ring file size in MB, 1 to 64. Default 8 MB (16384 slots of 512 bytes)."},
+    "env.MADEIRA_DXGI_COMPOSITION": {"category": "Direct3D 12", "title": "DXGI: swap chains for composition", "kind": "bool", "default": "1",
+                "note": "[dxgi-composition]: on (default): CreateSwapChainForComposition (what Godot 4.5 games such as Slay the Spire 2 call) makes the swap chain on the program's largest visible window instead of failing with 'Not implemented'. 0: the old failure (black screen)."},
+    "env.MADEIRA_DCOMP_PASSTHROUGH": {"category": "Direct3D 12", "title": "DirectComposition: pass-through device", "kind": "bool", "default": "1",
+                "note": "[dcomp-passthrough]: on (default): DCompositionCreateDevice returns a device whose targets, visuals and Commit succeed without drawing anything, so a game that needs it only to attach its swap chain can start (Godot 4.5). Surfaces, transforms and animations still return not implemented. 0: the old not-implemented stub."},
+    "env.MADEIRA_ARM64X_HOTPATCH_THUNKS": {"category": "Wine core", "title": "Wine: hotpatch prologue on x64 export thunks", "kind": "bool", "default": "0",
+                "note": "[hotpatch-thunks]: off by default. 1: when a program loads a DLL, the loader rewrites bare ff25 x64 export forwarders in memory to lea rsp,[rsp] plus jmp, keeping the same slot, so a hook that patches the first bytes of an export finds a proper prologue. Needed by some protected games. The log line names how many thunks were changed."},
+    "env.MADEIRA_WIN32U_ATTACH_FIRST": {"category": "Wine core", "title": "Wine: start win32u.dll before other DLLs", "kind": "bool", "default": "1",
+                "note": "[win32u-first]: on (default): the loader starts win32u.dll (whose start-up sets the system-call dispatcher) before the DLL that imports it, so an early call from a game DLL no longer jumps to an empty slot (Satisfactory crashed at start). 0: the old order."},
+    "env.MADEIRA_FLUSH_OWN_LOCK": {"category": "x86 emulation (FEX)", "title": "FEX: skip its own code flushes under the invalidation lock", "kind": "bool", "default": "1",
+                "note": "[flush-own-lock]: on (default): when FEX flushes its own translated code (a block unlinked while code is being invalidated) and wine passes the flush back to it, FEX returns at once instead of waiting for its thread lock. Before, that wait and a write fault on another thread waited on each other forever (PvZ Fusion with MelonLoader froze 24 to 100 s in, Test 8 logs, Nov 10). 0: the old wait. Read once per process."},
     "env.MADEIRA_FEX_PRELOADED_IMAGES": {"category": "x86 emulation (FEX)", "title": "FEX: record images loaded before it starts", "kind": "bool", "default": "1",
                 "note": "ml2260: on (default): when FEX starts in a 64-bit process it records the code sections of every image already loaded (kernel32, kernelbase, ucrtbase are mapped for it before its notifications work). Before, their x64 export thunks were not known as code: a 64-bit x64 program's call into one ended it with c0000005 (log 120: the DirectX redistributable's x64 helper, at its first kernel32 call). 0: as before."},
     "env.MADEIRA_EPIC_LAUNCHER_PARENT": {"category": "App & front end", "title": "Start Epic games under the Epic client's name", "kind": "bool", "default": "1",
                 "note": "ml2320: on (default): an Epic library game's x64 program starts as the child of C:\\windows\\system32\\EpicGamesLauncher.exe (build/epic-parent: starts its command line, waits, returns its exit code; not the Epic client, no window, no network), as it does under the Epic client on Windows. A publisher's launcher that did not find a process with that name treated the Epic copy as not owned and showed its store page (testers' log, 2026-10-31: a publisher's launcher started by an Epic copy said 'Failed to relaunch from third party platform' and offered the game for sale; Heroic does the same for that launcher). A batch or a 32-bit program starts as before. 0: the program starts directly."},
     "env.MADEIRA_STORE_STEAM_IDENTITY": {"category": "App & front end", "title": "Give games from other stores the fixed Steam identity", "kind": "bool", "default": "0",
                 "note": "ml2310: off (default): a game from another store (an Epic library entry) starts without the fixed Steam identity (SteamAppId, SteamGameId, SteamAppPath) every other launch outside Madeira Dock gets. With it, a game's launcher took its Steam path, its Steam API start failed and it showed only an error (testers' log, 2026-10-31: a publisher's launcher started by an Epic copy, 'Steam failed to initialize'). 1: publishes it as before."},
+    "env.MADEIRA_RESPAWN_GUARD": {"category": "Wine core (ntdll)", "title": "Stop a program that keeps restarting itself", "kind": "bool", "default": "1",
+                "note": "respawn-guard, default on: when a program starts a new copy of itself after 3 earlier copies of it each closed within 6 s of starting (inside 60 s), that start is refused, the log says [respawn-guard], and after the session the player is told; nothing else changes. Copies with --type= on their command line (Chromium/CEF helpers such as Battle.net's) and other programs never count (Fallout: New Vegas with FalloutNV.exe in the launcher's place started itself 32 times until a copy ran out of memory). 0: no check (old behaviour)."},
+    "env.MADEIRA_EXTERNAL_NESTED_LOG": {"category": "App & front end", "title": "Log nested drive libraries", "kind": "bool", "default": "1",
+                "note": "Drive libraries: the log names a Steam library that sits inside another listed library on the same drive (both are written to libraryfolders.vdf; Valve's client may keep only one; DJMAX RESPECT V code 41, Sentry Nov 16). Log only. 0 leaves the line out."},
+    "env.MADEIRA_DOTNET10": {"category": "App & front end", "title": ".NET 10 runtime in Settings", "kind": "bool", "default": "1",
+                "note": "Default on: Settings > Runtimes shows .NET 10 Desktop Runtime, which downloads Microsoft's .NET 10.0.9 x64 zips (base runtime + Windows Desktop runtime, size and SHA-512 pinned), and unpacks them into the prefix at C:\\Program Files\\dotnet\\x64 for .NET 10 programs (Emuera). 0: the section is hidden. Logged as [dotnet10]."},
+    "env.MADEIRA_STEAM_FIXED_IDENTITY": {"category": "App & front end", "title": "Give this game the fixed Steam identity", "kind": "bool", "default": "1",
+                "note": "on (default): a game started outside Madeira Dock and not through Steam's \"The game\" start gets the bridge's fixed Steam identity (SteamAppId 356400, SteamGameId, SteamAppPath = Thumper's folder). A game with its own Steam wrapper then sees another title's app ID. Seasons after Fall quits by itself with exit code 0 after about 90 s with it (testers' logs, 2026-11-15). 0, in that game's own config: no Steam identity is published for this game."},
     "env.MADEIRA_NO_STEAM_IDENTITY": {"category": "App & front end", "title": "", "kind": "text", "default": "",
                 "note": "set by the library for one launch of a game from another store; not a setting"},
     "env.MADEIRA_THREAD_REAP_CHECKED": {"category": "Exceptions & threads", "title": "Check the previous exited thread before freeing it", "kind": "bool", "default": "1",
@@ -587,6 +709,7 @@ OVERLAY = {
     "env.MADEIRA_WG_VIDEO": {"title": "Media: MP4 video (32-bit programs)",
                 "note": "0 limits the media parser to MP3/WAV; by default MP4 with H.264/HEVC video decodes through VideoToolbox."},
     "env.MADEIRA_WOW_RWX_PLAIN": {"category": "Memory & JIT pool", "note": "Unset: a 32-bit window's anonymous RWX memory is plain read/write to the host once Wine Mono's libmono-2.0-x86.dll is mapped there (ml1279/ml1282). 1: in every 32-bit window. 0: never (stores go through the JIT pool's alias, and FEX's Mono bridge stays off)."},
+    "env.MADEIRA_X64_RWX_PLAIN": {"category": "Memory & JIT pool", "note": "Unset: a 64-bit program's anonymous RWX memory is plain read/write to the host once Unity's mono-2.0-bdwgc.dll is mapped. 1: in every 64-bit process. 0: never (stores go through the JIT pool's alias)."},
     "env.MADEIRA_WINEMONO_BRIDGE": {"note": "FEX's Mono backpatcher bridge (ml712). On by itself for Wine Mono, 32- and 64-bit (ml1282/ml1286); for the 32-bit runtime in a guest window it also turns SMC detection off once the backpatcher is found (ml1280). 0 keeps it off."},
     "env.MADEIRA_MONO_DEFAULTS": {"category": "Wine libraries", "note": "Wine Mono, 32- and 64-bit: mscoree sets MONO_THREADS_SUSPEND=coop and adds keep-delegates to MONO_DEBUG before Mono loads, and puts the previous values back once Mono has read them (ml1282); values already set win. 0 sets nothing."},
     "cpu-count": {"title": "Reported CPU count (0 = device)"},
@@ -710,11 +833,15 @@ OVERLAY = {
     "env.MADEIRA_DINPUT_PAD": {"title": "DirectInput joystick from the host gamepad"},
     # ml2100: the HID controller (build/wineserver/hidpad_ios.c, docs/CONTROLLERS.md).
     "env.MADEIRA_PAD_MODE": {"category": "Controllers", "title": "Controller API (player 1)", "kind": "choice",
-                "note": "XInput (default): every controller is an Xbox pad. hid: player 1 becomes a HID game controller, "
+                "note": "Automatic (recommended, default): a game with SDL2.dll/SDL3.dll in its folder or a Godot 4 game gets a generic HID gamepad, every other game XInput; the [pad-auto] log line says which and why. XInput: every controller is an Xbox pad. hid: player 1 becomes a HID game controller, "
                         "a DualSense (054C:0CE6) when it is a PlayStation pad, and leaves XInput; any other pad stays "
                         "on XInput. dualsense/generic force the identity. Read at session start; the game's own file wins.",
-                "choices": [("", "XInput (default)"), ("hid", "DirectInput / HID"), ("dualsense", "HID, always a DualSense"),
+                "choices": [("", "Automatic (recommended)"), ("xinput", "XInput (always)"), ("hid", "DirectInput / HID"), ("dualsense", "HID, always a DualSense"),
                             ("generic", "HID, always a generic gamepad")],
+                "sources": ["app/Madeira/GamepadInput.swift"]},
+    "env.MADEIRA_PAD_AUTO": {"category": "Controllers", "title": "Controller API: automatic choice", "kind": "bool",
+                "default": "1",
+                "note": "0: the automatic Controller API choice is off; with env.MADEIRA_PAD_MODE unset player 1 is XInput, as before.",
                 "sources": ["app/Madeira/GamepadInput.swift"]},
     "env.MADEIRA_HIDPAD": {"category": "Controllers",
                 "note": "Set by the app at session start from env.MADEIRA_PAD_MODE (dualsense or generic) for the "
@@ -851,6 +978,19 @@ OVERLAY = {
                         "must start on a 32 GB boundary, gets 0x7800000000 (20 GB of it really reserved). 2: also "
                         "libcef.dll's (0x7000000000) and Oilpan's; the JIT pool's RW alias moves to 0x7900000000. "
                         "Off by default; set it in the game's own file; read at session start."},
+    "env.MADEIRA_CEF_CMDLINE": {"category": "Memory & JIT pool", "title": "Let in-process Chromium read the game's command line",
+                "kind": "bool", "default": "0",
+                "note": "1: in a program named by env.MADEIRA_CEF_PA_EXES, libcef.dll's cef_initialize clears the game's "
+                        "command_line_args_disabled, so Chromium switches given with env.MADEIRA_CHILD_ARGS (such as "
+                        "--single-process) reach it. For a game whose Chromium helper processes are refused memory "
+                        "(BeamNG.drive). Default off; set it in the game's own file; log [cef-cmdline]."},
+    "env.MADEIRA_CEF_PA_EXES": {"category": "Memory & JIT pool", "title": "Games that run Chromium in their own process",
+                "kind": "text", "default": "",
+                "note": "Exe names, separated by ';' (e.g. BeamNG.drive.x64.exe). A listed program gets the address "
+                        "space SocialClubHelper.exe gets under env.MADEIRA_SC_PA_POOLS: room for chrome_elf.dll's and "
+                        "libcef.dll's PartitionAlloc pools, Oilpan and V8's cage. Use it with env.MADEIRA_SC_PA_POOLS = 2 "
+                        "for a game that loads libcef.dll itself and stops in chrome_elf.dll (80000003). Empty by "
+                        "default; set it in the game's own file; read at session start."},
     "avail-phys": {"category": "Memory & JIT pool", "title": "Report the memory left before the app's limit as available",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: Windows programs' available physical memory (GlobalMemoryStatusEx) is what "
@@ -1081,6 +1221,12 @@ OVERLAY = {
                         "Launcher 132 MB, Social Club 68 MB through a whole RDR2 session). Larger uploads still get a "
                         "block of their own; each named program logs one [small-rings] line. Unset or 0 (default): "
                         "32 MB, as before. Set it in the game's own file; read when the program starts."},
+    "env.MADEIRA_D3D11_NO_VIDEO_DEVICE": {"category": "Direct3D 9/10/11 (DXMT)",
+                "title": "Direct3D 11: use software video presentation",
+                "kind": "bool", "default": "0",
+                "sources": ["build/dxmt-patches/0002-d3d11-video-device-fallback.patch"],
+                "note": "1: reject D3D11 devices explicitly requested with VIDEO_SUPPORT so Unity can fall back "
+                        "to CPU-backed Media Foundation samples. Direct3D rendering still uses Metal. Set per game."},
     # DXMT's Direct3D 9 index buffers read it (dxmt, build/dxmt-patches/0001-d3d9-index-range-per-draw.patch).
     "env.MADEIRA_D3D9_INDEX_RANGE": {"category": "Direct3D 9/10/11 (DXMT)",
                 "title": "Direct3D 9: upload only the index bytes a draw reads",
@@ -1162,12 +1308,13 @@ OVERLAY = {
                 "note": "Empty: Wine takes the user locale from the device's language. en_US.UTF-8 gives the game an English "
                         "system and user locale, for a game that fails right after loading a non-English OEM code page. "
                         "Read at session start."},
-    "env.MADEIRA_NLS_EXTRA": {"category": "Wine core (ntdll)", "title": "Extra code page tables", "kind": "bool", "default": "0",
-                "note": "Default off. 1: a code page table that is not loaded for every game (932, 936, 949, 950, 874, 1250, "
-                        "1251, 1253-1258) is read from the app's nls/extra folder when the game asks for it; without the line "
-                        "such a request fails (GetCPInfo and MultiByteToWideChar return an error), as before. For a game that "
-                        "converts its text in one of those pages. Logged as [nls-extra]; [nls-missing] names a table that was "
-                        "not found. Read at every request."},
+    "env.MADEIRA_NLS_EXTRA": {"category": "Wine core (ntdll)", "title": "Extra code page tables", "kind": "bool", "default": "1",
+                "note": "Default on. A code page table that is not in the app's nls folder (932, 936, 949, 950, 874, 1250, "
+                        "1251, 1253-1258, the OEM pages 720-869 and 20866) is read from the nls/extra folder when Wine asks for "
+                        "it, so programs started on a non-English device language (Chinese, Japanese, Korean, Russian and "
+                        "others) get their code page. 0: turn it off; such a request then fails as in older builds "
+                        "(GetCPInfo and MultiByteToWideChar return an error). Logged as [nls-extra]; [nls-missing] names a "
+                        "table that was not found. Read at every request."},
     "env.MADEIRA_JAPANESE": {"category": "Wine core (ntdll)", "title": "Japanese locale and fonts", "kind": "bool", "default": "0",
                 "note": "Default off. 1: the game runs with a Japanese system and user locale (LC_ALL = ja_JP.UTF-8, ANSI and OEM code page 932) and the extra code page tables (env.MADEIRA_NLS_EXTRA), and a Japanese font (Noto Sans JP) is installed in C:\\windows\\Fonts with MS Gothic, MS PGothic, MS UI Gothic, MS Mincho, Meiryo and Yu Gothic mapped onto it. For Japanese games and visual novels whose text shows as squares or gibberish, or that do not start. Game details › Compatibility › Japanese locale sets it for one game. Logged as [japanese]. Read at session start."},
     "env.MADEIRA_ALIAS_RELEASE": {"category": "Memory & JIT pool", "title": "Drop a released arena's code copies", "kind": "bool",
@@ -1243,6 +1390,9 @@ OVERLAY = {
                 "note": "Default off. 1: an x64 image's PE volatile metadata (MSVC /volatileMetadata) is cleared when it is "
                         "mapped, so FEX orders every instruction of it by its TSO settings instead of only the listed ones. "
                         "Slower; for testing memory-ordering bugs. Logged as [fex-vmeta]. Read at session start."},
+    "env.MADEIRA_AUDIO_MIX": {"category": "Audio", "title": "Play alongside other apps' audio", "kind": "bool", "default": "1",
+                "note": "Default on: a game's sound mixes with other apps', so a Discord voice call or music keeps playing "
+                        "while Madeira runs. 0: Madeira's audio stops the others, as before. Read when a session starts."},
     "env.MADEIRA_AUDIO_RESUME": {"category": "Audio", "title": "Bring game audio back after an interruption", "kind": "bool",
                 "default": "0",
                 "note": "Default off: after a call, Siri, an alarm or a suspension the sound stays off until the game restarts. "
@@ -1290,8 +1440,14 @@ OVERLAY = {
                         "a second) or presenting makes no progress, and the 5-repeat guard counts per thread within 5 ms; for a "
                         "Unity title that throws managed exceptions through null-check traps while it keeps drawing. Read once "
                         "per session."},
+    "env.MADEIRA_VCRT_ARM64_AUTO": {"category": "Wine core (ntdll)", "title": "ARM64 Visual C++ marker for Unreal games", "kind": "bool", "default": "1",
+                "note": "Default on: a game with an Unreal Engine folder (Engine\\Binaries or Engine\\Extras) starts with "
+                        "env.MADEIRA_VCRT_ARM64_KEY = 1, so its bootstrap stops asking for the ARM64 Visual C++ redistributable "
+                        "(Satisfactory, Subnautica 2). A MADEIRA_VCRT_ARM64_KEY line in madeira.cfg or the game's config wins. "
+                        "0: only such a line sets it. Read at launch."},
     "env.MADEIRA_VCRT_ARM64_KEY": {"category": "Wine core (ntdll)", "title": "ARM64 Visual C++ runtime marker", "kind": "text", "default": "",
-                "note": "Default empty: nothing written. 1 (or a version such as 14.50.35717): the session has the ARM64 Visual "
+                "note": "Default empty: nothing written, except for an Unreal Engine game, which gets 1 automatically "
+                        "(env.MADEIRA_VCRT_ARM64_AUTO). 0 turns it off for a game. 1 (or a version such as 14.50.35717): the session has the ARM64 Visual "
                         "C++ 2015-2022 redistributable's Installed marker (volatile keys; one the prefix has is left alone), for "
                         "an Unreal bootstrap program that sees an ARM64 machine and stops asking for that redistributable "
                         "(exit 0x2329). Read at session start."},
@@ -1315,7 +1471,8 @@ OVERLAY = {
                 "kind": "bool", "default": "0",
                 "note": "Default off: success with no path, as before. 1: QueryDisplayConfig returns the virtual monitor's one path "
                         "(source and target mode, the desktop size) and DisplayConfigGetDeviceInfo names its source, target and "
-                        "adapter, for a game that builds its fullscreen window from the paths."},
+                        "adapter and answers its preferred mode and colour info, for a game that builds its fullscreen window from "
+                        "the paths (Unity, e.g. REPLACED: white screen)."},
     "env.MADEIRA_REDELIV_CHILD_ONLY": {"category": "Exceptions & threads", "title": "A fault storm in a helper program ends only that program",
                 "kind": "bool", "default": "1",
                 "note": "Default on: when the fault-storm guard gives up on a thread of a program the session started (a "

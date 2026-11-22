@@ -126,14 +126,29 @@ enum MadeiraDock {
                 guard let data = try? Data(contentsOf: folder.appendingPathComponent(file)) else { continue }
                 let held = depots(manifest: data)
                 lent.merge(held.lent) { $0.union($1) }
-                guard let game = game(manifest: data, library: library),
-                      !result.contains(where: { $0.id == game.id }) else { continue }
+                guard let game = game(manifest: data, library: library) else { continue }
+                if let first = result.first(where: { $0.id == game.id }) {
+                    // The same App ID in two libraries: the first one listed wins (the client's own, then the ones its
+                    // libraryfolders.vdf lists, then drive libraries). Only that copy is ever offered for a move.
+                    noteDuplicate(appID: game.id, using: first.library, other: library)
+                    continue
+                }
                 installed[game.id] = held.installed
                 result.append(game)
             }
         }
         result.removeAll { game in lent[game.id].map { installed[game.id, default: []].isSubset(of: $0) } ?? false }
         return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private static let duplicateLock = NSLock()
+    private static var duplicatesLogged: Set<String> = []
+    /// Logs one "[external] duplicate appid" line per pair (games() runs on any thread, so the log is written on the main one).
+    private static func noteDuplicate(appID: Int, using: String, other: String) {
+        let key = "\(appID)|\(using)|\(other)"
+        duplicateLock.lock(); let isNew = duplicatesLogged.insert(key).inserted; duplicateLock.unlock()
+        guard isNew else { return }
+        DispatchQueue.main.async { LogStore.shared.log("[external] duplicate appid \(appID) in \(using) and \(other), using \(using)") }
     }
 
     /// The client's own library, the libraries on C: its `libraryfolders.vdf` lists and
@@ -242,6 +257,10 @@ enum MadeiraDock {
                 if fields["session-unsupported-client"] == "1" || fields["session-user-method-mismatch"] != nil {
                     return "Madeira Dock does not support this Steam client build. Dock only drives client builds it has verified; the log has the client fingerprint and the failed check."
                 }
+                // [dock-code30] Steam's saved sign-in was refused as input (Sentry F9, Fallout: New Vegas).
+                if fields["session-account-input-invalid"] == "1" {
+                    return "Steam's saved sign-in has expired on this device. Sign in to Steam again in Madeira, then start the game."
+                }
                 return "Madeira Dock could not initialize the Steam session (code 30). Export the log to identify the failed check."
             }
             // The host waits 90 s after sign-in for Valve's client to count the game
@@ -255,6 +274,16 @@ enum MadeiraDock {
                 return "The game's launch arguments are invalid or too long. Edit them in Game details and try again."
             }
             if result == 35 { return "Steam did not confirm a license for this game on the signed-in account." }
+            // The host crashed (build/dock-patches/0004): usually a DLL that Valve's
+            // client loaded on one of its own threads. Without this report the
+            // starting screen waited for a game that could never start.
+            if result == 60 {
+                let code = fields["host-unhandled-exception"].flatMap(Int32.init)
+                    .map { " (exception 0x" + String(UInt32(bitPattern: $0), radix: 16) + ")" } ?? ""
+                return fields["session-authenticated-online"] == "1"
+                    ? "Madeira Dock stopped: Steam's client crashed after signing in\(code), before it confirmed this game's license. Export the log and try again."
+                    : "Madeira Dock stopped: Steam's client crashed\(code) before the game started. Export the log and try again."
+            }
             // Offline start (madeira-dock docs/OFFLINE.md): Valve's client decides.
             if result == 50 {
                 return fields["session-offline-abi"] == "0"
@@ -340,6 +369,7 @@ enum MadeiraDock {
         "session-offline-entitled", "session-offline-listed", "session-offline-timeout-state",
         "session-offline-fallback", "session-offline-ready",
         "launch-user-arguments-bytes", "launch-user-arguments-invalid",
+        "launch-game-running", "friends-available", "friends-own-state", "friends-signin-available", "friends-signin", "friends-requested", "friends-own-game", "friends-total", "friends-valid-ids", "friends-named", "friends-playing", "friends-seconds", "friends-count", "friends-cmd-seq", "friends-cmd-result",
         "launch-client-error", "launch-option-index", "launch-option-invalid", "launch-option-missing",
         "launch-update-wait", "launch-update-retry", "launch-update-ready",
         "launch-config-wait", "launch-config-gave-up", "launch-session-wait", "launch-session-gave-up",
@@ -347,12 +377,17 @@ enum MadeiraDock {
         "ceg-finished-jobs", "ceg-result", "ceg-already-prepared", "ceg-disabled", "ceg-unsupported-client",
         "ceg-scm", "ceg-scm-started", "ceg-scm-error", "ceg-service-registered", "ceg-service-install", "ceg-service-start", "ceg-service-start-retry", "ceg-service-stop", "ceg-scm-stopped",
         "game-scm", "game-scm-services", "game-scm-timeout", "launch-keep-alive", "launch-keep-alive-held",
-        "shutdown-begin", "shutdown-complete", "probe-result"]
+        "shutdown-begin", "shutdown-complete", "host-crash-report", "host-unhandled-exception", "probe-result"]
     /// The host's report rounds (madeira-dock src/main.c).
     static let reportRounds: Set<String> = ["ml1820", "ml1830", "ml1860", "ml1870", "ml1970", "ml1990", "ml2000", "ml2011", "ml2015", "ml2016", "ml2020"]
 
+    /// The largest report read. Dock bounds its friends lines, but a long session
+    /// still writes more than the old 32 KB, and a report past the cap would hide
+    /// probe-result at game end.
+    static let reportCap = 1 << 20
+
     static func parseReport(_ data: Data) -> Report {
-        guard data.count <= 32768, let text = String(data: data, encoding: .utf8) else { return Report() }
+        guard data.count <= reportCap, let text = String(data: data, encoding: .utf8) else { return Report() }
         var report = Report()
         // Ignore a partial final line until the writer completes and flushes it.
         for line in text.replacingOccurrences(of: "\r\n", with: "\n")
@@ -386,7 +421,7 @@ enum MadeiraDock {
         let url = drive.appendingPathComponent("madeira-dock.txt")
         guard let file = try? FileHandle(forReadingFrom: url) else { return lastReport }
         defer { try? file.close() }
-        guard let data = try? file.read(upToCount: 32769), data.count <= 32768 else { return lastReport }
+        guard let data = try? file.read(upToCount: reportCap + 1), data.count <= reportCap else { return lastReport }
         let report = parseReport(data)
         for key in report.fields.keys.sorted() where report.fields[key] != lastReport.fields[key] {
             SteamLog.event("[dock-report] \(key)=\(report.fields[key]!)")
@@ -415,6 +450,9 @@ enum MadeiraDock {
         if let url = transferURL { try? FileManager.default.removeItem(at: url) }
         unsetenv("MADEIRA_DOCK_AUTH_FILE")
         unsetenv("MADEIRA_DOCK_OFFLINE")
+        // The friends feed and command too: a host that did not end cleanly
+        // leaves them, and a later session must not show its list.
+        DockFriends.shared.endSession()
     }
 
     /// Writes the one-use transfer to protected Application Support storage
@@ -455,6 +493,7 @@ enum MadeiraDock {
             setenv(key, "1", 1)
         }
         setenv("MADEIRA_STEAM_HOST_APPID", String(game.id), 1)
+        setenv("MADEIRA_DOCK_PERSONA_STATE", String(SteamOnlineStatus.current.rawValue), 1)
         setenv("MADEIRA_STEAM_HOST_LAUNCH_OPTION", String(launchOption), 1)
         setenv("MADEIRA_STEAM_HOST_CLIENT_DIR", SteamRuntimeFiles.windowsRoot, 1)
         setenv("MADEIRA_STEAM_HOST_EXPECTED_INSTALL", game.windowsInstallPath, 1)
@@ -491,6 +530,15 @@ enum MadeiraDock {
         let guardMap = SteamSignIn.flag("MADEIRA_DOCK_IMAGE_MAP_GUARD", default: true)
         if guardMap { setenv("MADEIRA_IMAGE_MAP_GUARD", "1", 1) }
         SteamLog.event("[dock-launch] image-map-guard=\(guardMap ? 1 : 0)")
+        // (tcp-connect-timeout) A Steam client start waited about 150 s on a connection to
+        // crash.steampowered.com that never answered (device log 0.2.33: [srv-conn-done] dport=443
+        // err=60, the game started at t+154 s). Wine's opt-in MADEIRA_CONNECT_TIMEOUT_MS fails a TCP
+        // connect still pending after that many ms, as a refused one fails. Dock sessions default to
+        // 10000; a value already set in madeira.cfg is kept; env.MADEIRA_DOCK_CONNECT_TIMEOUT = 0
+        // leaves it unset.
+        let connectTimeout = SteamSignIn.flag("MADEIRA_DOCK_CONNECT_TIMEOUT", default: true)
+        if connectTimeout, getenv("MADEIRA_CONNECT_TIMEOUT_MS") == nil { setenv("MADEIRA_CONNECT_TIMEOUT_MS", "10000", 1) }
+        SteamLog.event("[dock-launch] connect-timeout=\(connectTimeout ? 1 : 0)")
         DockOffline.configure(appID: game.id)
     }
 
@@ -504,7 +552,11 @@ enum MadeiraDock {
     static func launchArguments(width: Int, height: Int, installers: String? = nil, host: Bool = true) -> String {
         guard let installers else { return "/desktop=madeira,\(width)x\(height) \(executable)" }
         guard host else { return "/desktop=madeira,\(width)x\(height) C:\\windows\\system32\\cmd.exe /c call \(installers)" }
-        return "/desktop=madeira,\(width)x\(height) C:\\windows\\system32\\cmd.exe /c call \(installers) & \(executable)"
+        // The host gets NUL for its standard handles: started by cmd it inherits cmd's console handles,
+        // which its C runtime rejects at start (log 2026-11-15, Arma 3 on Test 18: _invalid_parameter,
+        // 0xC0000417 within 0.1 s, the start screen stayed on "First-time setup"). Started straight by
+        // explorer, as without installers, it gets plain handles and runs.
+        return "/desktop=madeira,\(width)x\(height) C:\\windows\\system32\\cmd.exe /c call \(installers) & \(executable) <nul >nul 2>nul"
     }
 
     /// Set on the main actor right before a Dock launch; read (and cleared) once by the
@@ -626,4 +678,18 @@ enum DockOffline {
         NotificationCenter.default.post(name: changed, object: nil)
     }
     static let changed = Notification.Name("MadeiraDockOfflineChanged")
+}
+
+/// The Steam status Dock signs in to Friends with (Settings › Steam › Status),
+/// passed to Dock as MADEIRA_DOCK_PERSONA_STATE; the raw value is Steam's
+/// persona state. Offline, the default, leaves Friends off for the session:
+/// Dock then sends Steam nothing of its own (madeira-dock README, "Friends").
+enum SteamOnlineStatus: Int, CaseIterable, Identifiable {
+    case online = 1, away = 3, invisible = 7, offline = 0
+    var id: Int { rawValue }
+    private static let key = "steamOnlineStatus"
+    static var current: SteamOnlineStatus {
+        get { (UserDefaults.standard.object(forKey: key) as? Int).flatMap(SteamOnlineStatus.init(rawValue:)) ?? .offline }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: key) }
+    }
 }

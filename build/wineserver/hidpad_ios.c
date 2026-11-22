@@ -112,29 +112,15 @@ static void hidpad_device_dump( struct object *obj, int verbose );
 static struct object *hidpad_device_open_file( struct object *obj, unsigned int access,
                                                unsigned int sharing, unsigned int options );
 
+/* Wine 11.22: designated initializers; an op left out takes the server default
+ * (no wait queue, no fd, no destroy: the device is permanent and never freed). */
 static const struct object_ops hidpad_device_ops =
 {
-    sizeof(struct hidpad_device),     /* size */
-    &device_type,                     /* type */
-    hidpad_device_dump,               /* dump */
-    no_add_queue,                     /* add_queue */
-    NULL,                             /* remove_queue */
-    NULL,                             /* signaled */
-    no_satisfied,                     /* satisfied */
-    no_signal,                        /* signal */
-    no_get_fd,                        /* get_fd */
-    default_get_sync,                 /* get_sync */
-    default_map_access,               /* map_access */
-    default_get_sd,                   /* get_sd */
-    default_set_sd,                   /* set_sd */
-    default_get_full_name,            /* get_full_name */
-    no_lookup_name,                   /* lookup_name */
-    directory_link_name,              /* link_name */
-    default_unlink_name,              /* unlink_name */
-    hidpad_device_open_file,          /* open_file */
-    no_kernel_obj_list,               /* get_kernel_obj_list */
-    no_close_handle,                  /* close_handle */
-    no_destroy                        /* destroy: permanent, never freed */
+    .size          = sizeof(struct hidpad_device),
+    .type          = &device_type,
+    .dump          = hidpad_device_dump,
+    .get_full_name = default_get_full_name,
+    .open_file     = hidpad_device_open_file,
 };
 
 static void hidpad_file_dump( struct object *obj, int verbose );
@@ -144,27 +130,14 @@ static void hidpad_file_destroy( struct object *obj );
 
 static const struct object_ops hidpad_file_ops =
 {
-    sizeof(struct hidpad_file),       /* size */
-    &file_type,                       /* type */
-    hidpad_file_dump,                 /* dump */
-    NULL,                             /* add_queue */
-    NULL,                             /* remove_queue */
-    NULL,                             /* signaled */
-    NULL,                             /* satisfied */
-    no_signal,                        /* signal */
-    hidpad_file_get_fd,               /* get_fd */
-    default_fd_get_sync,              /* get_sync */
-    default_map_access,               /* map_access */
-    default_get_sd,                   /* get_sd */
-    default_set_sd,                   /* set_sd */
-    hidpad_file_get_full_name,        /* get_full_name */
-    no_lookup_name,                   /* lookup_name */
-    no_link_name,                     /* link_name */
-    NULL,                             /* unlink_name */
-    no_open_file,                     /* open_file */
-    no_kernel_obj_list,               /* get_kernel_obj_list */
-    async_close_obj_handle,           /* close_handle: as named_pipe.c's ends */
-    hidpad_file_destroy               /* destroy */
+    .size          = sizeof(struct hidpad_file),
+    .type          = &file_type,
+    .dump          = hidpad_file_dump,
+    .get_fd        = hidpad_file_get_fd,
+    .get_sync      = default_fd_get_sync,
+    .get_full_name = hidpad_file_get_full_name,
+    .close_handle  = async_close_obj_handle,   /* as named_pipe.c's ends */
+    .destroy       = hidpad_file_destroy,
 };
 
 static enum server_fd_type hidpad_file_get_fd_type( struct fd *fd );
@@ -175,18 +148,14 @@ static void hidpad_file_ioctl( struct fd *fd, ioctl_code_t code, struct async *a
 
 static const struct fd_ops hidpad_file_fd_ops =
 {
-    default_fd_get_poll_events,       /* get_poll_events */
-    default_poll_event,               /* poll_event */
-    hidpad_file_get_fd_type,          /* get_fd_type */
-    hidpad_file_read,                 /* read */
-    hidpad_file_write,                /* write */
-    no_fd_flush,                      /* flush */
-    default_fd_get_file_info,         /* get_file_info */
-    hidpad_file_get_volume_info,      /* get_volume_info */
-    hidpad_file_ioctl,                /* ioctl */
-    default_fd_cancel_async,          /* cancel_async */
-    default_fd_queue_async,           /* queue_async */
-    default_fd_reselect_async,        /* reselect_async */
+    .get_fd_type     = hidpad_file_get_fd_type,
+    .read            = hidpad_file_read,
+    .write           = hidpad_file_write,
+    .get_file_info   = default_fd_get_file_info,
+    .get_volume_info = hidpad_file_get_volume_info,
+    .ioctl           = hidpad_file_ioctl,
+    .queue_async     = default_fd_queue_async,
+    .reselect_async  = default_fd_reselect_async,
 };
 
 static void hidpad_device_dump( struct object *obj, int verbose )
@@ -664,8 +633,12 @@ void madeira_hidpad_init( void )
     }
 
     hidpad_ascii_name( HIDPAD_NT_DEVICE, nameW, ARRAY_SIZE(nameW), &name );
-    if (!(device = create_named_object( NULL, &hidpad_device_ops, &name,
-                                        OBJ_PERMANENT | OBJ_CASE_INSENSITIVE, NULL )))
+    {
+        struct object_params params = { .ops = &hidpad_device_ops, .name = name,
+                                        .attr = OBJ_PERMANENT | OBJ_CASE_INSENSITIVE };
+        device = create_named_object( &params );
+    }
+    if (!device)
     {
         fprintf( stderr, "[hid-pad] ml2101 cannot create %s: %#x\n", HIDPAD_NT_DEVICE, get_error() );
         free( preparsed );
@@ -691,7 +664,7 @@ void madeira_hidpad_init( void )
     hidpad_ascii_name( path, nameW, ARRAY_SIZE(nameW), &name );
     /* ml2105: no link, no device a game can open -- and ntdll publishes the
      * registry entries only for a link that exists (server_ios.c). */
-    if (!(symlink = create_obj_symlink( NULL, &name, OBJ_PERMANENT | OBJ_CASE_INSENSITIVE, &device->obj, NULL )))
+    if (!(symlink = create_obj_symlink( NULL, name, OBJ_PERMANENT | OBJ_CASE_INSENSITIVE, &device->obj, NULL )))
     {
         fprintf( stderr, "[hid-pad] ml2105 cannot create \\??\\%s: %#x; the pad stays invisible\n",
                  link, get_error() );

@@ -249,7 +249,7 @@ final class MetalBackedView: UIView {
     private func applyDisplayMode(reason: String) {
         guard let w = window else { return }
         let r = gameRect()
-        MetalHostView.shared.frame = convert(r, to: w)
+        if !ExternalDisplay.active { MetalHostView.shared.frame = convert(r, to: w) }
         // The desktop compositor lays the guest display out in the same rect,
         // so Aspect / Fill / Stretch / Fit apply to desktop sessions as well.
         winios_set_desktop_rect(r.minX - bounds.minX, r.minY - bounds.minY, r.width, r.height, 1)
@@ -303,8 +303,9 @@ final class MetalBackedView: UIView {
             }
             v = s.superview
         }
+        installPencilMouse()
         let host = MetalHostView.shared
-        if host.superview !== w {
+        if host.superview !== w && !ExternalDisplay.active {
             host.removeFromSuperview()
             w.addSubview(host)
         }
@@ -419,6 +420,72 @@ final class MetalBackedView: UIView {
         let upFlags = up | F_ABS
         postSurfacePointer(x, y, down | F_ABS)
         afterTapHold { [weak self] in self?.postSurfacePointer(x, y, upFlags) }
+    }
+
+    // ==================================================================
+    // Apple Pencil as a mouse (madeira.cfg or a game's own config:
+    // `pencil-mouse = 1`). Off by default.
+    //   Pencil touching the glass — already a left press/drag/release through
+    //                               the touch paths above, unchanged
+    //   Pencil hovering above it  — moves the pointer, no button pressed
+    //   Pencil Pro squeeze        — right click where the Pencil is
+    // A hovering Pencil is told apart from a mouse or trackpad by its height
+    // (UIHoverGestureRecognizer.zOffset > 0), the same test HardwareInput's
+    // pointer hover uses to ignore it. Skipped in mouse-look (relative) mode,
+    // where the pointer position is not what the program reads.
+    // ==================================================================
+    private var pencilMouseOn = false
+    private var pencilHover: UIHoverGestureRecognizer?
+    private var pencilInteraction: UIPencilInteraction?
+    private var pencilLastPoint: CGPoint?
+
+    /// Read at every attach, so a game's own `pencil-mouse` line applies to that game.
+    private static func pencilMouseWanted() -> Bool {
+        let v = MadeiraConfig.gameValue("pencil-mouse") ?? MadeiraConfig.get("pencil-mouse")
+        return ["1", "on", "true", "yes"].contains(v ?? "")
+    }
+
+    private func installPencilMouse() {
+        pencilMouseOn = Self.pencilMouseWanted()
+        if pencilHover == nil {
+            let hover = UIHoverGestureRecognizer(target: self, action: #selector(pencilHovered(_:)))
+            addGestureRecognizer(hover)
+            pencilHover = hover
+            let interaction = UIPencilInteraction()
+            interaction.delegate = self
+            addInteraction(interaction)
+            pencilInteraction = interaction
+        }
+        if pencilMouseOn {
+            LogStore.shared.log("[pencil] the Apple Pencil is a mouse (hover moves the pointer, squeeze: right click)")
+        }
+    }
+
+    @objc private func pencilHovered(_ g: UIHoverGestureRecognizer) {
+        guard pencilMouseOn, !InputSettings.shared.relative else { return }
+        // Pencil only: mouse and trackpad hover have no height.
+        guard #available(iOS 16.1, *), g.zOffset > 0 else { return }
+        guard g.state == .began || g.state == .changed else { return }
+        let p = g.location(in: self)
+        pencilLastPoint = p
+        movePencilPointer(to: p)
+    }
+
+    private func movePencilPointer(to p: CGPoint) {
+        let (x, y) = mapPoint(p)
+        if touchPointerMode { winios_cursor_move(x, y) }   // the drawn cursor follows the Pencil
+        if desktopMode {
+            postPointer(F_MOVE | F_ABS)                     // mapPoint left the cursor at (x, y)
+        } else {
+            postSurfacePointer(x, y, F_MOVE | F_ABS)
+        }
+    }
+
+    fileprivate func pencilSqueezed(at hover: CGPoint?) {
+        guard pencilMouseOn, !InputSettings.shared.relative,
+              let p = hover ?? pencilLastPoint else { return }
+        pencilLastPoint = p
+        tmAbsoluteClick(down: F_RDOWN, up: F_RUP, at: p)
     }
 
     private func touchModeBegan(_ touches: Set<UITouch>) {
@@ -581,7 +648,8 @@ final class MetalBackedView: UIView {
     }
 
     private func postPointer(_ flags: UInt32, data: Int32 = 0) {
-        postSurfacePointer(Int32(Self.cursor.x), Int32(Self.cursor.y), flags, data: UInt32(bitPattern: data))
+        // The touch pad's clicks follow the game's "swap left and right buttons".
+        postSurfacePointer(Int32(Self.cursor.x), Int32(Self.cursor.y), MouseTuning.current.swapped(flags), data: UInt32(bitPattern: data))
     }
 
     private func postSurfacePointer(_ x: Int32, _ y: Int32, _ flags: UInt32, data: UInt32 = 0) {
@@ -753,9 +821,10 @@ final class MetalBackedView: UIView {
          * by dragging RIGHT. That is the same sign as a mouse. Negate both terms
          * for content-drag (finger-follows-world) feel. */
         if InputSettings.shared.relative {
-            let sens = CGFloat(InputSettings.shared.sensRel)
+            let tuning = MouseTuning.current
+            let sens = CGFloat(InputSettings.shared.sensRel * tuning.speed)
             relCarryX += dx * sens
-            relCarryY += dy * sens
+            relCarryY += dy * sens * CGFloat(tuning.yFactor)
             let ix = Int32(max(-30000, min(30000, relCarryX)))
             let iy = Int32(max(-30000, min(30000, relCarryY)))
             relCarryX -= CGFloat(ix)
@@ -764,7 +833,7 @@ final class MetalBackedView: UIView {
             return
         }
 
-        let sens = CGFloat(InputSettings.shared.sensAbs)   // desktop px per view pt
+        let sens = CGFloat(InputSettings.shared.sensAbs * MouseTuning.current.speed)   // desktop px per view pt
         // The live desktop size: a program's display-mode change resizes it.
         var deskW: Int32 = 0, deskH: Int32 = 0
         winios_screen_size(&deskW, &deskH)
@@ -873,6 +942,15 @@ struct HoldMouseButtonView: View {
         guard let event = HardwareInput.shared.surfacePointerEvent(x: 0, y: 0, flags: flags) else { return }
         winios_pointer(event.x, event.y, event.flags, event.data)
         fputs("[trackpad] relative-mode button flags=0x\(String(flags, radix: 16))\n", stderr)
+    }
+}
+
+/// Apple Pencil Pro squeeze (see "Apple Pencil as a mouse" in MetalBackedView).
+extension MetalBackedView: UIPencilInteractionDelegate {
+    func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
+        // One right click per squeeze, on release.
+        guard squeeze.phase == .ended else { return }
+        pencilSqueezed(at: squeeze.hoverPose?.location)
     }
 }
 
@@ -1168,7 +1246,7 @@ struct JoystickKeyView: View {
                         center = CGPoint(x: geo.frame(in: .global).midX,
                                          y: geo.frame(in: .global).midY)
                         JoystickPadState.shared.center = center
-                        if let scene = UIApplication.shared.connectedScenes
+                        if let scene = UIApplication.shared.phoneScenes
                             .compactMap({ $0 as? UIWindowScene }).first {
                             JoystickPadHost.attach(to: scene)
                             hosted = true
@@ -1186,7 +1264,7 @@ struct JoystickKeyView: View {
                     .onChanged { g in
                         if !held {
                             held = true
-                            if let scene = UIApplication.shared.connectedScenes
+                            if let scene = UIApplication.shared.phoneScenes
                                 .compactMap({ $0 as? UIWindowScene }).first {
                                 JoystickPadHost.attach(to: scene)
                             }
@@ -1287,6 +1365,9 @@ final class InputSettings: ObservableObject {
     /// "Right stick controls mouse" (HardwareInput.swift, PadStickMouse). Off by
     /// default: a program that reads the controller already gets the stick.
     @Published var padRightStickMouse = false { didSet { save() } }
+    /// On the Wine desktop a keyboard's Command acts as Control in shortcuts (DesktopKeys.postedKey).
+    /// Off by default: Command is Windows' key as before.
+    @Published var commandIsControl = false { didSet { save() } }
 
     /// didSet fires for assignments made in init() because the properties are
     /// already initialised by then; without this the first launch would write
@@ -1310,6 +1391,7 @@ final class InputSettings: ObservableObject {
             sensMouse = j["sensMouse"] as? Double ?? 1.0
             ignoreTouchesWithMouse = j["ignoreTouchesWithMouse"] as? Bool ?? true
             padRightStickMouse = j["padRightStickMouse"] as? Bool ?? false
+            commandIsControl = j["commandIsControl"] as? Bool ?? false
         }
         loading = false
         madeira_set_diag_enabled(diagnostics ? 1 : 0)   // push the restored value down
@@ -1319,7 +1401,7 @@ final class InputSettings: ObservableObject {
         guard !loading else { return }
         let j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel, "diagnostics": diagnostics,
                                 "sensMouse": sensMouse, "ignoreTouchesWithMouse": ignoreTouchesWithMouse,
-                                "padRightStickMouse": padRightStickMouse,
+                                "padRightStickMouse": padRightStickMouse, "commandIsControl": commandIsControl,
                                 "touchMode": touchMode]
         guard let d = try? JSONSerialization.data(withJSONObject: j) else { return }
         try? d.write(to: Self.url, options: .atomic)
@@ -1374,7 +1456,10 @@ struct ContentView: View {
          * NavigationStack is single-column on every device. Safe here: there are
          * no NavigationLinks anywhere in the app, so nothing depended on the
          * two-column selection behaviour. */
-        NavigationStack {
+        // The library's tab bar holds a page stack per tab (Library.swift newLookBody), and a stack
+        // inside a stack breaks Back: the library is not put inside this one.
+        // Sessions and the developer screen keep it.
+        ContentNavigation(stack: !(library.enabled && library.current == nil)) {
             Group {
                 if library.enabled && library.current != nil {
                     sessionBody
@@ -1394,15 +1479,43 @@ struct ContentView: View {
             // under the title, the buttons and the search field behind a
             // progressive blur (as in the App Store), with no hard edge.
             .toolbarBackground(library.enabled && !Self.systemScrollEdge ? .visible : .automatic, for: .navigationBar)
+        }
             // A second session cannot start in this process; offer to close Madeira.
-            .alert("Restart Madeira", isPresented: Binding(get: { library.restartNotice != nil },
+            .alert(library.restartEntry != nil && MadeiraConfig.flag("MADEIRA_SWIPE_AWAY") ? "Ready to Start" : "Restart Madeira", isPresented: Binding(get: { library.restartNotice != nil },
                                                             set: { if !$0 { library.restartNotice = nil } })) {
-                Button("Close Madeira") {
-                    LogStore.shared.log("[session-once] closed by the user for a restart")
-                    exit(0)
+                // env.MADEIRA_SWIPE_AWAY = 0 restores the old Close Madeira button (exit(0)).
+                // Only the held-game notice (it has a game to start); other notices keep Close Madeira.
+                if library.restartEntry != nil && MadeiraConfig.flag("MADEIRA_SWIPE_AWAY") {
+                    Button("OK", role: .cancel) {
+                        // The game is remembered now; the next app run starts it by itself.
+                        if let id = library.restartEntry {
+                            NextLibraryGame.set(id)
+                            LogStore.shared.log("[session-once] the next app run starts the held game (the player swipes Madeira away)")
+                        }
+                        library.restartNotice = nil; library.restartEntry = nil
+                    }
+                } else {
+                    Button("Close Madeira") {
+                        LogStore.shared.log("[session-once] closed by the user for a restart")
+                        if let id = library.restartEntry {
+                            NextLibraryGame.set(id)
+                            LogStore.shared.log("[session-once] the next app run starts the held game")
+                        }
+                        exit(0)
+                    }
+                    Button("Later", role: .cancel) { library.restartNotice = nil; library.restartEntry = nil }
                 }
-                Button("Later", role: .cancel) { library.restartNotice = nil }
             } message: { Text(library.restartNotice ?? "") }
+            // A Steam game started without Madeira Dock handed itself to Steam and quit.
+            .alert("This game needs Steam", isPresented: Binding(get: { library.steamNeeded != nil },
+                                                                 set: { if !$0 { library.steamNeeded = nil } })) {
+                if let hint = library.steamNeeded, hint.canSwitch {
+                    Button("Use Madeira Dock") { library.useMadeiraDock(hint.id); library.steamNeeded = nil }
+                    Button("Not now", role: .cancel) { library.steamNeeded = nil }
+                } else {
+                    Button("OK", role: .cancel) { library.steamNeeded = nil }
+                }
+            } message: { Text(library.steamNeeded?.message ?? "") }
             // CS_DEBUGGED without a debugger (JIT enabled outside Madeira): offer Madeira's own request.
             .alert("Enable JIT", isPresented: Binding(get: { library.jitNotice != nil },
                                                       set: { if !$0 { library.jitNotice = nil } })) {
@@ -1416,7 +1529,7 @@ struct ContentView: View {
                 if let notice = library.cloudNotice {
                     switch notice.kind {
                     case .syncing: Button("Wait and sync") { library.cloudNotice = nil; cloudWait(notice.appID) }
-                    case .unchecked: Button("Try again") { library.cloudNotice = nil; cloudWait(notice.appID) }
+                    case .unchecked: Button("Try Again") { library.cloudNotice = nil; cloudWait(notice.appID) }
                     case .conflict:
                         Button("Choose") {
                             library.cloudNotice = nil; library.cloudRetry = nil
@@ -1440,6 +1553,7 @@ struct ContentView: View {
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
                 logStore.log("[build] \(BuildStamp.text)")
+                if let id = GetHelp.playerID { logStore.log("[player-id] \(id)") }
                 DeviceDiagnostics.logStartup()
                 DockOffline.begin()
                 FrontendChoice.logStartup()
@@ -1457,7 +1571,6 @@ struct ContentView: View {
             // now or, from a cold start, once the library is up.
             .onReceive(ShortcutRouter.shared.$pendingExe) { _ in launchPendingShortcut() }
             .onChange(of: library.enabled) { _, _ in launchPendingShortcut() }
-        }
     }
 
     /// The developer interface. Orientation comes from the view's own shape, not
@@ -1644,6 +1757,7 @@ struct ContentView: View {
                 .cornerRadius(6)
         }
         .matchedGeometryEffect(id: "pointerBtn", in: pointerNS)
+        .iconLabel(pointerPanel ? "Hide pointer controls" : "Pointer controls")
     }
 
     /// ml649: heavy diagnostics on/off, live. Stroke icon, dimmed when quiet —
@@ -1660,6 +1774,7 @@ struct ContentView: View {
                 .background(Color.secondary.opacity(0.25))
                 .cornerRadius(6)
         }
+        .iconLabel(input.diagnostics ? "Turn diagnostics off" : "Turn diagnostics on")
         .buttonStyle(.plain)
     }
 
@@ -2468,7 +2583,16 @@ struct ContentView: View {
         }
     }
 
+    /// A JIT failure goes where the player can act on it: the Settings › JIT row, or a top banner
+    /// (JITFailure, JITSetup.swift). env.MADEIRA_JIT_ERROR_ROW = 0 keeps the library's alert.
+    private func reportJITFailure(_ message: String, fix: String?, problem: JITCoordinator.ConnectionProblem?) {
+        guard MadeiraConfig.flag("MADEIRA_JIT_ERROR_ROW") else { library.error = message; return }
+        library.retryJIT = { enableJIT() }
+        library.jitFailure = JITFailure(message: message, fix: fix, problem: problem)
+    }
+
     private func enableJIT() {
+        library.jitFailure = nil
         // Explains why JIT cannot be enabled on a copy signed without get-task-allow; 0 opens StikDebug regardless.
         // A debugger can attach only to a process whose signature carries
         // get-task-allow (a development signature). A copy signed with a
@@ -2479,7 +2603,9 @@ struct ContentView: View {
             logStore.log(String(format: "[jit-signing] get-task-allow is missing (cs-flags=0x%x): no debugger can attach to this copy, "
                                 + "so JIT cannot be enabled. Reinstall Madeira with a development certificate.",
                                 SigningStatus.current.flags), level: .error)
-            if library.enabled { library.error = SigningStatus.notDebuggableMessage }
+            if library.enabled {
+                reportJITFailure(SigningStatus.notDebuggableMessage, fix: "Reinstall Madeira with a development certificate.", problem: nil)
+            }
             launchAfterJITEnded(started: false)
             return
         }
@@ -2501,7 +2627,10 @@ struct ContentView: View {
                 }
                 jitStatus = .unavailable
                 logStore.log("Failed to enable JIT: \(failure.localizedDescription)", level: .error)
-                if library.enabled { library.error = failure.localizedDescription }
+                if library.enabled {
+                    let problem = jitCoordinator.connectionProblem.flatMap { $0.message == failure.localizedDescription ? $0 : nil }
+                    reportJITFailure(failure.localizedDescription, fix: nil, problem: problem)
+                }
             }
         }
     }
@@ -2595,19 +2724,29 @@ struct ContentView: View {
 
     /// A Home Screen shortcut waiting for the library (a link opened at a cold start
     /// arrives before the library is up).
-    /// Then the Steam game the last run's game asked to start (NextSteamApp).
+    /// Then the Steam game the last run's game asked to start (NextSteamApp), or else the
+    /// game whose Play the last run held for a restart (NextLibraryGame).
     private func launchPendingShortcut() {
         guard library.enabled, library.current == nil else { return }
         if let exe = ShortcutRouter.shared.pendingExe {
             ShortcutRouter.shared.pendingExe = nil
-            _ = NextSteamApp.take()
+            _ = NextSteamApp.take(); _ = NextLibraryGame.take()
             launchShortcut(exe); return
         }
-        guard LibraryModel.sessionsThisRun == 0, let appID = NextSteamApp.take() else { return }
-        guard let entry = library.entries.first(where: { $0.steamAppID == appID }) else {
-            LogStore.shared.log("[dock-steam-run] app \(appID) is not in the library: not started", level: .error); return
+        guard LibraryModel.sessionsThisRun == 0 else { return }
+        let heldGame = NextLibraryGame.take()
+        if let appID = NextSteamApp.take() {
+            guard let entry = library.entries.first(where: { $0.steamAppID == appID }) else {
+                LogStore.shared.log("[dock-steam-run] app \(appID) is not in the library: not started", level: .error); return
+            }
+            LogStore.shared.log("[dock-steam-run] starting app \(appID), which the last run's game asked for")
+            launchLibraryEntry(entry); return
         }
-        LogStore.shared.log("[dock-steam-run] starting app \(appID), which the last run's game asked for")
+        guard let heldGame else { return }
+        guard let entry = library.entries.first(where: { $0.id == heldGame }) else {
+            LogStore.shared.log("[session-once] the game held for the restart is no longer in the library: not started", level: .error); return
+        }
+        LogStore.shared.log("[session-once] starting \(entry.title), which Play asked for before the restart")
         launchLibraryEntry(entry)
     }
 
@@ -2627,6 +2766,7 @@ struct ContentView: View {
     /// applies the entry's launch profile and runs the same full sequence as the
     /// developer interface's buttons.
     private func launchLibraryEntry(_ entry: LibraryEntry) {
+        LogTrail.play(entry)   // madeira-log-trail: the start steps count from here
         // madeira-bcd: a game seen for the first time starts with Madeira's recommended
         // settings (GameRecommendationsApply.swift).
         var entry = entry
@@ -2654,13 +2794,14 @@ struct ContentView: View {
             LogStore.shared.log("[steam-start] app=\(appID) direct source=\(entry.steamProgramSource ?? "-") " +
                                 "args=\(entry.launchArguments.isEmpty ? 0 : 1) folder=\(entry.steamWorkingWindowsPath == nil ? "program" : "steam")")
         }
-        guard wine_process_is_running() == 0, wineserver_is_running() == 0, library.current == nil else {
-            library.error = "A session is already running."; return
-        }
-        // One Wine session per app run (see LibraryModel.sessionsThisRun).
+        // One Wine session per app run (see LibraryModel.sessionsThisRun). First, so a start
+        // stopped from the starting screen, whose game may still be closing, says to restart.
         if LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN") {
             LogStore.shared.log("[session-once] launch held: \(LibraryModel.sessionsThisRun) session(s) already ran in this app run")
-            library.restartNotice = LibraryModel.restartMessage; return
+            library.holdForRestart(entry); return
+        }
+        guard wine_process_is_running() == 0, wineserver_is_running() == 0, library.current == nil else {
+            library.error = "A session is already running."; return
         }
         // The same precondition runWineFullSequence checks: the JIT pool is
         // taken at launch, through the debugger. Without it, Play enables JIT and
@@ -2743,6 +2884,7 @@ struct ContentView: View {
         let program = entry.desktop == true ? "explorer.exe"
             : entry.launchWindowsPath.split(separator: "\\").last.map(String.init) ?? entry.launchWindowsPath
         LogStore.shared.startSessionLog(program: program)
+        HardwareInput.shared.gameSessionStarted()
         library.begin(entry)
         runWineFullSequence(profile: entry)
     }
@@ -2798,6 +2940,7 @@ struct ContentView: View {
     private func runWineFullSequence(profile: LibraryEntry? = nil) {
         guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
+            unsetenv("MADEIRA_BEPINEX_DIRS")   // [bepinex-auto] a Dock start's folder list must not reach the next launch
             if profile != nil { LibraryModel.shared.launchFailed() }
             return
         }
@@ -2812,6 +2955,9 @@ struct ContentView: View {
         MadeiraConfig.migrateLegacy { self.logStore.log($0) }
         MadeiraConfig.deleteLegacyFiles { self.logStore.log($0) }   /* ml1096: the old files go once the cfg exists */
         /* ml2100: XInput (default) or the HID controller; before the wineserver starts. */
+        GamepadInput.sessionGameFolder = profile.flatMap {
+            GamepadInput.gameFolder(relativePath: $0.relativePath, startsDirectly: $0.startsSteamGameDirectly, drive: LibraryModel.drive)
+        }
         GamepadInput.shared.beginPadSession()
         /* ml1990: player 1 exists before the game enumerates XInput. */
         GamepadInput.shared.reserveSessionSlot(touchControls: TouchControlsModel.shared.offersControllerInput)
@@ -2861,6 +3007,33 @@ struct ContentView: View {
                 }
             } else {
                 _ = try? MadeiraConfig.applyGame(nil)   // no library game: no game's own lines
+            }
+
+            // [exe-window-auto] A library launch (not Dock) measures the game's own fixed-base
+            // exe too, so the window is widened before the pool is placed. METAPHOR.exe (333 MB,
+            // base 0x140000000) got "failed to create main module c0000018" without this.
+            // Dock sets exeWindowAutoMB before this point; an explicit exe-window-mb still wins.
+            if let profile, StikJITHelper.exeWindowAutoMB == 0 {
+                // [exe-window-auto] folder fix: a Steam entry's relativePath is already the game's
+                // folder (".../steamapps/common/Denshattack"), so dropping its last part scanned
+                // every installed game and sized the window for another game's exe (Denshattack,
+                // 0.2.26: METAPHOR.exe -> 336MB window, pool 656MB, directml.dll out of memory).
+                // Drop the last part only when it is the .exe itself, and never scan a folder that
+                // holds several games (steamapps/common, steamapps, Steam, Program Files).
+                let parts = profile.relativePath.split(separator: "/").map(String.init)
+                let rel = (!profile.startsSteamGameDirectly && (parts.last?.lowercased().hasSuffix(".exe") ?? false))
+                    ? parts.dropLast().joined(separator: "/")
+                    : profile.relativePath
+                let top = (rel.split(separator: "/").last.map(String.init) ?? "").lowercased()
+                let sharedFolder = rel.isEmpty || ["common", "steamapps", "steam", "program files", "program files (x86)", "games"].contains(top)
+                let exeFolder = LibraryModel.drive.appendingPathComponent(rel)
+                if sharedFolder {
+                    logStore.log("[exe-window-auto] skipped: \(rel.isEmpty ? "the drive" : rel) holds more than one game")
+                } else if let need = StikJITHelper.fixedBaseWindowMB(in: exeFolder) {
+                    StikJITHelper.exeWindowAutoMB = need.mb
+                    logStore.log("[exe-window-auto] \(need.exe) is a fixed-base image ending \(need.mb)MB above 0x140000000: "
+                        + "the executable window is widened to \(need.mb)MB for this session (exe-window-mb in the game's file overrides)")
+                }
             }
 
             // Step 1: Allocate JIT pool (BRK suspends entire process)
@@ -3569,14 +3742,16 @@ struct ContentView: View {
         guard jitReadyForLaunch(inLibrary: inLibrary, entry: profile?.id,
                                 then: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
         guard cloudClear(game.id, name: game.name, retry: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
+        // First, so a start stopped from the starting screen, whose game may still be
+        // closing, says to restart Madeira.
+        if inLibrary, LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN") {
+            LogStore.shared.log("[session-once] Dock launch held: \(LibraryModel.sessionsThisRun) session(s) already ran in this app run")
+            library.holdForRestart(profile)
+            return
+        }
         guard wine_process_is_running() == 0, wineserver_is_running() == 0, !inLibrary || library.current == nil else {
             logStore.log("[madeira-dock] a session already ran in this app run; restart Madeira first", level: .error)
             if inLibrary { library.error = "A session is already running." }
-            return
-        }
-        if inLibrary, LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN") {
-            LogStore.shared.log("[session-once] Dock launch held: \(LibraryModel.sessionsThisRun) session(s) already ran in this app run")
-            library.restartNotice = LibraryModel.restartMessage
             return
         }
         func fail(_ error: Error) {
@@ -3633,7 +3808,8 @@ struct ContentView: View {
             // one Steam's launch entry names, or the kept launcher goes back. No session runs.
             let program = DockStartProgram.chosen(game.id)
             if let launcher = steamEntry?.program {
-                let outcome = DockStartProgram.apply(launcher: launcher, program: program, folder: installFolder)
+                let outcome = DockStartProgram.apply(launcher: launcher, program: program, folder: installFolder,
+                                                   unityData: MadeiraConfig.flag("MADEIRA_DOCK_START_UNITY_DATA"))
                 if case .failed(let why) = outcome {
                     logStore.log("[dock-start-program] app=\(game.id) launcher=\(launcher) program=\(program ?? "steam") failed: \(why)", level: .error)
                 } else if outcome != .unchanged || program != nil {
@@ -3727,6 +3903,24 @@ struct ContentView: View {
             // is unchanged; env.MADEIRA_GDI_SHARED_SECTION = 0 in madeira.cfg, exported after
             // this, keeps the default for Dock sessions too.
             setenv("MADEIRA_GDI_SHARED_SECTION", "1", 1)
+            // [bepinex-auto] This session's program is explorer.exe; Valve's client starts the game later from
+            // its own folder. The bridge looks in these folders (the one holding Steam's launch program, which
+            // a chosen "Steam starts" program takes the place of, then the install folder) for a BepInEx install
+            // and adds winhttp=n,b to WINEDLLOVERRIDES for this session; it clears the variable when it has read
+            // it (and runWineFullSequence clears it when the session cannot start).
+            // env.MADEIRA_BEPINEX_AUTO = 0 leaves it out: in madeira.cfg, or in the game's file for a library start.
+            if DockInstallers.installsOnly {
+                unsetenv("MADEIRA_BEPINEX_DIRS")
+            } else {
+                var bepinexDirs = [gameFolder.path]
+                if let launchProgram = steamEntry?.program {
+                    let parts = launchProgram.replacingOccurrences(of: "\\", with: "/").split(separator: "/").dropLast()
+                    if !parts.isEmpty {
+                        bepinexDirs.insert(gameFolder.appendingPathComponent(parts.joined(separator: "/"), isDirectory: true).path, at: 0)
+                    }
+                }
+                setenv("MADEIRA_BEPINEX_DIRS", bepinexDirs.joined(separator: "\n"), 1)
+            }
             // ml1185: without desktop-size or a game's Resolution, this screen's shape
             // (ml1172's default: 1408x648 on a 19.5:9 iPhone, 1152x800 on an 11-inch
             // iPad), as every library entry defaults to; a fixed 1280x720 left bars
@@ -3737,7 +3931,7 @@ struct ContentView: View {
                 if p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 { width = p[0]; height = p[1] }
             }
             // A Steam game's own Resolution (validated above) sizes its Dock desktop.
-            if let size = profile?.resolution.split(separator: "x").compactMap({ Int($0) }), size.count == 2 {
+            if let size = profile.map({ ResolutionChoices.effective($0.resolution) })?.split(separator: "x").compactMap({ Int($0) }), size.count == 2 {
                 width = size[0]; height = size[1]
             }
             setenv("MADEIRA_EXE", "explorer.exe", 1)
@@ -4038,6 +4232,9 @@ enum ControlAction: Codable, Equatable, Hashable {
     case key(Int32)          // Windows virtual-key code
     case mouseLeft
     case mouseRight
+    case mouseMiddle         // held down and up like the other buttons
+    case scrollUp            // one wheel notch a press, repeating while held
+    case scrollDown
     case joystickWASD        // renders as a stick, posts W/A/S/D
     case joystickArrows      // renders as a stick, posts the arrow keys
     case keyboardToggle      // raises the iOS keyboard, as in portrait
@@ -4062,7 +4259,23 @@ enum ControlAction: Codable, Equatable, Hashable {
         default:              return nil
         }
     }
+    /// MOUSEEVENTF_WHEEL's data for one notch of a scroll action: +120 is away from the
+    /// user (up), -120 toward them. 0 for every other action.
+    var wheelDelta: UInt32 {
+        switch self {
+        case .scrollUp:   return 120
+        case .scrollDown: return UInt32(bitPattern: -120)
+        default:          return 0
+        }
+    }
     var isPad: Bool { if case .pad = self { return true }; return false }
+    /// Pure mouse actions: the Mouse tab of the mapping panel lists these.
+    var isMouseAction: Bool {
+        switch self {
+        case .mouseLeft, .mouseRight, .mouseMiddle, .scrollUp, .scrollDown: return true
+        default: return false
+        }
+    }
     var padName: String? { if case .pad(let name) = self { return name }; return nil }
     var isPadStick: Bool { padName == "LS" || padName == "RS" }
 
@@ -4119,6 +4332,9 @@ enum ControlAction: Codable, Equatable, Hashable {
         case .none:            return "—"
         case .mouseLeft:       return "L"
         case .mouseRight:      return "R"
+        case .mouseMiddle:     return "M"
+        case .scrollUp:        return "Sc▲"
+        case .scrollDown:      return "Sc▼"
         case .keyboardToggle:  return "⌨"
         case .joystickWASD:    return "WASD"
         case .joystickArrows:  return "↕"
@@ -4328,7 +4544,7 @@ enum TouchControlsHost {
     private static var window: ControlsWindow?
 
     static func attach() {
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scenes = UIApplication.shared.phoneScenes.compactMap { $0 as? UIWindowScene }
         guard let scene = scenes.first(where: { $0.activationState == .foregroundActive })
                         ?? scenes.first else { return }
         if window == nil {
@@ -4344,6 +4560,10 @@ enum TouchControlsHost {
             w.isHidden = false        // deliberately never made key
             let host = UIHostingController(rootView: TouchControlsOverlay())
             host.view.backgroundColor = .clear
+            // The controls are white glyphs on glass; in Light Mode the glass turned
+            // light and the glyphs vanished. Keep this window dark in either mode.
+            host.overrideUserInterfaceStyle = .dark
+            w.overrideUserInterfaceStyle = .dark
             w.rootViewController = host
             PointerLock.register(host)
             window = w
@@ -4373,7 +4593,7 @@ struct TouchControlsOverlay: View {
                 // happen) draws nothing over the library's own screens.
                 if landscape && !(library.enabled && !session && !m.editing) {
                     if m.editing {
-                        Color.clear.contentShape(editorCanvas(geo.size))
+                        Color.clear.contentShape(editorCanvas(geo.size, top: geo.safeAreaInsets.top))
                             .onTapGesture { m.selected = nil; zones.selected = nil }
                     }
                     if (m.visible || m.editing) && !library.blocksGameplayTouch {
@@ -4382,9 +4602,9 @@ struct TouchControlsOverlay: View {
                         }
                         controls(geo.size, session: session)
                     }
-                    if session && !m.editing { LibraryHUD() } else { topBar }
+                    if session && !m.editing { LibraryHUD() } else { topBar(top: geo.safeAreaInsets.top) }
                     if m.editing, let i = m.index(of: m.selected) {
-                        MappingPanel(control: m.controls[i], screen: geo.size)
+                        MappingPanel(control: m.controls[i], screen: geo.size).id(m.controls[i].id)
                     } else if m.editing, let i = zones.index(of: zones.selected) {
                         GestureZonePanel(zone: zones.zones[i], screen: geo.size)
                     }
@@ -4409,8 +4629,25 @@ struct TouchControlsOverlay: View {
     }
 
     /// The dismissal gesture must never take a control's drag on iOS 26.
-    private func editorCanvas(_ screen: CGSize) -> Path {
+    ///
+    /// Nor a tap meant for the top bar or the open panel: on iOS 26 this tap
+    /// recognises together with a button drawn over it, so the bar's "+" added a
+    /// control and the same tap selected nothing again (no panel opened), and the
+    /// panel's own options lost taps to it. Only Done seemed to work, because
+    /// clearing the selection is what Done does anyway. The bar's strip (the
+    /// same 68 pt hitsInteractive gives it) and the panel are left out.
+    private func editorCanvas(_ screen: CGSize, top: CGFloat) -> Path {
         var area = Path(CGRect(origin: .zero, size: screen))
+        area = area.subtracting(Path(CGRect(x: 0, y: 0, width: screen.width, height: 68 + top)))
+        // The open panel's place comes from the same arithmetic that places it,
+        // not from a measured frame: publishing a measured frame back into the
+        // model re-rendered the whole overlay from inside its own layout.
+        if let i = m.index(of: m.selected) {
+            area = area.subtracting(Path(MappingPanel.frame(control: m.controls[i], screen: screen)
+                .insetBy(dx: -4, dy: -4)))
+        } else if GestureZonesModel.enabled, let i = zones.index(of: zones.selected) {
+            area = area.subtracting(Path(GestureZonePanel.column(zone: zones.zones[i], screen: screen)))
+        }
         for control in m.controls {
             let size = TouchControlsModel.size(control)
             let frame = CGRect(x: CGFloat(control.nx) * screen.width - size.width / 2,
@@ -4483,7 +4720,8 @@ struct TouchControlsOverlay: View {
         ControlPresetsModel.enabled && m.visible && !m.editing
     }
 
-    private var topBar: some View {
+    /// `top` is the safe-area inset: in portrait the bar would sit behind the Dynamic Island.
+    private func topBar(top: CGFloat) -> some View {
         HStack(spacing: 10) {
             if m.editing && Self.editorDone {
                 Button {
@@ -4543,7 +4781,7 @@ struct TouchControlsOverlay: View {
                 }
             }
         }
-        .padding(.top, 10)
+        .padding(.top, 10 + top)
         .animation(.easeInOut(duration: 0.22), value: m.editing)
     }
 
@@ -4574,6 +4812,24 @@ struct TouchControlsOverlay: View {
                 .background(GlassShape(circle: true))
         }
         .buttonStyle(.plain)
+        .iconLabel(Self.glassLabel(system))
+    }
+
+    /// VoiceOver names for the strip's icon-only buttons, keyed by the symbol each state draws.
+    private static func glassLabel(_ symbol: String) -> String {
+        switch symbol {
+        case "keyboard": return "Keyboard"
+        case "gamecontroller": return "Show or hide touch controls"
+        case "checkmark": return "Done editing controls"
+        case "pencil": return "Edit touch controls"
+        case "circle.grid.2x2": return "Snap to grid, off"
+        case "circle.grid.2x2.fill": return "Snap to grid, on"
+        case "iphone.radiowaves.left.and.right": return "Haptic feedback, on"
+        case "iphone.slash": return "Haptic feedback, off"
+        case "plus": return "Add button"
+        case "rectangle.dashed": return "Add gesture zone"
+        default: return symbol
+        }
     }
 }
 
@@ -4658,6 +4914,13 @@ struct TouchControlButton: View {
     @State private var dragBase: CGPoint?
     @State private var stickDir: Int = -1
     @State private var padVector = CGSize.zero
+    /// When the current press went down, and the action whose release is being
+    /// held back to the minimum hold (TouchControlButton.minimumHold).
+    @State private var downAt: CFTimeInterval = 0
+    @State private var heldAction: ControlAction?
+    @State private var holdToken = 0
+    /// A held scroll button repeats while this token is current (a release or a removed control bumps it).
+    @State private var scrollToken = 0
 
     private var solid: Bool { TouchControlStyle.isSolid(style) }
     private var diameter: CGFloat { TouchControlsModel.diameter(control) }
@@ -4768,7 +5031,7 @@ struct TouchControlButton: View {
         // ml646: the springy knob, same curve as the portrait pad overlay.
         .animation(.spring(response: 0.22, dampingFraction: 0.58), value: stickDir)
         .overlay(alignment: .topTrailing) {
-            if isSelected && control.locked != true {
+            if isSelected && control.locked != true && !MappingPanel.higEnabled {
                 Button {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     m.controls.removeAll { $0.id == control.id }
@@ -4791,7 +5054,11 @@ struct TouchControlButton: View {
                 }
             }
         }
-        .onDisappear { if control.action.isPad { padVector = .zero; isDown = false } }
+        .onDisappear {
+            if control.action.isPad { padVector = .zero; isDown = false }
+            releaseHeldNow()             // never leave a key down behind a removed control
+            scrollToken &+= 1            // nor a scroll repeating
+        }
         .onChange(of: m.editing) { _, _ in if control.action.isPad { padVector = .zero; isDown = false } }
         .onChange(of: screen) { _, _ in if control.action.isPad { padVector = .zero; isDown = false } }
         .onChange(of: control.action) { old, new in
@@ -4879,17 +5146,40 @@ struct TouchControlButton: View {
 
     /// Haptic on the DOWN edge only — a held movement key would otherwise buzz
     /// continuously for as long as you walk.
+    ///
+    /// A key or mouse button stays down for at least `minimumHold`. A quick tap
+    /// otherwise put its press and its release into the same input drain, and a
+    /// game that reads key state once a frame (GetAsyncKeyState, DirectInput's
+    /// device state, many engines' input polling) never saw the key down: the tap
+    /// buzzed but did nothing, and only a long hold registered (0.2.0 reports).
     private func press(_ down: Bool) {
         if down && TouchControlsModel.shared.hapticsEnabled {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         }
         switch control.action {
-        case .key(let vk):
-            winios_post_key(vk, down ? 1 : 0)
-        case .mouseLeft:
-            winios_pointer(0, 0, down ? 0x0002 : 0x0004, 0)   // LEFTDOWN / LEFTUP
-        case .mouseRight:
-            winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)   // RIGHTDOWN / RIGHTUP
+        case .scrollUp, .scrollDown:
+            scrollToken &+= 1
+            if down {
+                send(control.action, down: true)      // one notch a tap
+                scrollRepeat(scrollToken, after: 0.4)
+            }
+        case .key, .mouseLeft, .mouseRight, .mouseMiddle:
+            if down {
+                releaseHeldNow()         // a new tap while the last one is held back: release it first
+                downAt = CACurrentMediaTime()
+                send(control.action, down: true)
+                return
+            }
+            let left = Self.minimumHold - (CACurrentMediaTime() - downAt)
+            guard left > 0 else { send(control.action, down: false); return }
+            let token = holdToken &+ 1
+            holdToken = token; heldAction = control.action
+            DispatchQueue.main.asyncAfter(deadline: .now() + left) {
+                // A newer press (or a removed control) has already sent this release.
+                guard holdToken == token, let action = heldAction else { return }
+                heldAction = nil
+                send(action, down: false)
+            }
         case .keyboardToggle:
             if down { MetalBackedView.toggleKeyboard() }
         case .none, .joystickWASD, .joystickArrows:
@@ -4898,6 +5188,54 @@ struct TouchControlButton: View {
             break     // TouchPadSurface owns pad presses and cancellation.
         }
     }
+
+    private func send(_ action: ControlAction, down: Bool) {
+        switch action {
+        case .key(let vk):
+            winios_post_key(vk, down ? 1 : 0)
+        case .mouseLeft:
+            winios_pointer(0, 0, MouseTuning.current.swapped(down ? 0x0002 : 0x0004), 0)   // LEFTDOWN / LEFTUP
+        case .mouseRight:
+            winios_pointer(0, 0, MouseTuning.current.swapped(down ? 0x0008 : 0x0010), 0)   // RIGHTDOWN / RIGHTUP
+        case .mouseMiddle:
+            winios_pointer(0, 0, down ? 0x0020 : 0x0040, 0)   // MIDDLEDOWN / MIDDLEUP
+        case .scrollUp, .scrollDown:
+            if down { winios_pointer(0, 0, 0x0800, action.wheelDelta) }   // one WHEEL notch
+        default:
+            break
+        }
+    }
+
+    /// While a scroll button stays down, another notch every 0.1 s after `delay`.
+    private func scrollRepeat(_ token: Int, after delay: Double) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard scrollToken == token else { return }
+            send(control.action, down: true)
+            scrollRepeat(token, after: 0.1)
+        }
+    }
+
+    /// Sends a release that is being held back, at once; the delayed one then
+    /// finds its token stale and does nothing.
+    private func releaseHeldNow() {
+        guard let action = heldAction else { return }
+        heldAction = nil
+        holdToken &+= 1
+        send(action, down: false)
+    }
+
+    /// The shortest press a touch key or mouse button sends:
+    /// `env.MADEIRA_TOUCH_KEY_MIN_HOLD_MS` in milliseconds (0 to 500; a game's
+    /// own config can set it), 60 ms by default, about two frames at 30 fps.
+    /// 0: a release is sent the moment the finger lifts, as before. Returned in
+    /// seconds. The session's environment comes first: it already holds
+    /// madeira.cfg's value with the game's own line exported over it.
+    static var minimumHold: Double {
+        let raw = getenv("MADEIRA_TOUCH_KEY_MIN_HOLD_MS").map { String(cString: $0) }
+            ?? MadeiraConfig.get("env.MADEIRA_TOUCH_KEY_MIN_HOLD_MS")
+        let ms = raw.flatMap { Int($0.trimmingCharacters(in: .whitespaces)) } ?? 60
+        return Double(min(max(ms, 0), 500)) / 1000
+    }
 }
 
 /// ml645 — the mapping panel. Shown for the selected control in edit mode.
@@ -4905,15 +5243,113 @@ struct MappingPanel: View {
     let control: TouchControl
     let screen: CGSize
     @ObservedObject private var m = TouchControlsModel.shared
-    @State private var tab = 0                    // 0 keyboard, 1 controller
+    @ObservedObject private var library = LibraryModel.shared
+    @State private var tab: Int                   // 0 keyboard, 1 controller, 2 mouse
     @State private var resizeDiameter: CGFloat?
+    @State private var speedDraft: Double = 1
+    @State private var stickSpeedDraft: Double = 1
 
+    init(control: TouchControl, screen: CGSize) {
+        self.control = control
+        self.screen = screen
+        _tab = State(initialValue: control.action.isMouseAction ? 2 : 0)
+        hig = Self.higEnabled
+    }
+
+    /// The panel in Apple's type styles with 44 pt rows, a Delete Button row and one scrolling
+    /// page (env.MADEIRA_CONTROL_PANEL_HIG = 0 keeps the compact panel below, as it was).
+    private let hig: Bool   // read once when the panel opens
+    static var higEnabled: Bool { MadeiraConfig.flag("MADEIRA_CONTROL_PANEL_HIG") }
 
     var body: some View {
+        if hig { higBody } else { classicBody }
+    }
+
+    private var higBody: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                HStack(spacing: 4) {
+                    Picker("Input", selection: $tab) {
+                        Text("Keyboard").tag(0)
+                        Text("Controller").tag(1)
+                        Text("Mouse").tag(2)
+                    }
+                    .pickerStyle(.segmented)
+                    Button {
+                        if let i = m.index(of: control.id) { m.controls[i].locked = control.locked == true ? nil : true }
+                    } label: {
+                        Image(systemName: control.locked == true ? "lock.fill" : "lock.open")
+                            .font(.body)
+                            .foregroundStyle(control.locked == true ? Color.primary : Color.secondary)
+                            .frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(control.locked == true ? "Unlock control" : "Lock control")
+                }
+                .padding(.horizontal, 10).padding(.top, 6)
+                HStack(spacing: 8) {
+                    Text("Size").font(.subheadline)
+                    Slider(value: Binding(get: { control.scale }, set: { value in
+                        if let i = m.index(of: control.id), m.controls[i].locked != true {
+                            m.controls[i].scale = value
+                        }
+                    }), in: 0.5...3.0, onEditingChanged: { resizing in
+                        if resizing {
+                            if resizeDiameter == nil { resizeDiameter = TouchControlsModel.diameter(control) }
+                        } else if resizeDiameter != nil {
+                            DispatchQueue.main.async { resizeDiameter = nil }
+                        }
+                    })
+                        .id(control.id)
+                        .disabled(control.locked == true)
+                        .accessibilityLabel("Control size")
+                        .accessibilityValue("\(Int(control.scale * 100)) percent")
+                    Text("\(Int(control.scale * 100))%")
+                        .font(.subheadline.monospacedDigit())
+                        .frame(width: 52, alignment: .trailing)
+                }
+                .padding(.horizontal, 12)
+                .frame(minHeight: 44)
+                Divider()
+                LayerButtons { mv in if let i = m.index(of: control.id) { mv.apply(&m.controls, i) } }
+                    .padding(.horizontal, 10)
+                    .frame(minHeight: 44)
+                if control.locked != true {
+                    Button(role: .destructive) {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        m.controls.removeAll { $0.id == control.id }
+                        m.selected = nil
+                    } label: {
+                        Text("Delete Button")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                            .background(RoundedRectangle(cornerRadius: 10).fill(Color.red))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 10).padding(.vertical, 8)
+                }
+                Divider()
+                (tab == 0 ? AnyView(keyboardTab) : tab == 1 ? AnyView(controllerTab) : AnyView(mouseTab))
+                    .padding(10)
+            }
+        }
+        .foregroundStyle(.white)
+        .environment(\.colorScheme, .dark)
+        .frame(width: layout.size.width, height: layout.size.height)
+        .background(GlassShape())
+        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.18), lineWidth: 1))
+        .contentShape(Rectangle())
+        .position(layout.center)
+    }
+
+    private var classicBody: some View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
                 tabButton(0, "keyboard")
                 tabButton(1, "gamecontroller")
+                tabButton(2, "computermouse", label: "Mouse")
                 Button {
                     if let i = m.index(of: control.id) { m.controls[i].locked = control.locked == true ? nil : true }
                 } label: {
@@ -4955,7 +5391,7 @@ struct MappingPanel: View {
                 .padding(.horizontal, 10)
             Rectangle().fill(.white.opacity(0.15)).frame(height: 1)
             ScrollView {
-                (tab == 0 ? AnyView(keyboardTab) : AnyView(controllerTab))
+                (tab == 0 ? AnyView(keyboardTab) : tab == 1 ? AnyView(controllerTab) : AnyView(mouseTab))
                     .padding(10)
             }
         }
@@ -4963,12 +5399,24 @@ struct MappingPanel: View {
         .background(GlassShape())
         .clipShape(RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.18), lineWidth: 1))
+        // Panel gaps must not dismiss the selection beneath them: the editor's
+        // dismissal area leaves the panel out (MappingPanel.frame). No tap gesture
+        // of its own here; on iOS 26 one took taps from the panel's buttons.
         .contentShape(Rectangle())
-        .onTapGesture { } // Panel gaps must not dismiss the selection beneath them.
         .position(layout.center)
     }
 
-    private struct Placement { var center: CGPoint; var size: CGSize }
+    /// Captions: the system's secondary label colour (the panel is dark), not white at 45%.
+    private var captionStyle: AnyShapeStyle { hig ? AnyShapeStyle(.secondary) : AnyShapeStyle(.white.opacity(0.45)) }
+
+    struct Placement { var center: CGPoint; var size: CGSize }
+
+    /// Where the panel for `control` sits at rest, for the editor's dismissal area.
+    static func frame(control: TouchControl, screen: CGSize) -> CGRect {
+        let p = placement(control: control, screen: screen, radius: TouchControlsModel.diameter(control) / 2)
+        return CGRect(x: p.center.x - p.size.width / 2, y: p.center.y - p.size.height / 2,
+                      width: p.size.width, height: p.size.height)
+    }
 
     /// ml646: the panel must NEVER sit under the control it is editing.
     ///
@@ -4982,14 +5430,20 @@ struct MappingPanel: View {
     /// then always safe — below/above are separated vertically, so no horizontal
     /// clamp can reintroduce an overlap, and vice versa.
     private var layout: Placement {
+        Self.placement(control: control, screen: screen,
+                       radius: (resizeDiameter ?? TouchControlsModel.diameter(control)) / 2)
+    }
+
+    static func placement(control: TouchControl, screen: CGSize, radius r: CGFloat) -> Placement {
         let cx = CGFloat(control.nx) * screen.width
         let cy = CGFloat(control.ny) * screen.height
-        let r  = (resizeDiameter ?? TouchControlsModel.diameter(control)) / 2
         let gap: CGFloat = 14, edge: CGFloat = 8
 
-        for size in [CGSize(width: 340, height: 236),
-                     CGSize(width: 300, height: 196),
-                     CGSize(width: 264, height: 164)] {
+        // The type-styled panel scrolls, so it keeps beside-the-button placement at these sizes.
+        let sizes = higEnabled
+            ? [CGSize(width: 340, height: 300), CGSize(width: 300, height: 240), CGSize(width: 264, height: 190)]
+            : [CGSize(width: 340, height: 236), CGSize(width: 300, height: 196), CGSize(width: 264, height: 164)]
+        for size in sizes {
             let clampX = min(max(cx, size.width  / 2 + edge), screen.width  - size.width  / 2 - edge)
             let clampY = min(max(cy, size.height / 2 + edge), screen.height - size.height / 2 - edge)
             if cy + r + gap + size.height <= screen.height - edge {
@@ -5007,7 +5461,7 @@ struct MappingPanel: View {
         }
         // Nothing fits alongside — smallest panel, corner furthest from the
         // control, so it still cannot cover it.
-        let size = CGSize(width: 264, height: 164)
+        let size = sizes[2]
         return Placement(
             center: CGPoint(x: cx < screen.width  / 2 ? screen.width  - size.width  / 2 - edge
                                                       : size.width  / 2 + edge,
@@ -5016,7 +5470,7 @@ struct MappingPanel: View {
             size: size)
     }
 
-    private func tabButton(_ i: Int, _ icon: String) -> some View {
+    private func tabButton(_ i: Int, _ icon: String, label: String? = nil) -> some View {
         Button { tab = i } label: {
             Image(systemName: icon)                       // stroke, not filled
                 .font(.system(size: 16, weight: .regular))
@@ -5024,6 +5478,7 @@ struct MappingPanel: View {
                 .frame(maxWidth: .infinity, minHeight: 36)
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(label ?? (i == 0 ? "Keyboard" : "Controller"))
     }
 
     // ---- catalogues ----
@@ -5047,8 +5502,7 @@ struct MappingPanel: View {
             if GamepadInput.keyboardMouseAvailable, !control.action.isPad, control.action != .none, control.action != .keyboardToggle {
                 bindingSection
             }
-            section("Pointer, sticks & special", [
-                ("L click", .mouseLeft), ("R click", .mouseRight),
+            section("Sticks & special", [
                 ("WASD", .joystickWASD), ("Arrows", .joystickArrows),
                 ("Keyboard", .keyboardToggle), ("None", .none),
             ])
@@ -5075,11 +5529,67 @@ struct MappingPanel: View {
         }
     }
 
+    private var mouseTab: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            section("Mouse", [
+                ("L click", .mouseLeft), ("R click", .mouseRight), ("M click", .mouseMiddle),
+                ("Scroll up", .scrollUp), ("Scroll down", .scrollDown),
+            ])
+            if let game = library.activeEntry, library.current != nil {
+                mouseSettings(game)
+            }
+        }
+    }
+
+    /// The running game's Controls > Mouse settings: the same LibraryEntry fields (and so the
+    /// same env.MADEIRA_MOUSE_* lines) that Game details > Controls > Mouse writes.
+    private func mouseSettings(_ game: LibraryEntry) -> some View {
+        func store(_ change: (inout LibraryEntry) -> Void) {
+            guard var e = library.activeEntry else { return }
+            change(&e)
+            library.save(e)
+            library.activeEntry = e
+        }
+        func speedRow(_ title: String, _ draft: Binding<Double>, _ commit: @escaping (Double?) -> Void) -> some View {
+            HStack(spacing: 8) {
+                Text(title).font(hig ? .footnote : .system(size: 12)).frame(width: 96, alignment: .leading)
+                Slider(value: draft, in: 0.25...3, step: 0.05) { editing in
+                    if !editing { commit(abs(draft.wrappedValue - 1) < 0.01 ? nil : draft.wrappedValue) }
+                }
+                Text("\(Int((draft.wrappedValue * 100).rounded()))%")
+                    .font(hig ? .footnote.monospacedDigit() : .system(size: 12).monospacedDigit()).frame(width: hig ? 48 : 42, alignment: .trailing)
+            }
+            .frame(minHeight: hig ? 44 : 0)
+        }
+        func toggleRow(_ title: String, _ on: Bool, _ set: @escaping (Bool) -> Void) -> some View {
+            Toggle(title, isOn: Binding(get: { on }, set: set))
+                .font(hig ? .subheadline : .system(size: 12))
+                .frame(minHeight: hig ? 44 : 0)
+        }
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("This game's mouse settings")
+                .font(hig ? .footnote.weight(.semibold) : .system(size: 10, weight: .semibold))
+                .foregroundStyle(captionStyle)
+            speedRow("Mouse speed", $speedDraft) { v in store { $0.mouseSpeed = v } }
+            speedRow("Stick speed", $stickSpeedDraft) { v in store { $0.stickMouseSpeed = v } }
+            toggleRow("Invert Y", game.mouseInvertY ?? false) { v in store { $0.mouseInvertY = v ? true : nil } }
+            toggleRow("Swap left and right", game.mouseSwapButtons ?? false) { v in store { $0.mouseSwapButtons = v ? true : nil } }
+            Text("Applies next time the game starts.")
+                .font(hig ? .footnote : .system(size: 10))
+                .foregroundStyle(captionStyle)
+        }
+        .foregroundStyle(.white)
+        .onAppear {
+            speedDraft = game.mouseSpeed ?? 1
+            stickSpeedDraft = game.stickMouseSpeed ?? 1
+        }
+    }
+
     private var controllerTab: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Controller controls feed XInput player 1. LS and RS are analogue sticks; "
                  + "LT and RT are full-press triggers. Touch and physical controls can be used together.")
-                .font(.system(size: 11))
+                .font(hig ? .footnote : .system(size: 11))
                 .foregroundStyle(.orange.opacity(0.95))
                 .fixedSize(horizontal: false, vertical: true)
             section("Face", [("A", .pad("A")), ("B", .pad("B")), ("X", .pad("X")), ("Y", .pad("Y"))])
@@ -5103,9 +5613,9 @@ struct MappingPanel: View {
         let names = control.action.stickKeys != nil ? PadBindings.stickNames : PadBindings.buttonNames
         return VStack(alignment: .leading, spacing: 6) {
             Text("Controller button for this action (keyboard & mouse mode)")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.45))
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 48), spacing: 6)], spacing: 6) {
+                .font(hig ? .footnote.weight(.semibold) : .system(size: 10, weight: .semibold))
+                .foregroundStyle(captionStyle)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: hig ? 56 : 48), spacing: 6)], spacing: 6) {
                 ForEach(names, id: \.self) { name in
                     let on = control.padBinding == name
                     Button {
@@ -5113,9 +5623,9 @@ struct MappingPanel: View {
                         if let i = m.index(of: control.id) { m.controls[i].padBinding = on ? nil : name }
                     } label: {
                         Text(name == "Menu" ? "Start" : name == "View" ? "Select" : name)
-                            .font(.system(size: 12, weight: .medium)).lineLimit(1).minimumScaleFactor(0.55)
+                            .font(hig ? .footnote.weight(.medium) : .system(size: 12, weight: .medium)).lineLimit(1).minimumScaleFactor(0.55)
                             .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity, minHeight: 30)
+                            .frame(maxWidth: .infinity, minHeight: hig ? 44 : 30)
                             .background(RoundedRectangle(cornerRadius: 7).fill(on ? Color.accentColor.opacity(0.6) : .white.opacity(0.12)))
                     }
                     .buttonStyle(.plain)
@@ -5127,9 +5637,9 @@ struct MappingPanel: View {
     private func section(_ title: String, _ items: [(String, ControlAction)]) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.45))
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 48), spacing: 6)], spacing: 6) {
+                .font(hig ? .footnote.weight(.semibold) : .system(size: 10, weight: .semibold))
+                .foregroundStyle(captionStyle)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: hig ? 56 : 48), spacing: 6)], spacing: 6) {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, it in
                     chip(it.0, it.1)
                 }
@@ -5144,14 +5654,25 @@ struct MappingPanel: View {
             if let i = m.index(of: control.id) { m.controls[i].action = action }
         } label: {
             Text(label)
-                .font(.system(size: 12, weight: .medium))
+                .font(hig ? .footnote.weight(.medium) : .system(size: 12, weight: .medium))
                 .lineLimit(1)
                 .minimumScaleFactor(0.55)
                 .foregroundStyle(.white.opacity(action.isPad ? 0.55 : 1.0))
-                .frame(maxWidth: .infinity, minHeight: 30)
+                .frame(maxWidth: .infinity, minHeight: hig ? 44 : 30)
                 .background(RoundedRectangle(cornerRadius: 7)
                     .fill(.white.opacity(on ? 0.36 : 0.12)))
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// (new-look) The app's navigation stack, or none: the new-look library's tab bar has one per
+/// tab (ContentView.body). The alerts, sheets and start-up work sit outside this, so switching
+/// it never runs them again.
+private struct ContentNavigation<Content: View>: View {
+    let stack: Bool
+    @ViewBuilder var content: Content
+    var body: some View {
+        if stack { NavigationStack { content } } else { content }
     }
 }

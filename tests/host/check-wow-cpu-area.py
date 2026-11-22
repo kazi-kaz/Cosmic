@@ -24,7 +24,7 @@ def function(source, start):
     return source[a:c]
 
 # ---- Part A
-impl = function(mod, "static uint64_t HandleSyscallImpl(")
+impl = function(mod, "static void HandleSyscallImpl(" if "static void HandleSyscallImpl(" in mod else "static uint64_t HandleSyscallImpl(")
 for call in ["WineUnixCall(", "Wow64SystemServiceEx("]:
     before = impl[:impl.index(call)]
     flush = before.rindex("Context::FlushCpuAreaForExit(TLS);")

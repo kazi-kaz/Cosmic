@@ -1,15 +1,15 @@
 [submodule "FEX"]
 	path = FEX
-	url = https://github.com/willfaust/FEX.git
-	branch = ios-port-2607
+	url = https://github.com/kazi-kaz/FEX.git
+	branch = madeira-0.2.72
 [submodule "wine"]
 	path = wine
-	url = https://github.com/willfaust/wine.git
-	branch = madeira-lgpl
+	url = https://github.com/kazi-kaz/wine.git
+	branch = madeira-0.2.72
 [submodule "dxmt"]
 	path = dxmt
-	url = https://github.com/willfaust/dxmt.git
-	branch = ios-port
+	url = https://github.com/kazi-kaz/dxmt.git
+	branch = madeira-0.2.72
 [submodule "madeira-dock"]
 	path = madeira-dock
 	url = https://github.com/willfaust/madeira-dock.git

@@ -167,6 +167,42 @@ class SteamLibraryFetcher {
         return app
     }
 
+    // MARK: - Free games
+
+    /// Asks Steam for the free license of an app (ClientRequestFreeLicense), as
+    /// Steam's own "Add to Library" button on a free game's store page does.
+    /// Returns the app IDs Steam granted; empty when the app is not free or the
+    /// account already has it. A grant makes Steam push a new license list.
+    func requestFreeLicense(appID: UInt32) async throws -> (eresult: UInt64, grantedApps: [UInt32], grantedPackages: [UInt32]) {
+        try await session.ensureConnected()
+        var request = ProtobufEncoder()
+        request.writeUInt32(fieldNumber: 2, value: appID)   // appids (repeated)
+        let response = try await session.sendAndWait(eMsg: .clientRequestFreeLicense, body: request.data,
+                                                     responseEMsg: .clientRequestFreeLicenseResponse, timeout: 15)
+        var decoder = ProtobufDecoder(response.body)
+        var result: UInt64 = 2
+        var packages: [UInt32] = [], apps: [UInt32] = []
+        func ids(_ wire: ProtoWireType, into list: inout [UInt32]) throws {
+            if wire == .lengthDelimited {   // packed
+                var packed = ProtobufDecoder(try decoder.readBytes())
+                while !packed.isAtEnd { list.append(UInt32(truncatingIfNeeded: try packed.readVarint())) }
+            } else {
+                list.append(UInt32(truncatingIfNeeded: try decoder.readVarint()))
+            }
+        }
+        while let tag = try decoder.readTag() {
+            switch (tag.fieldNumber, tag.wireType) {
+            case (1, .varint): result = try decoder.readVarint()
+            case (2, .varint), (2, .lengthDelimited): try ids(tag.wireType, into: &packages)
+            case (3, .varint), (3, .lengthDelimited): try ids(tag.wireType, into: &apps)
+            default: try decoder.skip(wireType: tag.wireType)
+            }
+        }
+        SteamLog.event("[steam-free] request app=\(appID) eresult=\(result) packages=\(packages.map(String.init).joined(separator: ",")) apps=\(apps.map(String.init).joined(separator: ","))")
+        if result == 1, !packages.isEmpty { session.addGrantedLicenses(packages) }
+        return (result, apps, packages)
+    }
+
     // MARK: - Beta branches
 
     /// The private branches a beta code opens for an app (CheckAppBetaPassword),

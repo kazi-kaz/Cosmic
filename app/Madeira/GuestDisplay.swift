@@ -222,6 +222,21 @@ enum ResolutionChoices {
     static func defaultSize(for s: Screen = screen) -> (w: Int, h: Int) { shape(s, pixels: budgets[defaultBudget].pixels) }
     static var defaultValue: String { let d = defaultSize(); return "\(d.w)x\(d.h)" }
 
+    /// The global Resolution (Settings > Display and Graphics, `desktop-size` in madeira.cfg),
+    /// or nil when unset or out of range.
+    static var globalValue: String? {
+        guard let txt = MadeiraConfig.get("desktop-size") else { return nil }
+        let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        guard p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 else { return nil }
+        return "\(p[0])x\(p[1])"
+    }
+
+    /// A game's Resolution as launched: an entry still on the plain default value ("use
+    /// Settings") follows the global one; any other stored value is the game's own and stays.
+    static func effective(_ own: String) -> String {
+        own == defaultValue ? (globalValue ?? own) : own
+    }
+
     /// madeira-bcd: the screen's shape at `lines` lines, the width a multiple of 8.
     static func lines(_ s: Screen, _ lines: Int) -> (w: Int, h: Int) {
         (Int((Double(lines) * aspect(s) / 8).rounded()) * 8, lines)

@@ -135,7 +135,14 @@ actor SteamConnection {
         // Verify the connection completed (WebSocket handshake + ping round-trip)
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                // [steam-ping] the ping's completion can come twice (once more with an error after the
+                // cancel below), and a CheckedContinuation resumed twice traps (Sentry B8, SIGTRAP on an iPad).
+                let once = PingResumeOnce()
                 task.sendPing { error in
+                    guard once.claim() else {
+                        SteamLog.trace("[steam-ping] a second ping completion was ignored")
+                        return
+                    }
                     if let error {
                         cont.resume(throwing: error)
                     } else {
@@ -244,5 +251,18 @@ actor SteamConnection {
         }
         disconnect()
         try await connect()
+    }
+}
+
+/// [steam-ping] Lets exactly one sendPing completion resume the connect continuation.
+private final class PingResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+    /// True for the first caller only.
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if done { return false }
+        done = true
+        return true
     }
 }

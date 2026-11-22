@@ -1,0 +1,73 @@
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index a8fc26b1..0da2811a 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -4633,6 +4633,34 @@ static HRESULT d3d12_resource_validate_heap(const D3D12_RESOURCE_DESC1 *resource
+     return S_OK;
+ }
+ 
++static bool d3d12_resource_placed_buffer_offset_ok(struct d3d12_device *device,
++        const struct d3d12_resource *resource, uint64_t heap_offset)
++{
++    static int mode = -1; /* -1 not read, 0 off, 1 on */
++    static bool logged;
++    VkDeviceSize alignment;
++    char env[8];
++
++    if (d3d12_resource_is_texture(resource))
++        return false;
++
++    if (mode < 0)
++        mode = !(vkd3d_get_env_var("MADEIRA_VKD3D_PLACED_BUFFER_OFFSET", env, sizeof(env)) && !strcmp(env, "0"));
++    if (!mode)
++        return false;
++
++    alignment = max(d3d12_device_get_ssbo_alignment(device), (VkDeviceSize)VKD3D_MIN_BUFFER_ALIGNMENT);
++    if (heap_offset & (alignment - 1u))
++        return false;
++
++    if (!logged)
++    {
++        logged = true;
++        ERR("[placed-buffer-offset] accepted a placed buffer at heap offset %#"PRIx64" (not 64 KiB aligned; MADEIRA_VKD3D_PLACED_BUFFER_OFFSET = 0 refuses it as before).\n", heap_offset);
++    }
++    return true;
++}
++
+ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
+         struct d3d12_heap *heap, uint64_t heap_offset, D3D12_RESOURCE_STATES initial_state,
+         const D3D12_CLEAR_VALUE *optimized_clear_value,
+@@ -4698,10 +4726,20 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
+ 
+     if (heap_offset & (object->placed_alignment - 1u))
+     {
+-        WARN("Heap offset %#"PRIx64" not a multiple of resource alignment %#"PRIx64".\n",
+-                heap_offset, object->placed_alignment);
+-        hr = E_INVALIDARG;
+-        goto fail;
++        /* madeira [placed-buffer-offset] (env MADEIRA_VKD3D_PLACED_BUFFER_OFFSET = 0 turns it off).
++         * A placed buffer is only a range of the heap's own buffer, so nothing on our
++         * side needs it to start on a 64 KiB boundary.  Some engines place small
++         * buffers at offsets that are not, and stop when that fails.  A buffer is
++         * accepted when its offset is a multiple of 256 bytes and of the storage
++         * buffer offset alignment; textures keep the strict check. */
++        if (!d3d12_resource_placed_buffer_offset_ok(device, object, heap_offset))
++        {
++            WARN("[placed-buffer-offset] refused: heap offset %#"PRIx64" is not a multiple of resource alignment %#"PRIx64" (%s).\n",
++                    heap_offset, object->placed_alignment,
++                    d3d12_resource_is_texture(object) ? "texture" : "buffer");
++            hr = E_INVALIDARG;
++            goto fail;
++        }
+     }
+ 
+     if (d3d12_resource_is_texture(object))
+@@ -6287,7 +6325,7 @@ static void vkd3d_buffer_view_get_bound_range_ssbo(
+         VkDeviceSize aligned_begin = offset & ~(alignment - 1);
+         VkDeviceSize aligned_end = min((offset + range + alignment - 1) & ~(alignment - 1), resource->desc.Width);
+ 
+-        /* heap_offset is guaranteed to have 64KiB alignment */
++        /* heap_offset is a multiple of the SSBO alignment (64KiB, or what [placed-buffer-offset] accepts) */
+         vk_buffer->buffer = resource->res.vk_buffer;
+         vk_buffer->offset = resource->mem.offset + aligned_begin;
+         vk_buffer->range = aligned_end - aligned_begin;

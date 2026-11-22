@@ -28,6 +28,15 @@
  * decoded by VideoToolbox / AudioToolbox (wg_parser_apple_ios.c).
  * MADEIRA_WG_VIDEO=0 (read by the glue) restores the MP3/WAV-only behaviour.
  *
+ * soft-video: Resident Evil Village (64-bit, MADEIRA_WG_64BIT=1) opens its
+ * intro video the same way, and the source resolver picked ".asf" for it --
+ * its handler, mfasfsrcsnk.dll, is absent, so it reached this core, which had
+ * no ASF demuxer.  ASF (WMV video, WMA audio), MPEG-1/2 program streams and
+ * raw MPEG video are now accepted, with WMV 7/8/9, VC-1 and MPEG-1/2 video
+ * decoded by libavcodec in software (the core's own backend, below; Apple's
+ * VideoToolbox has none of them) and WMA by libavcodec.
+ * MADEIRA_WG_SOFT_VIDEO=0 restores the MP3 / WAV / MP4-only behaviour.
+ *
  * WHAT IS IMPLEMENTED
  * -------------------
  * The subset of wg_parser.c's semantics that quartz_parser.c and
@@ -49,8 +58,8 @@
  *     An unsupported codec is logged with its libavcodec id.
  *
  *   - STREAMS.  An MP3/WAV file exposes its first audio stream.  An MP4
- *     exposes its first video stream and its first audio stream, in container
- *     order.  An MP4 whose video cannot be decoded is refused outright; one
+ *     (and, soft-video, an ASF / MPEG file) exposes its first video stream
+ *     and its first audio stream, in container order.  An MP4 whose video cannot be decoded is refused outright; one
  *     whose audio cannot be decoded exposes the video alone (logged).
  *
  *   - one demuxer, several consumers.  wg_parser.c runs a GStreamer thread
@@ -167,6 +176,8 @@ enum mav_codec_kind
     MAV_CODEC_AAC = 3,
     MAV_CODEC_H264 = 4,
     MAV_CODEC_HEVC = 5,
+    MAV_CODEC_WMA = 6,          /* soft-video: WMA 1/2/Pro/Lossless on libavcodec */
+    MAV_CODEC_SOFT_VIDEO = 7,   /* soft-video: WMV/VC-1/MPEG-1/2 on libavcodec */
 };
 
 struct mav_output
@@ -257,6 +268,11 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
 /* An ISO media file with a recognisable ftyp/moov/mdat scores 100; half of
  * that is the floor for accepting one without a file name. */
 #define MAV_MIN_MOV_PROBE_SCORE (AVPROBE_SCORE_MAX / 2)
+/* soft-video: ASF (a GUID, 100) and raw MPEG video (51) use the MP4 floor.
+ * An MPEG program stream read without a file name probes at 25-26 (pack and
+ * system headers, no extension to add to it); FFmpeg's own low-score line is
+ * AVPROBE_SCORE_RETRY (25), so that is its floor. */
+#define MAV_MIN_MPEGPS_PROBE_SCORE AVPROBE_SCORE_RETRY
 /* Consecutive undecodable packets before the stream is ended rather than
  * spun on. */
 #define MAV_MAX_DECODE_ERRORS 512
@@ -284,6 +300,18 @@ static void mav_configure( int video_allowed, const struct mav_video_backend *vi
     mav_vbackend = video;
     mav_abackend = audio;
     mav_native_pix = native ? native : MAV_PIX_NV12;
+}
+
+/* soft-video: ASF (WMV / WMA), MPEG-1/2 program streams and raw MPEG video,
+ * with WMV 7/8/9, VC-1 and MPEG-1/2 video decoded by libavcodec in software
+ * (VideoToolbox has none of them) and WMA audio by libavcodec.  Resident Evil
+ * Village's intro video comes to this core as ASF (the source resolver picked
+ * ".asf" for it and its handler, mfasfsrcsnk.dll, is absent).
+ * MADEIRA_WG_SOFT_VIDEO=0 restores the MP3 / WAV / MP4-only behaviour. */
+static int mav_soft_video_on(void)
+{
+    const char *v = getenv( "MADEIRA_WG_SOFT_VIDEO" );
+    return !(v && v[0] == '0' && !v[1]);
 }
 
 /* ---- the log: bounded, and deduplicated ---- */
@@ -370,6 +398,8 @@ struct mav_stream
     struct mav_output out;
 
     /* ---- video ---- */
+    const struct mav_video_backend *vb;   /* the backend vdec belongs to */
+    int vordered;               /* vb emits in presentation order: a picture is final at once */
     void *vdec;
     struct mav_video_output vout;
     struct mav_vframe *reorder; /* sorted by pts */
@@ -424,6 +454,8 @@ struct mav_parser
     AVFormatContext *fmt;
     AVPacket *read_pkt;
     int is_mov;
+    int video_container;        /* mov, or (soft-video) asf / mpeg / mpegvideo */
+    int64_t seek_preroll;       /* 100 ns: seek this much earlier, then trim (no keyframe index) */
     int ready;                  /* connected and streams exposed */
     int demux_eof;
     unsigned int read_errors_logged;
@@ -594,7 +626,7 @@ static void mav_reorder_clear( struct mav_stream *s )
     unsigned int i;
 
     for (i = 0; i < s->reorder_count; i++)
-        if (mav_vbackend) mav_vbackend->release( s->reorder[i].handle );
+        if (s->vb) s->vb->release( s->reorder[i].handle );
     s->reorder_count = 0;
 }
 
@@ -603,7 +635,7 @@ static void mav_stream_free( struct mav_stream *s )
     if (!s) return;
     mav_reorder_clear( s );
     free( s->reorder );
-    if (s->vdec && mav_vbackend) mav_vbackend->close( s->vdec );
+    if (s->vdec && s->vb) s->vb->close( s->vdec );
     if (s->adec && mav_abackend) mav_abackend->close( s->adec );
     mav_queue_clear( s );
     free( s->queue );
@@ -634,7 +666,8 @@ static void mav_teardown( struct mav_parser *p )
         av_freep( &p->avio->buffer );
         avio_context_free( &p->avio );
     }
-    p->ready = p->is_mov = p->demux_eof = 0;
+    p->ready = p->is_mov = p->video_container = p->demux_eof = 0;
+    p->seek_preroll = 0;
     p->read_errors_logged = 0;
     p->stop = -1;
 }
@@ -779,6 +812,15 @@ static int mav_classify_audio( enum AVCodecID id, enum mav_codec_kind *kind, uin
     case AV_CODEC_ID_MP1: *layer = 1; break;
     case AV_CODEC_ID_MP2: *layer = 2; break;
     case AV_CODEC_ID_MP3: *layer = 3; break;
+    case AV_CODEC_ID_WMAV1:
+    case AV_CODEC_ID_WMAV2:
+    case AV_CODEC_ID_WMAPRO:
+    case AV_CODEC_ID_WMALOSSLESS:
+        /* soft-video: libavcodec, reported as S16 like MPEG audio */
+        if (!mav_soft_video_on()) return 0;
+        *kind = MAV_CODEC_WMA;
+        *native = MAV_FMT_S16;
+        return 1;
     case AV_CODEC_ID_AAC:
         /* decoded by the platform backend, to float */
         *kind = MAV_CODEC_AAC;
@@ -843,6 +885,12 @@ static struct mav_stream *mav_stream_new( struct mav_parser *p, AVStream *st, en
     /* MP4 timestamps are already on the presentation timeline (edit lists
      * applied by the demuxer); an MP3/WAV stream starts at its own start. */
     s->origin = p->is_mov ? 0 : (st->start_time != AV_NOPTS_VALUE ? st->start_time : 0);
+    /* soft-video: an ASF / MPEG file with video keeps its streams on one
+     * timeline -- the file's start, not each stream's own (an MPEG program
+     * stream starts at its first SCR, and audio and video differ). */
+    if (p->video_container && !p->is_mov)
+        s->origin = p->fmt->start_time != AV_NOPTS_VALUE
+                    ? av_rescale_q( p->fmt->start_time, AV_TIME_BASE_Q, st->time_base ) : 0;
     s->last_dts = s->last_vpts = INT64_MIN;
     s->seek_target = -1;
     if (!(s->pkt = av_packet_alloc()))
@@ -857,6 +905,11 @@ static struct mav_stream *mav_stream_new( struct mav_parser *p, AVStream *st, en
         s->info.duration = av_rescale_q( st->duration, st->time_base, (AVRational){ 1, 10000000 } );
     else if (p->fmt->duration != AV_NOPTS_VALUE && p->fmt->duration > 0)
         s->info.duration = (uint64_t)p->fmt->duration * 10;
+    /* soft-video: raw MPEG video's duration is guessed from a bitrate the
+     * file need not carry (2 s reported as 25 ms); unknown is better than
+     * wrong, since the PE side uses it as the stop position */
+    if (p->video_container && !p->is_mov && p->fmt->duration_estimation_method == AVFMT_DURATION_FROM_BITRATE)
+        s->info.duration = 0;
     return s;
 }
 
@@ -950,23 +1003,261 @@ static int mav_open_audio( struct mav_parser *p, struct mav_stream *s, AVStream 
     return MAV_OK;
 }
 
+
+/***********************************************************************
+ *           soft-video: the core's own libavcodec video backend
+ *
+ * The same contract as the platform backends (wg_parser_backend_ios.h), so
+ * the reorder / emit / conversion path is shared; only `open` differs (the
+ * core opens it from the AVCodecParameters, which carry what WMV / VC-1 need:
+ * the codec tag and the BITMAPINFOHEADER's sequence header).  Pictures come
+ * out of libavcodec in presentation order (s->vordered), and a B-frame
+ * decoder holds the last one back until `drain`.
+ */
+struct mav_soft_dec
+{
+    AVCodecContext *ctx;
+    AVPacket *pkt;
+    AVFrame *frame;
+};
+
+struct mav_soft_pic
+{
+    AVFrame *frame;
+    uint8_t *uv;                /* the interleaved CbCr plane map() builds */
+};
+
+/* Hands every finished picture to `emit`; returns how many there were. */
+static unsigned int mav_soft_emit_ready( struct mav_soft_dec *d, mav_vframe_emit emit, void *ctx )
+{
+    unsigned int n = 0;
+
+    while (avcodec_receive_frame( d->ctx, d->frame ) == 0)
+    {
+        struct mav_soft_pic *pic = calloc( 1, sizeof(*pic) );
+        int64_t pts = d->frame->best_effort_timestamp;
+
+        if (!pic || !(pic->frame = av_frame_alloc()))
+        {
+            free( pic );
+            av_frame_unref( d->frame );
+            continue;
+        }
+        av_frame_move_ref( pic->frame, d->frame );
+        emit( ctx, pic, pts != AV_NOPTS_VALUE ? pts : INT64_MIN,
+              pic->frame->duration > 0 ? pic->frame->duration : INT64_MIN );
+        n++;
+    }
+    return n;
+}
+
+static int mav_soft_decode( void *dec, const uint8_t *data, uint32_t size, int64_t pts, int64_t duration,
+                            int keyframe, mav_vframe_emit emit, void *ctx )
+{
+    struct mav_soft_dec *d = dec;
+    int err;
+
+    /* an empty packet would put the decoder into end-of-stream mode */
+    if (!data || !size) return 0;
+    /* not refcounted: avcodec_send_packet copies what it keeps */
+    d->pkt->data = (uint8_t *)data;
+    d->pkt->size = (int)size;
+    d->pkt->pts = pts != INT64_MIN ? pts : AV_NOPTS_VALUE;
+    d->pkt->dts = AV_NOPTS_VALUE;   /* the core passes presentation times only */
+    d->pkt->duration = duration != INT64_MIN ? duration : 0;
+    d->pkt->flags = keyframe ? AV_PKT_FLAG_KEY : 0;
+    /* EAGAIN: the decoder is full; take its pictures, then send again (a
+     * full decoder that gives none would loop, so that ends the attempt) */
+    while ((err = avcodec_send_packet( d->ctx, d->pkt )) == AVERROR(EAGAIN))
+        if (!mav_soft_emit_ready( d, emit, ctx )) break;
+    d->pkt->data = NULL;
+    d->pkt->size = 0;
+    mav_soft_emit_ready( d, emit, ctx );
+    return err < 0 && err != AVERROR(EAGAIN) && err != AVERROR_EOF ? err : 0;
+}
+
+static void mav_soft_drain( void *dec, mav_vframe_emit emit, void *ctx )
+{
+    struct mav_soft_dec *d = dec;
+
+    if (avcodec_send_packet( d->ctx, NULL ) >= 0) mav_soft_emit_ready( d, emit, ctx );
+}
+
+static int mav_soft_supports( int codec )
+{
+    (void)codec;
+    return 0;   /* opened by the core only (mav_open_soft_video) */
+}
+
+static void *mav_soft_open( int codec, const uint8_t *extradata, uint32_t extradata_size,
+                            uint32_t width, uint32_t height, char *why, size_t why_size )
+{
+    (void)codec; (void)extradata; (void)extradata_size; (void)width; (void)height;
+    snprintf( why, why_size, "opened by the core only" );
+    return NULL;
+}
+
+/* 4:2:0 planar (and 4:2:2, every other chroma row) to the NV12 planes the
+ * core converts from.  Other layouts are refused (the picture is dropped). */
+static int mav_soft_map( void *frame, struct mav_vplanes *planes )
+{
+    struct mav_soft_pic *pic = frame;
+    const AVFrame *f = pic->frame;
+    uint32_t cw = (f->width + 1) / 2, ch = (f->height + 1) / 2, x, y, step;
+
+    if (f->width <= 0 || f->height <= 0 || f->linesize[0] <= 0) return -1;
+    planes->y = f->data[0];
+    planes->y_stride = f->linesize[0];
+    planes->width = f->width;
+    planes->height = f->height;
+    planes->full_range = f->color_range == AVCOL_RANGE_JPEG
+                         || f->format == AV_PIX_FMT_YUVJ420P || f->format == AV_PIX_FMT_YUVJ422P;
+    switch (f->format)
+    {
+    case AV_PIX_FMT_NV12:
+        if (f->linesize[1] <= 0) return -1;
+        planes->uv = f->data[1];
+        planes->uv_stride = f->linesize[1];
+        return 0;
+    case AV_PIX_FMT_YUV420P:
+    case AV_PIX_FMT_YUVJ420P:
+    case AV_PIX_FMT_YUVA420P:
+        step = 1;
+        break;
+    case AV_PIX_FMT_YUV422P:
+    case AV_PIX_FMT_YUVJ422P:
+        step = 2;
+        break;
+    default:
+        return -1;
+    }
+    if (f->linesize[1] <= 0 || f->linesize[2] <= 0) return -1;
+    if (!pic->uv && !(pic->uv = malloc( (size_t)cw * 2 * ch ))) return -1;
+    for (y = 0; y < ch; y++)
+    {
+        const uint8_t *u = f->data[1] + (size_t)f->linesize[1] * y * step;
+        const uint8_t *v = f->data[2] + (size_t)f->linesize[2] * y * step;
+        uint8_t *dst = pic->uv + (size_t)cw * 2 * y;
+        for (x = 0; x < cw; x++)
+        {
+            dst[2 * x] = u[x];
+            dst[2 * x + 1] = v[x];
+        }
+    }
+    planes->uv = pic->uv;
+    planes->uv_stride = cw * 2;
+    return 0;
+}
+
+static void mav_soft_unmap( void *frame )
+{
+    (void)frame;
+}
+
+static void mav_soft_release( void *frame )
+{
+    struct mav_soft_pic *pic = frame;
+
+    if (!pic) return;
+    av_frame_free( &pic->frame );
+    free( pic->uv );
+    free( pic );
+}
+
+static void mav_soft_flush( void *dec )
+{
+    struct mav_soft_dec *d = dec;
+    avcodec_flush_buffers( d->ctx );
+}
+
+static void mav_soft_close( void *dec )
+{
+    struct mav_soft_dec *d = dec;
+
+    if (!d) return;
+    avcodec_free_context( &d->ctx );
+    av_packet_free( &d->pkt );
+    av_frame_free( &d->frame );
+    free( d );
+}
+
+static const struct mav_video_backend mav_soft_video_backend =
+{
+    "libavcodec", mav_soft_supports, mav_soft_open, mav_soft_decode, mav_soft_map, mav_soft_unmap,
+    mav_soft_release, mav_soft_flush, mav_soft_close, mav_soft_drain,
+};
+
+/* Returns MAV_OK, MAV_E_UNSUPPORTED with *why set, or MAV_E_NOMEM. */
+static int mav_open_soft_video( struct mav_stream *s, AVStream *st, char *why, size_t why_size )
+{
+    const AVCodec *codec = avcodec_find_decoder( st->codecpar->codec_id );
+    struct mav_soft_dec *d;
+
+    if (!codec)
+    {
+        snprintf( why, why_size, "no decoder in this build" );
+        return MAV_E_UNSUPPORTED;
+    }
+    if (!(d = calloc( 1, sizeof(*d) ))) return MAV_E_NOMEM;
+    if (!(d->ctx = avcodec_alloc_context3( codec )) || !(d->pkt = av_packet_alloc()) || !(d->frame = av_frame_alloc()))
+    {
+        mav_soft_close( d );
+        return MAV_E_NOMEM;
+    }
+    d->ctx->opaque = MAV_DECODER_MARKER;
+    if (avcodec_parameters_to_context( d->ctx, st->codecpar ) < 0)
+    {
+        mav_soft_close( d );
+        snprintf( why, why_size, "codec parameters rejected" );
+        return MAV_E_UNSUPPORTED;
+    }
+    d->ctx->pkt_timebase = st->time_base;
+    /* slice threads only: no extra pictures held back (frame threads would
+     * delay output by a picture per thread) */
+    d->ctx->thread_type = FF_THREAD_SLICE;
+    d->ctx->thread_count = 0;
+    if (avcodec_open2( d->ctx, codec, NULL ) < 0)
+    {
+        mav_soft_close( d );
+        snprintf( why, why_size, "decoder did not open" );
+        return MAV_E_UNSUPPORTED;
+    }
+    s->vdec = d;
+    s->vb = &mav_soft_video_backend;
+    s->vordered = 1;
+    return MAV_OK;
+}
+
 static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream *st, char *why, size_t why_size )
 {
     const AVCodecParameters *par = st->codecpar;
     AVRational fps = st->avg_frame_rate;
-    int codec;
+    int codec = 0, status;
 
     (void)p;
     switch (par->codec_id)
     {
     case AV_CODEC_ID_H264: codec = MAV_BACKEND_H264; s->info.kind = MAV_CODEC_H264; break;
     case AV_CODEC_ID_HEVC: codec = MAV_BACKEND_HEVC; s->info.kind = MAV_CODEC_HEVC; break;
+    case AV_CODEC_ID_WMV1:
+    case AV_CODEC_ID_WMV2:
+    case AV_CODEC_ID_WMV3:
+    case AV_CODEC_ID_VC1:
+    case AV_CODEC_ID_MPEG1VIDEO:
+    case AV_CODEC_ID_MPEG2VIDEO:
+        if (!mav_soft_video_on())
+        {
+            snprintf( why, why_size, "software video decoding disabled by MADEIRA_WG_SOFT_VIDEO=0" );
+            return MAV_E_UNSUPPORTED;
+        }
+        s->info.kind = MAV_CODEC_SOFT_VIDEO;
+        break;
     default:
         snprintf( why, why_size, "no decoder for it in this port" );
         return MAV_E_UNSUPPORTED;
     }
     snprintf( s->info.codec, sizeof(s->info.codec), "%s", avcodec_get_name( par->codec_id ) );
-    if (!mav_vbackend || !mav_vbackend->supports( codec ))
+    if (codec && (!mav_vbackend || !mav_vbackend->supports( codec )))
     {
         snprintf( why, why_size, "no video decoder backend for it" );
         return MAV_E_UNSUPPORTED;
@@ -976,10 +1267,18 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
         snprintf( why, why_size, "unusable picture size %dx%d", par->width, par->height );
         return MAV_E_UNSUPPORTED;
     }
-    if (!(s->vdec = mav_vbackend->open( codec, par->extradata, par->extradata_size, par->width, par->height,
-                                        why, why_size )))
-        return MAV_E_UNSUPPORTED;
-    snprintf( s->info.backend, sizeof(s->info.backend), "%s", mav_vbackend->name );
+    if (!codec)
+    {
+        if ((status = mav_open_soft_video( s, st, why, why_size ))) return status;
+    }
+    else
+    {
+        if (!(s->vdec = mav_vbackend->open( codec, par->extradata, par->extradata_size, par->width, par->height,
+                                            why, why_size )))
+            return MAV_E_UNSUPPORTED;
+        s->vb = mav_vbackend;
+    }
+    snprintf( s->info.backend, sizeof(s->info.backend), "%s", s->vb->name );
 
     if (fps.num <= 0 || fps.den <= 0) fps = st->r_frame_rate;
     if (fps.num <= 0 || fps.den <= 0 || av_q2d( fps ) > 1000)
@@ -1020,7 +1319,7 @@ static int mav_connect_locked( struct mav_parser *p )
     uint8_t *avio_buf;
     char why[160];
     unsigned int i;
-    int err, status, is_mp3;
+    int err, status, is_mp3, is_soft, min_score;
 
     if (!(avio_buf = av_malloc( MAV_AVIO_BUFFER ))) return MAV_E_NOMEM;
     if (!(p->avio = avio_alloc_context( avio_buf, MAV_AVIO_BUFFER, 0, p, mav_avio_read, NULL, mav_avio_seek )))
@@ -1032,30 +1331,68 @@ static int mav_connect_locked( struct mav_parser *p )
     p->fmt->pb = p->avio;
     p->fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
     p->fmt->probesize = MAV_PROBESIZE;
+    /* soft-video off: only the demuxers this core had before compete, so
+     * detection is exactly as it was (freed with the context) */
+    if (!mav_soft_video_on() && !(p->fmt->format_whitelist = av_strdup( "mp3,wav,mov" ))) return MAV_E_NOMEM;
 
     if ((err = avformat_open_input( &p->fmt, NULL, NULL, NULL )) < 0)
     {
         /* avformat_open_input freed the context (not our AVIO) */
         p->fmt = NULL;
+        /* wg-head (LOG ONLY): log avformat's error and the stream's first 16
+         * bytes (Resident Evil Village's intro video, 0.2.53).  Usually served
+         * from the probe data still in the AVIO buffer; MADEIRA_WG_HEAD_LOG=0 skips it. */
+        if (err != AVERROR_EXIT && err != AVERROR(EIO))
+        {
+            const char *off = getenv( "MADEIRA_WG_HEAD_LOG" );
+            if (!(off && off[0] == '0' && !off[1]) && avio_seek( p->avio, 0, SEEK_SET ) == 0)
+            {
+                unsigned char head[16];
+                char hex[16 * 3 + 1], txt[17];
+                int n = avio_read( p->avio, head, sizeof(head) ), k;
+                for (k = 0; k < n && k < 16; k++)
+                {
+                    snprintf( hex + 3 * k, 4, "%02x ", head[k] );
+                    txt[k] = head[k] >= 0x20 && head[k] < 0x7f ? (char)head[k] : '.';
+                }
+                hex[n > 0 ? 3 * k : 0] = 0; txt[n > 0 ? k : 0] = 0;
+                mav_log( "open failed (avformat error %d): size %llu, first %d bytes: %s|%s|",
+                         err, (unsigned long long)p->file_size, n, hex, txt );
+            }
+        }
         return mav_refuse( p, err == AVERROR_EXIT || err == AVERROR(EIO) ? MAV_E_IO : MAV_E_UNSUPPORTED,
                            "no enabled demuxer recognised the stream" );
     }
     name = p->fmt->iformat->name;
     is_mp3 = !strcmp( name, "mp3" );
     p->is_mov = !strcmp( name, MAV_MOV_NAME );
-    if (!is_mp3 && strcmp( name, "wav" ) && !(p->is_mov && mav_video_allowed))
+    /* soft-video containers (see mav_soft_video_on) */
+    is_soft = !strcmp( name, "asf" ) || !strcmp( name, "mpeg" ) || !strcmp( name, "mpegvideo" );
+    p->video_container = p->is_mov || is_soft;
+    /* An MPEG program stream / raw MPEG video has no keyframe index: its
+     * seek lands on any picture, and the decoder then skips to the next
+     * I-picture, up to a GOP (DVD: 18 pictures) late.  Seek a second early
+     * instead; the seek target trims what comes before. */
+    p->seek_preroll = !strcmp( name, "mpeg" ) || !strcmp( name, "mpegvideo" ) ? 10000000 : 0;
+    if (is_soft && !(mav_video_allowed && mav_soft_video_on()))
+        return mav_refuse( p, MAV_E_UNSUPPORTED, mav_video_allowed ? "container disabled by MADEIRA_WG_SOFT_VIDEO=0"
+                                                                   : "container disabled by MADEIRA_WG_VIDEO=0" );
+    if (!is_mp3 && strcmp( name, "wav" ) && !(p->is_mov && mav_video_allowed) && !is_soft)
         return mav_refuse( p, MAV_E_UNSUPPORTED, p->is_mov ? "container disabled by MADEIRA_WG_VIDEO=0"
                                                             : "container not in the allowlist" );
-    if (p->fmt->probe_score < (p->is_mov ? MAV_MIN_MOV_PROBE_SCORE : MAV_MIN_PROBE_SCORE))
+    /* the video containers need a confident probe: their demuxers are not
+     * as strict as mp3 / wav about what they accept */
+    min_score = !strcmp( name, "mpeg" ) ? MAV_MIN_MPEGPS_PROBE_SCORE
+                : p->video_container ? MAV_MIN_MOV_PROBE_SCORE : MAV_MIN_PROBE_SCORE;
+    if (p->fmt->probe_score < min_score)
     {
-        snprintf( why, sizeof(why), "probe score %d below %d", p->fmt->probe_score,
-                  p->is_mov ? MAV_MIN_MOV_PROBE_SCORE : MAV_MIN_PROBE_SCORE );
+        snprintf( why, sizeof(why), "probe score %d below %d", p->fmt->probe_score, min_score );
         return mav_refuse( p, MAV_E_UNSUPPORTED, why );
     }
     /* The mp3 demuxer only ever carries MPEG audio and an MP4 only compressed
      * streams: a compressed-output parser is refused before the stream
      * analysis reads anything more. */
-    if (p->output_compressed && (is_mp3 || p->is_mov))
+    if (p->output_compressed && (is_mp3 || p->video_container))
         return mav_refuse( p, MAV_E_UNSUPPORTED,
                            "compressed output requested and no decoder filter exists; "
                            "the decoding splitter is tried next" );
@@ -1065,7 +1402,7 @@ static int mav_connect_locked( struct mav_parser *p )
     for (i = 0; i < p->fmt->nb_streams; i++)
     {
         enum AVMediaType type = p->fmt->streams[i]->codecpar->codec_type;
-        if (type != AVMEDIA_TYPE_AUDIO && !(p->is_mov && type == AVMEDIA_TYPE_VIDEO))
+        if (type != AVMEDIA_TYPE_AUDIO && !(p->video_container && type == AVMEDIA_TYPE_VIDEO))
             p->fmt->streams[i]->discard = AVDISCARD_ALL;
     }
 
@@ -1080,12 +1417,12 @@ static int mav_connect_locked( struct mav_parser *p )
         if (s->disposition & AV_DISPOSITION_ATTACHED_PIC) continue;
         if (s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
         {
-            if (!p->is_mov) return mav_refuse( p, MAV_E_UNSUPPORTED, "the file has a video stream" );
+            if (!p->video_container) return mav_refuse( p, MAV_E_UNSUPPORTED, "the file has a video stream" );
             if (!vst) vst = s;
         }
         if (s->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && !ast) ast = s;
     }
-    if (!vst && !ast) return mav_refuse( p, MAV_E_UNSUPPORTED, p->is_mov ? "no audio or video stream" : "no audio stream" );
+    if (!vst && !ast) return mav_refuse( p, MAV_E_UNSUPPORTED, p->video_container ? "no audio or video stream" : "no audio stream" );
 
     if (!(p->read_pkt = av_packet_alloc())) return MAV_E_NOMEM;
 
@@ -1721,7 +2058,7 @@ static void mav_vframe_emit_cb( void *ctx, void *handle, int64_t pts, int64_t du
         struct mav_vframe *grown = realloc( s->reorder, cap * sizeof(*grown) );
         if (!grown)
         {
-            mav_vbackend->release( handle );
+            s->vb->release( handle );
             return;
         }
         s->reorder = grown;
@@ -1881,28 +2218,28 @@ static int mav_video_emit( struct mav_parser *p, struct mav_stream *s, struct ma
     {
         if (pts + dur <= s->seek_target)
         {
-            mav_vbackend->release( f->handle );
+            s->vb->release( f->handle );
             return 0;
         }
         s->seek_target = -1;
     }
     if (p->stop >= 0 && pts >= p->stop)
     {
-        mav_vbackend->release( f->handle );
+        s->vb->release( f->handle );
         s->eos = 1;
         return 0;
     }
     size = mav_video_layout( s->vout.fmt, s->vout.width, s->vout.height < 0 ? -s->vout.height : s->vout.height, &l );
     if (!size || size > UINT32_MAX || !mav_reserve( s, size ))
     {
-        mav_vbackend->release( f->handle );
+        s->vb->release( f->handle );
         s->eos = 1;
         mav_log( "stream %u: cannot hold a %zu-byte picture; ending the stream", s->number, size );
         return 0;
     }
-    if (mav_vbackend->map( f->handle, &planes ))
+    if (s->vb->map( f->handle, &planes ))
     {
-        mav_vbackend->release( f->handle );
+        s->vb->release( f->handle );
         if (s->errors_logged < 3)
         {
             s->errors_logged++;
@@ -1912,8 +2249,8 @@ static int mav_video_emit( struct mav_parser *p, struct mav_stream *s, struct ma
         return 0;
     }
     mav_convert_picture( s, &planes, s->buf, &l );
-    mav_vbackend->unmap( f->handle );
-    mav_vbackend->release( f->handle );
+    s->vb->unmap( f->handle );
+    s->vb->release( f->handle );
 
     s->next_pts = pts + dur;
     s->cur.pts = pts > 0 ? (uint64_t)pts : 0;
@@ -1937,7 +2274,7 @@ static int mav_video_next( struct mav_parser *p, struct mav_stream *s )
         /* A picture is final once no later packet can present before it:
          * later packets decode at or after the last decode time, and a
          * picture never presents before it decodes. */
-        if (s->reorder_count && (s->draining || s->reorder_count > MAV_REORDER_MAX
+        if (s->reorder_count && (s->draining || s->vordered || s->reorder_count > MAV_REORDER_MAX
                                  || (s->last_dts != INT64_MIN && s->reorder[0].pts <= s->last_dts)))
         {
             struct mav_vframe f = s->reorder[0];
@@ -1953,10 +2290,12 @@ static int mav_video_next( struct mav_parser *p, struct mav_stream *s )
         }
         if (!mav_next_packet( p, s, s->pkt ))
         {
+            /* soft-video: the pictures a B-frame decoder still holds */
+            if (s->vb->drain) s->vb->drain( s->vdec, mav_vframe_emit_cb, s );
             s->draining = 1;
             continue;
         }
-        err = mav_vbackend->decode( s->vdec, s->pkt->data, s->pkt->size,
+        err = s->vb->decode( s->vdec, s->pkt->data, s->pkt->size,
                                     s->pkt->pts != AV_NOPTS_VALUE ? s->pkt->pts : INT64_MIN,
                                     s->pkt->duration > 0 ? s->pkt->duration : INT64_MIN,
                                     !!(s->pkt->flags & AV_PKT_FLAG_KEY), mav_vframe_emit_cb, s );
@@ -2073,7 +2412,8 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
         /* Seek on the video stream, so the demuxer lands on a keyframe. */
         for (i = 0; i < p->stream_count; i++)
             if (!ref || p->streams[i]->type == MAV_STREAM_VIDEO) ref = p->streams[i];
-        ts = av_rescale_q( target, (AVRational){ 1, 10000000 }, ref->time_base ) + ref->origin;
+        ts = av_rescale_q( target > p->seek_preroll ? target - p->seek_preroll : 0,
+                           (AVRational){ 1, 10000000 }, ref->time_base ) + ref->origin;
 
         /* A failed read (a NULL push) latches in the AVIOContext; a seek is
          * the PE side's way to start over, so it must not stay failed. */
@@ -2098,7 +2438,7 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
                 if (c->vdec)
                 {
                     mav_reorder_clear( c );
-                    mav_vbackend->flush( c->vdec );
+                    c->vb->flush( c->vdec );
                 }
                 swr_free( &c->swr );
                 if (c->pkt_pending) av_packet_unref( c->pkt );

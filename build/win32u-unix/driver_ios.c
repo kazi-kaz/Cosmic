@@ -38,6 +38,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(driver);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
 
+static const struct ratio no_dpi;
 static const struct user_driver_funcs lazy_load_driver;
 static struct user_driver_funcs null_user_driver;
 static WCHAR driver_load_error[80];
@@ -69,6 +70,7 @@ extern UINT winios_OpenGLInit( UINT version, const struct opengl_funcs *opengl_f
 extern UINT madeira_ios_VulkanInit( UINT version, void *vulkan_handle,
                                const struct vulkan_driver_funcs **driver_funcs );
 
+extern struct client_surface *madeira_ios_client_surface_create( HWND hwnd, int format, BOOL raw );
 static struct user_driver_funcs winios_user_driver;
 
 /* Direct mode (no virtual desktop) has no compositor to draw the Windows
@@ -163,7 +165,7 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
      * of the NtUserCallHwndParam inline — we get the raw NTSTATUS and skip
      * a dispatch layer that can fail for its own reasons. */
     ios_foreground_if_none( "an injected mouse event" );   /* MADEIRA_INPUT_FOREGROUND */
-    NTSTATUS st = send_hardware_message( NULL, 0, &input, 0 );
+    NTSTATUS st = server_send_hardware_message( NULL, 0, &input, 0 );
     {
         static unsigned cnt;
         if (cnt++ < 40)
@@ -247,7 +249,7 @@ void winios_drv_post_key(unsigned short vk, unsigned int flags)
     input.ki.dwExtraInfo = 0;
 
     ios_foreground_if_none( "an injected key" );
-    st = send_hardware_message( NULL, 0, &input, 0 );
+    st = server_send_hardware_message( NULL, 0, &input, 0 );
     {
         /* ml647: COUNT EVENTS, and never let a cap masquerade as absence. The
          * old "first 40 lines" cap was exhausted by arrow keys early in the
@@ -273,7 +275,7 @@ static void winios_text_key(unsigned short vk, unsigned int flags)
     input.ki.wVk = vk;
     input.ki.wScan = NtUserMapVirtualKeyEx( vk, MAPVK_VK_TO_VSC_EX, NtUserGetKeyboardLayout(0) ) & 0xff;
     input.ki.dwFlags = flags;
-    send_hardware_message( NULL, 0, &input, 0 );
+    server_send_hardware_message( NULL, 0, &input, 0 );
 }
 
 /* A complete pasted character is emitted on the Wine event-pump thread. */
@@ -309,9 +311,9 @@ void winios_drv_post_text(unsigned int scalar, unsigned short vk, int shift)
     {
         input.ki.wScan = units[i];
         input.ki.dwFlags = KEYEVENTF_UNICODE;
-        send_hardware_message( NULL, 0, &input, 0 );
+        server_send_hardware_message( NULL, 0, &input, 0 );
         input.ki.dwFlags |= KEYEVENTF_KEYUP;
-        send_hardware_message( NULL, 0, &input, 0 );
+        server_send_hardware_message( NULL, 0, &input, 0 );
     }
 }
 
@@ -764,7 +766,7 @@ static void winios_note_dialog_thread( HWND hwnd, const RECT *visible )
     if (visible->right - visible->left < 32 || visible->bottom - visible->top < 32) return;
     if (!(get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE)) return;
     if (get_window_thread( hwnd, NULL ) != GetCurrentThreadId()) return;
-    screen = get_virtual_screen_rect( 0, MDT_DEFAULT );
+    screen = get_virtual_screen_rect( no_dpi, MDT_DEFAULT );
     if (visible->left <= screen.left && visible->top <= screen.top &&
         visible->right >= screen.right && visible->bottom >= screen.bottom) return;
     winios_thread_shows_dialog = 1;
@@ -773,6 +775,110 @@ static void winios_note_dialog_thread( HWND hwnd, const RECT *visible )
                  "the game; its message waits now wake every 16 ms to take taps and keys "
                  "(MADEIRA_GAME_INPUT_WAKE=0 disables)\n", (int)GetCurrentThreadId(), hwnd,
                  (int)visible->left, (int)visible->top, (int)visible->right, (int)visible->bottom );
+}
+
+/* Game mode, a dialog left off the screen. amakanoPE_kor.exe (a KiriKiri
+ * visual novel, report 2026-11-16_09-10-02, build v0.13.1) opens a two-button
+ * screen-mode dialog before its game window and centres it itself on an empty
+ * rectangle: the 255x86 box went to {-127,-43,128,43}, its default button
+ * wholly off the 1920x1080 desktop, the rest a 31x10 pt speck in a corner of
+ * the phone. It was also shown without activation, so nothing was foreground
+ * and the Return key of the keyboard button went nowhere (as for the D3D12
+ * menu under MADEIRA_INPUT_FOREGROUND). The game sat in the modal loop until
+ * it was quit. A window manager keeps such a box reachable, so: a visible,
+ * captioned top-level window smaller than the virtual screen that is shown
+ * or moved partly outside it is moved to the centre of the screen by its own
+ * thread at its next message poll (the modal loop polls every 16 ms,
+ * winios_note_dialog_thread) and made foreground unless it already is, which
+ * gives its default button the keyboard. At most twice per window, so a
+ * program that puts it back is not fought. Windows already on the screen,
+ * child windows and full-screen game windows are never touched.
+ * MADEIRA_DIALOG_ONSCREEN=0 turns this off. Logs [dlg-onscreen] (16 lines). */
+static __thread HWND ios_offscreen_dialog;
+static __thread HWND ios_offscreen_last;
+static __thread unsigned int ios_offscreen_moves;
+
+static int ios_dialog_onscreen_enabled(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        const char *env = getenv( "MADEIRA_DIALOG_ONSCREEN" );  /* Default on: a game-mode dialog shown partly off the screen is moved to its centre and made foreground; 0 = off. */
+        on = !(env && env[0] == '0' && !env[1]);
+    }
+    return on;
+}
+
+/* 1, with the new top-left corner in *x / *y, when the window {left,top,right,bottom}
+ * is partly outside the screen and smaller than it both ways: centred on the
+ * screen. 0 for a window on the screen, a tiny one, or one as large as the screen. */
+static int ios_dialog_onscreen_target( int left, int top, int right, int bottom, int screen_left, int screen_top,
+                                       int screen_right, int screen_bottom, int *x, int *y )
+{
+    int w = right - left, h = bottom - top;
+    int sw = screen_right - screen_left, sh = screen_bottom - screen_top;
+
+    if (w < 32 || h < 32 || w >= sw || h >= sh) return 0;
+    if (left >= screen_left && top >= screen_top && right <= screen_right && bottom <= screen_bottom) return 0;
+    /* Wholly off the screen: left alone, a program may park a window there on purpose. */
+    if (right <= screen_left || bottom <= screen_top || left >= screen_right || top >= screen_bottom) return 0;
+    *x = screen_left + (sw - w) / 2;
+    *y = screen_top + (sh - h) / 2;
+    return 1;
+}
+
+/* From winios_drv_window_pos_changed (game mode, a visible top-level window
+ * with a surface), on any thread: only the window's own thread acts on it. */
+static void ios_note_offscreen_dialog( HWND hwnd, const RECT *window )
+{
+    DWORD style;
+    RECT screen;
+    int x, y;
+
+    if (!ios_dialog_onscreen_enabled()) return;
+    style = get_window_long( hwnd, GWL_STYLE );
+    if ((style & (WS_CHILD | WS_MINIMIZE)) || !(style & WS_VISIBLE) || (style & WS_CAPTION) != WS_CAPTION) return;
+    if (get_window_thread( hwnd, NULL ) != GetCurrentThreadId()) return;
+    if (hwnd == ios_offscreen_last && ios_offscreen_moves >= 2) return;
+    screen = get_virtual_screen_rect( no_dpi, MDT_DEFAULT );
+    if (!ios_dialog_onscreen_target( window->left, window->top, window->right, window->bottom,
+                                     screen.left, screen.top, screen.right, screen.bottom, &x, &y )) return;
+    ios_offscreen_dialog = hwnd;
+}
+
+/* From winios_drv_process_events, outside any SetWindowPos of the window. */
+static void ios_apply_offscreen_dialog(void)
+{
+    static unsigned int said;
+    HWND hwnd = ios_offscreen_dialog, fg;
+    RECT rect, screen;
+    BOOL moved, front = FALSE;
+    int x, y;
+
+    ios_offscreen_dialog = 0;
+    if (!is_window( hwnd ) || !is_window_visible( hwnd )) return;
+    if (!get_window_rect( hwnd, &rect, get_thread_dpi() )) return;
+    screen = get_virtual_screen_rect( no_dpi, MDT_DEFAULT );
+    if (!ios_dialog_onscreen_target( rect.left, rect.top, rect.right, rect.bottom,
+                                     screen.left, screen.top, screen.right, screen.bottom, &x, &y )) return;
+    if (hwnd != ios_offscreen_last)
+    {
+        ios_offscreen_last = hwnd;
+        ios_offscreen_moves = 0;
+    }
+    if (ios_offscreen_moves >= 2) return;
+    ios_offscreen_moves++;
+    moved = NtUserSetWindowPos( hwnd, 0, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
+    if ((fg = NtUserGetForegroundWindow()) != hwnd && !(get_window_long( hwnd, GWL_STYLE ) & WS_DISABLED))
+        front = set_foreground_window( hwnd, FALSE, TRUE );
+    if (__atomic_fetch_add( &said, 1, __ATOMIC_RELAXED ) < 16)
+        dprintf( 2, "[dlg-onscreen] hwnd=%p was at {%d,%d,%d,%d}, partly off the screen {%d,%d,%d,%d}: "
+                 "moved to %d,%d ok=%d (move %u of 2); foreground was %p, made it foreground ok=%d "
+                 "(MADEIRA_DIALOG_ONSCREEN=0 disables)\n", hwnd,
+                 (int)rect.left, (int)rect.top, (int)rect.right, (int)rect.bottom,
+                 (int)screen.left, (int)screen.top, (int)screen.right, (int)screen.bottom,
+                 x, y, (int)moved, ios_offscreen_moves, fg, (int)front );
 }
 
 /* Activation of a full-screen window when it is shown. iOS has no window
@@ -820,7 +926,7 @@ static void ios_note_fullscreen_show( HWND hwnd, UINT swp_flags, const RECT *vis
     if (get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_NOACTIVATE) return;
     if (NtUserGetAncestor( hwnd, GA_PARENT ) != get_desktop_window()) return;
     if (get_window_thread( hwnd, NULL ) != GetCurrentThreadId()) return;
-    screen = get_virtual_screen_rect( 0, MDT_DEFAULT );
+    screen = get_virtual_screen_rect( no_dpi, MDT_DEFAULT );
     if (visible->left > screen.left || visible->top > screen.top ||
         visible->right < screen.right || visible->bottom < screen.bottom) return;
     ios_show_foreground = hwnd;
@@ -967,7 +1073,7 @@ static void ios_tiny_window_poll(void)
         if (!ios_tiny_fix_enabled() || st->tries >= 2) continue;
 
         st->tries++;
-        screen = get_virtual_screen_rect( 0, MDT_DEFAULT );
+        screen = get_virtual_screen_rect( no_dpi, MDT_DEFAULT );
         if (screen.right - screen.left < 320 || screen.bottom - screen.top < 200)
         {
             dprintf( 2, "[tiny-win] hwnd=%p: the virtual screen %dx%d is too small to size it to\n", hwnd,
@@ -995,6 +1101,7 @@ static void ios_tiny_window_poll(void)
 static BOOL winios_drv_process_events( DWORD mask )
 {
     if (ios_show_foreground) ios_apply_fullscreen_foreground();
+    if (ios_offscreen_dialog) ios_apply_offscreen_dialog();
     ios_foreground_if_none( "a message poll" );
     ios_tiny_window_poll();
     return winios_pProcessEvents ? winios_pProcessEvents( mask ) : FALSE;
@@ -1113,9 +1220,10 @@ static void winios_surface_destroy( struct window_surface *surface )
 
 static const struct window_surface_funcs winios_surface_funcs =
 {
-    winios_surface_set_clip,
-    winios_surface_flush,
-    winios_surface_destroy
+    .size = sizeof(struct window_surface),
+    .set_clip = winios_surface_set_clip,
+    .flush = winios_surface_flush,
+    .destroy = winios_surface_destroy,
 };
 
 /* iOS-Madeira: [swap-win] WHAT HAPPENS TO A SWAPCHAIN'S WINDOW. A title
@@ -1233,7 +1341,7 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
      * surface copied to the app at every flush (about 8 MB at 1080p). */
     if (!winios_desktop_mode())
     {
-        RECT screen = get_virtual_screen_rect( 0, MDT_DEFAULT );
+        RECT screen = get_virtual_screen_rect( no_dpi, MDT_DEFAULT );
         if (surface_rect->right - surface_rect->left >= screen.right - screen.left &&
             surface_rect->bottom - surface_rect->top >= screen.bottom - screen.top)
             return FALSE;
@@ -1251,8 +1359,7 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
     info->bmiHeader.biSizeImage   = surface_rect->right * surface_rect->bottom * 4;
     info->bmiHeader.biCompression = BI_RGB;
 
-    *window_surface = window_surface_create( sizeof(struct window_surface), &winios_surface_funcs,
-                                             hwnd, surface_rect, info, 0 );
+    *window_surface = window_surface_create( &winios_surface_funcs, hwnd, surface_rect, info, 0 );
     if (previous) window_surface_release( previous );
 
     {
@@ -1284,7 +1391,7 @@ static BOOL winios_drv_screen_rects( HWND hwnd, const struct window_rects *new_r
 {
     struct window_rects screen, parent;
     HWND ancestor = NtUserGetAncestor( hwnd, GA_PARENT );
-    UINT raw_dpi = 0;
+    struct ratio raw_dpi = {0}, dpi;
     int x, y;
 
     if (new_rects && (!ancestor || ancestor == get_desktop_window()))
@@ -1292,7 +1399,8 @@ static BOOL winios_drv_screen_rects( HWND hwnd, const struct window_rects *new_r
         *rects = *new_rects;
         return TRUE;
     }
-    if (!get_win_monitor_dpi( hwnd, &raw_dpi ) || !raw_dpi ||
+    dpi = get_win_monitor_dpi( hwnd, &raw_dpi );
+    if (!dpi.num || !raw_dpi.num ||
         !get_window_rects( hwnd, COORDS_SCREEN, &screen, raw_dpi )) return FALSE;
     if (!new_rects)
     {
@@ -1450,7 +1558,11 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
                              (int)v->left, (int)v->top, (int)v->right, (int)v->bottom );
             }
         }
-        if (visible && surface && winios_game_windows()) winios_note_dialog_thread( hwnd, v );
+        if (visible && surface && winios_game_windows())
+        {
+            winios_note_dialog_thread( hwnd, v );
+            ios_note_offscreen_dialog( hwnd, &new_rects->window );
+        }
     }
     /* ml505: z-order and geometry churn. If the three same-rect siblings are
      * being reordered, the topmost changes and the surface shows whichever
@@ -1738,14 +1850,14 @@ static INT nulldrv_GetDeviceCaps( PHYSDEV dev, INT cap )
     case DESKTOPHORZRES:
         if (NtGdiGetDeviceCaps( dev->hdc, TECHNOLOGY ) == DT_RASDISPLAY)
         {
-            RECT rect = get_virtual_screen_rect( 0, MDT_DEFAULT );
+            RECT rect = get_virtual_screen_rect( no_dpi, MDT_DEFAULT );
             return rect.right - rect.left;
         }
         return NtGdiGetDeviceCaps( dev->hdc, HORZRES );
     case DESKTOPVERTRES:
         if (NtGdiGetDeviceCaps( dev->hdc, TECHNOLOGY ) == DT_RASDISPLAY)
         {
-            RECT rect = get_virtual_screen_rect( 0, MDT_DEFAULT );
+            RECT rect = get_virtual_screen_rect( no_dpi, MDT_DEFAULT );
             return rect.bottom - rect.top;
         }
         return NtGdiGetDeviceCaps( dev->hdc, VERTRES );
@@ -1772,10 +1884,9 @@ static INT nulldrv_GetDeviceCaps( PHYSDEV dev, INT cap )
     }
 }
 
-static BOOL nulldrv_GetDeviceGammaRamp( PHYSDEV dev, void *ramp )
+static UINT nulldrv_GetDeviceGammaRamp( PHYSDEV dev, void *ramp )
 {
-    RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
-    return FALSE;
+    return -1; /* use default implementation */
 }
 
 static DWORD nulldrv_GetFontData( PHYSDEV dev, DWORD table, DWORD offset, LPVOID buffer, DWORD length )
@@ -1971,10 +2082,9 @@ static void nulldrv_SetDeviceClipping( PHYSDEV dev, HRGN rgn )
 {
 }
 
-static BOOL nulldrv_SetDeviceGammaRamp( PHYSDEV dev, void *ramp )
+static UINT nulldrv_SetDeviceGammaRamp( PHYSDEV dev, void *ramp )
 {
-    RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
-    return FALSE;
+    return -1; /* use default implementation */
 }
 
 static COLORREF nulldrv_SetPixel( PHYSDEV dev, INT x, INT y, COLORREF color )
@@ -2156,9 +2266,9 @@ static void nulldrv_ReleaseKbdTables( const KBDTABLES *tables )
 {
 }
 
-static UINT nulldrv_ImeProcessKey( HIMC himc, UINT wparam, UINT lparam, const BYTE *state )
+static UINT nulldrv_ImeToAsciiEx( UINT vkey, UINT vsc, const BYTE *state, void *update )
 {
-    return 0;
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 static void nulldrv_NotifyIMEStatus( HWND hwnd, UINT status )
@@ -2298,7 +2408,7 @@ static BOOL nodrv_CreateWindow( HWND hwnd )
     HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
 
     /* HWND_MESSAGE windows don't need a graphics driver */
-    if (!parent || parent == UlongToHandle( NtUserGetThreadInfo()->msg_window )) return TRUE;
+    if (!parent || parent == get_user_thread_info()->msg_window) return TRUE;
     if (warned++) return FALSE;
 
     ERR_(winediag)( "Application tried to create a window, but no driver could be loaded.\n" );
@@ -2342,7 +2452,7 @@ static BOOL nulldrv_ScrollDC( HDC hdc, INT dx, INT dy, HRGN update )
                         hdc, rect.left - dx, rect.top - dy, SRCCOPY, 0, 0 );
 }
 
-static void nulldrv_SetCapture( HWND hwnd, UINT flags )
+static void nulldrv_SetCapture( HWND hwnd, UINT flags, HWND previous )
 {
 }
 
@@ -2410,6 +2520,36 @@ static BOOL nulldrv_GetWindowStyleMasks( HWND hwnd, UINT style, UINT ex_style, U
 static BOOL nulldrv_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, RECT *rect, HWND *foreground )
 {
     return FALSE;
+}
+
+static void nulldrv_surface_destroy( struct client_surface *client )
+{
+}
+
+static void nulldrv_surface_detach( struct client_surface *client )
+{
+}
+
+static void nulldrv_surface_update( struct client_surface *client )
+{
+}
+
+static void nulldrv_surface_present( struct client_surface *client, HDC hdc )
+{
+}
+
+static const struct client_surface_funcs nulldrv_surface_funcs =
+{
+    .size = sizeof(struct client_surface),
+    .destroy = nulldrv_surface_destroy,
+    .detach = nulldrv_surface_detach,
+    .update = nulldrv_surface_update,
+    .present = nulldrv_surface_present,
+};
+
+static struct client_surface *nulldrv_CreateClientSurface( HWND hwnd, int pixel_format, BOOL raw )
+{
+    return client_surface_create( &nulldrv_surface_funcs, hwnd, pixel_format, raw );
 }
 
 static BOOL nulldrv_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface )
@@ -2615,6 +2755,9 @@ static void load_display_driver(void)
         /* Vulkan surfaces on Metal (vulkan_ios.c). win32u calls it only after a
          * Vulkan library was loaded, which needs MADEIRA_VULKAN_LIBRARY. */
         winios_user_driver.pVulkanInit = madeira_ios_VulkanInit;
+        /* Wine 11.22: client surfaces come from the user driver; ours can
+         * carry the window's Metal layer for Vulkan (vulkan_surface_ios.c). */
+        winios_user_driver.pCreateClientSurface = madeira_ios_client_surface_create;
         __wine_set_user_driver( &winios_user_driver, WINE_GDI_DRIVER_VERSION );
 #else
         __wine_set_user_driver( &null_user_driver, WINE_GDI_DRIVER_VERSION );
@@ -2696,17 +2839,17 @@ static const KBDTABLES *loaderdrv_KbdLayerDescriptor( HKL layout )
 
 static void loaderdrv_ReleaseKbdTables( const KBDTABLES *tables )
 {
-    return load_driver()->pReleaseKbdTables( tables );
+    load_driver()->pReleaseKbdTables( tables );
 }
 
-static UINT loaderdrv_ImeProcessKey( HIMC himc, UINT wparam, UINT lparam, const BYTE *state )
+static UINT loaderdrv_ImeToAsciiEx( UINT vkey, UINT vsc,const BYTE *state, void *update )
 {
-    return load_driver()->pImeProcessKey( himc, wparam, lparam, state );
+    return load_driver()->pImeToAsciiEx( vkey, vsc, state, update );
 }
 
 static void loaderdrv_NotifyIMEStatus( HWND hwnd, UINT status )
 {
-    return load_driver()->pNotifyIMEStatus( hwnd, status );
+    load_driver()->pNotifyIMEStatus( hwnd, status );
 }
 
 static BOOL loaderdrv_SetIMECompositionRect( HWND hwnd, RECT rect )
@@ -2856,7 +2999,7 @@ static const struct user_driver_funcs lazy_load_driver =
     loaderdrv_VkKeyScanEx,
     loaderdrv_KbdLayerDescriptor,
     loaderdrv_ReleaseKbdTables,
-    loaderdrv_ImeProcessKey,
+    loaderdrv_ImeToAsciiEx,
     loaderdrv_NotifyIMEStatus,
     loaderdrv_SetIMECompositionRect,
     /* cursor/icon functions */
@@ -2904,6 +3047,7 @@ static const struct user_driver_funcs lazy_load_driver =
     nulldrv_WindowPosChanging,
     nulldrv_GetWindowStyleMasks,
     nulldrv_GetWindowStateUpdates,
+    nulldrv_CreateClientSurface,
     nulldrv_CreateWindowSurface,
     nulldrv_MoveWindowBits,
     nulldrv_WindowPosChanged,
@@ -2960,7 +3104,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(VkKeyScanEx);
     SET_USER_FUNC(KbdLayerDescriptor);
     SET_USER_FUNC(ReleaseKbdTables);
-    SET_USER_FUNC(ImeProcessKey);
+    SET_USER_FUNC(ImeToAsciiEx);
     SET_USER_FUNC(NotifyIMEStatus);
     SET_USER_FUNC(SetIMECompositionRect);
     SET_USER_FUNC(DestroyCursorIcon);
@@ -3003,6 +3147,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(WindowPosChanging);
     SET_USER_FUNC(GetWindowStyleMasks);
     SET_USER_FUNC(GetWindowStateUpdates);
+    SET_USER_FUNC(CreateClientSurface);
     SET_USER_FUNC(CreateWindowSurface);
     SET_USER_FUNC(MoveWindowBits);
     SET_USER_FUNC(WindowPosChanged);
@@ -3040,35 +3185,6 @@ INT WINAPI NtGdiExtEscape( HDC hdc, WCHAR *driver, int driver_id, INT escape, IN
     ret = physdev->funcs->pExtEscape( physdev, escape, input_size, input, output_size, output );
     release_dc_ptr( dc );
     return ret;
-}
-
-static void nulldrv_surface_destroy( struct client_surface *client )
-{
-}
-
-static void nulldrv_surface_detach( struct client_surface *client )
-{
-}
-
-static void nulldrv_surface_update( struct client_surface *client )
-{
-}
-
-static void nulldrv_surface_present( struct client_surface *client, HDC hdc )
-{
-}
-
-static const struct client_surface_funcs nulldrv_surface_funcs =
-{
-    .destroy = nulldrv_surface_destroy,
-    .detach = nulldrv_surface_detach,
-    .update = nulldrv_surface_update,
-    .present = nulldrv_surface_present,
-};
-
-struct client_surface *nulldrv_client_surface_create( HWND hwnd )
-{
-    return client_surface_create( sizeof(struct client_surface), &nulldrv_surface_funcs, hwnd );
 }
 
 /* ml1920: same-task controller snapshots supplied by the app. */
@@ -3130,7 +3246,7 @@ static HWND ios_main_window( DWORD pid )
 {
     HWND *list, best = 0;
     LONGLONG best_area = 0;
-    UINT dpi = get_thread_dpi();
+    struct ratio dpi = get_thread_dpi();
     int i;
 
     if (!(list = list_window_children( 0 ))) return 0;

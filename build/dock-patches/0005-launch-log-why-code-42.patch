@@ -1,0 +1,76 @@
+--- a/src/launch.c
++++ b/src/launch.c
+@@ -33,15 +33,31 @@
+ }
+ 
+ struct saved_value { HKEY key; const wchar_t *name; DWORD previous, written; bool existed, changed; };
++/* [dock-code42-log] Why publish() refused, for the log only: what (1 the
++ * query failed, 2 an existing value is not a 4-byte DWORD, 3 the write
++ * failed), the registry status, and the existing value's type and size.
++ */
++static struct { int32_t what, status, type, size; } publish_fail;
+ static bool publish(struct saved_value *v, DWORD value)
+ {
+     DWORD type = 0, size = sizeof(DWORD);
+     LSTATUS status = RegQueryValueExW(v->key, v->name, NULL, &type, (BYTE *)&v->previous, &size);
+     v->existed = status == ERROR_SUCCESS;
+     if ((v->existed && (type != REG_DWORD || size != sizeof(DWORD))) ||
+-        (!v->existed && status != ERROR_FILE_NOT_FOUND)) return false;
++        (!v->existed && status != ERROR_FILE_NOT_FOUND)) {
++        publish_fail.what = v->existed ? 2 : 1;
++        publish_fail.status = (int32_t)status;
++        publish_fail.type = (int32_t)type;
++        publish_fail.size = (int32_t)size;
++        return false;
++    }
+     v->written = value;
+-    if (RegSetValueExW(v->key, v->name, 0, REG_DWORD, (BYTE *)&value, sizeof(value)) != ERROR_SUCCESS) return false;
++    status = RegSetValueExW(v->key, v->name, 0, REG_DWORD, (BYTE *)&value, sizeof(value));
++    if (status != ERROR_SUCCESS) {
++        publish_fail.what = 3;
++        publish_fail.status = (int32_t)status;
++        return false;
++    }
+     v->changed = true;
+     return true;
+ }
+@@ -303,15 +319,33 @@
+             result = 42;
+         }
+     }
+-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam\\ActiveProcess", 0,
+-                     KEY_QUERY_VALUE | KEY_SET_VALUE, &active) != ERROR_SUCCESS ||
+-        RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Valve\\Steam", 0,
+-                     KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_32KEY, &machine) != ERROR_SUCCESS) goto done;
++    /* [dock-code42-log] Both opens are tried so the log names which key (if
++     * either) is missing; the result is the same as before: either one
++     * failing ends the launch with 42.
++     */
++    LSTATUS active_status = RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam\\ActiveProcess", 0,
++                                          KEY_QUERY_VALUE | KEY_SET_VALUE, &active);
++    LSTATUS machine_status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Valve\\Steam", 0,
++                                           KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_32KEY, &machine);
++    if (active_status != ERROR_SUCCESS || machine_status != ERROR_SUCCESS) {
++        o->event("launch-discovery-open-active", (int32_t)active_status);
++        o->event("launch-discovery-open-machine", (int32_t)machine_status);
++        goto done;
++    }
+     values[0] = (struct saved_value){.key=active, .name=L"pid"};
+     values[1] = (struct saved_value){.key=active, .name=L"ActiveUser"};
+     values[2] = (struct saved_value){.key=machine, .name=L"SteamPID"};
+-    if (!publish(&values[0], GetCurrentProcessId()) ||
+-        !publish(&values[1], (DWORD)steamid) || !publish(&values[2], GetCurrentProcessId())) goto done;
++    int publish_step = !publish(&values[0], GetCurrentProcessId()) ? 1 :
++                       !publish(&values[1], (DWORD)steamid) ? 2 :
++                       !publish(&values[2], GetCurrentProcessId()) ? 3 : 0;
++    if (publish_step) {
++        o->event("launch-discovery-publish-step", publish_step);
++        o->event("launch-discovery-publish-what", publish_fail.what);
++        o->event("launch-discovery-publish-status", publish_fail.status);
++        o->event("launch-discovery-publish-type", publish_fail.type);
++        o->event("launch-discovery-publish-size", publish_fail.size);
++        goto done;
++    }
+     o->event("launch-client-discovery-published", 1);
+     SetConsoleCtrlHandler(on_control, TRUE);
+     uint64_t gameid = appid;

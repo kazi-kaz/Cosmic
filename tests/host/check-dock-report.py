@@ -52,6 +52,13 @@ let entitled = parse("[steam-host] ml1830 session-requested-app-entitled=1\n[ste
 assert(entitled.fields["session-requested-app-entitled"] == "1" && entitled.fields["session-subscription-count"] == "12")
 assert(parse("[steam-host] ml1830 session-authenticated-online=1\n[steam-host] ml1830 probe-result=34\n").failure!.contains("did not confirm this game's license in time"))
 assert(parse("[steam-host] ml1830 probe-result=34\n").failure!.contains("did not finish signing in"))
+// The host crashed (dock patch 0004): the code is shown as hex, and a crash after sign-in names the license.
+let crashed = parse("[steam-host] ml1830 host-crash-report=1\n[steam-host] ml1830 session-authenticated-online=1\n[steam-host] ml1830 host-unhandled-exception=-1073741819\n[steam-host] ml1830 probe-result=60\n")
+assert(crashed.result == 60 && crashed.fields["host-crash-report"] == "1")
+assert(crashed.failure!.contains("crashed after signing in") && crashed.failure!.contains("0xc0000005"))
+let crashedEarly = parse("[steam-host] ml1830 host-unhandled-exception=-1073741819\n[steam-host] ml1830 probe-result=60\n").failure!
+assert(crashedEarly.contains("crashed (exception 0xc0000005) before the game started") && !crashedEarly.contains("license"))
+assert(parse("[steam-host] ml1830 probe-result=60\n").failure!.contains("crashed before the game started"))
 // Offline start (ml2016): Valve's client decides; each refusal has its own words.
 let offline = parse("[steam-host] ml2016 session-offline-abi=1\n[steam-host] ml2016 session-offline-requested=1\n[steam-host] ml2016 session-offline-can=2\n[steam-host] ml1830 probe-result=50\n")
 assert(offline.fields["session-offline-can"] == "2" && offline.failure!.contains("nothing saved") && offline.failure!.contains("once while online"))
@@ -61,9 +68,14 @@ assert(parse("[steam-host] ml2016 session-offline-logon-state=3\n[steam-host] ml
 assert(parse("[steam-host] ml2016 session-offline-ready=1\n").fields["session-offline-ready"] == "1")
 let rejected = "[steam-host] ml1830 account=synthetic\n[steam-host] ml1830 token=synthetic\n[steam-host] ml1830 probe-result=2147483648\n[steam-host] ml1830 probe-result=secret\n[steam-host] ml1830 client-sha256=invalid\n[steam-host] unknown probe-result=0\n[steam-host] ml1830 probe-result=0 secret\n"
 assert(parse(rejected).fields.isEmpty)
-assert(parse(String(repeating: "x", count: 32769)).fields.isEmpty)
+// The cap (1 MiB): a report of exactly reportCap bytes is read, one byte more is not.
+let capLine = "[steam-host] ml1830 probe-result=0\n"
+let capPad = String(repeating: "x", count: MadeiraDock.reportCap - capLine.utf8.count - 1) + "\n"
+assert(MadeiraDock.reportCap == 1 << 20 && (capPad + capLine).utf8.count == MadeiraDock.reportCap)
+assert(parse(capPad + capLine).result == 0)
+assert(parse("x" + capPad + capLine).fields.isEmpty)
 assert(MadeiraDock.parseReport(Data([0xff])).fields.isEmpty)
-print("PASS: Dock report completion, CRLF, fingerprints, adapter version, callback IDs, failure reasons (including the session wait and the license wait) and private/malformed field rejection")
+print("PASS: Dock report completion, the 1 MiB cap, CRLF, fingerprints, adapter version, callback IDs, failure reasons (including the session wait and the license wait) and private/malformed field rejection")
 '''
 with tempfile.TemporaryDirectory(prefix='madeira-dock-report-') as directory:
     source = Path(directory) / 'main.swift'; binary = Path(directory) / 'check'

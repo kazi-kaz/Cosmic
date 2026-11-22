@@ -42,14 +42,42 @@ extension GameRecommendations {
     /// The recommendation for a game in drive_c: a program, or a Steam game's install folder.
     /// A game Madeira has no list for gets the standard one; a path that names nothing, none.
     static func recommendation(windowsPath: String, steamAppID: Int?) -> GameRecommendation? {
-        if let rec = match(windowsPath: windowsPath, steamAppID: steamAppID, fileExists: driveFileExists) { return rec }
-        let parts = windowsPath.replacingOccurrences(of: "/", with: "\\").split(separator: "\\")
-        return parts.count > 1 ? standard : nil
+        var base = match(windowsPath: windowsPath, steamAppID: steamAppID, fileExists: driveFileExists)
+        if base == nil {
+            let parts = windowsPath.replacingOccurrences(of: "/", with: "\\").split(separator: "\\")
+            // [engine-presets] a game with no list of its own gets its engine's preset when its folder shows one, else the standard list.
+            if parts.count > 1 { base = enginePreset(windowsPath: windowsPath, fileExists: driveFileExists) ?? standard }
+        }
+        // (remote-recs) A newer list for the game from the signed file the Get Help server serves (RemoteRecs.swift).
+        return RemoteRecs.replacement(base: base, steamAppID: steamAppID) ?? base
+    }
+
+    /// [engine-presets] The preset of the engine a game's folder shows, for a game with no list of its own that
+    /// Madeira has not written anything for yet (no mark) or wrote an engine preset for before. A game that has a
+    /// mark of its own (the standard list, a game's list, "" for a config of its own) never gets one, so a game
+    /// already in the library keeps what it runs with. Off switches (madeira.cfg): env.MADEIRA_ENGINE_PRESETS = 0
+    /// for all, env.MADEIRA_ENGINE_PRESET_<UNITY|MONO|DOTNET|JVM> = 0 for one; with a switch off the preset is not
+    /// offered and a config still exactly as an engine preset wrote it goes back to the standard list.
+    static func enginePreset(windowsPath: String, fileExists: (String) -> Bool) -> GameRecommendation? {
+        let mark = marks[windowsPath.lowercased()]
+        guard mark == nil || mark?.hasPrefix("engine-") == true else { return nil }
+        guard MadeiraConfig.flag("MADEIRA_ENGINE_PRESETS") else { return nil }
+        // Written before: the same engine, without looking at the folder again.
+        let written = mark.flatMap { m in Engine(rawValue: String(m.dropFirst("engine-".count).prefix { $0 != "#" })) }
+        guard let engine = written ?? self.engine(windowsPath: windowsPath, fileExists: fileExists),
+              MadeiraConfig.flag(engine.switchName) else { return nil }
+        return enginePreset(engine)
     }
 
     /// A library entry's recommendation: the Desktop's is the standard list.
     static func recommendation(for entry: LibraryEntry) -> GameRecommendation? {
-        entry.desktop == true ? standard : recommendation(windowsPath: entry.windowsPath, steamAppID: entry.steamAppID)
+        if entry.desktop == true { return standard }
+        let rec = recommendation(windowsPath: entry.windowsPath, steamAppID: entry.steamAppID)
+        // (shared-configs) A game with only the standard list takes the settings other players
+        // said work for it, once approved (SharedConfigs.swift). A list of its own always wins.
+        if rec?.id == standard.id || rec?.id.hasPrefix("engine-") == true,
+           let shared = SharedConfigs.recommendation(title: entry.title) { return shared }
+        return rec
     }
 
     /// A library entry's recommendation, when one is due (see above). `new`: the entry
@@ -90,6 +118,15 @@ extension GameRecommendations {
         return rec
     }
 
+    /// (shared-configs) Undo on "Madeira used shared settings": the standard list goes back, and
+    /// the game keeps it as its own, so the shared list is never written again by itself
+    /// (Reset to Recommended still brings it back).
+    static func undoShared(windowsPath: String, title: String) {
+        GameProfile(windowsPath: windowsPath).text = standard.fileText
+        setMark("", windowsPath)
+        LogStore.shared.log("[shared-configs] \(title): undo, standard list back; the shared list is one Reset to Recommended away")
+    }
+
     /// The line under Reset to Recommended. `desktop`: the Desktop entry's page.
     static func note(_ rec: GameRecommendation?, desktop: Bool = false) -> String {
         guard let rec else { return "Madeira has no recommended settings for this game yet; resetting empties this game's config." }
@@ -100,6 +137,10 @@ extension GameRecommendations {
                 + "\(lines) config line\(lines == 1 ? "" : "s") (the emulator's code-patch report off, without which many games "
                 + "close at start). Resetting replaces "
                 + (desktop ? "the Desktop's" : "this game's") + " config with them."
+        }
+        if SharedConfigs.isShared(rec) {
+            return "Settings other players said work for \(rec.title), approved by Madeira: \(lines) config lines. "
+                + "Resetting replaces this game's config with them."
         }
         let summary = rec.switchSummary
         let switches = summary.isEmpty ? "" : "; " + summary
@@ -117,19 +158,51 @@ extension GameRecommendations {
 
     // MARK: -
 
+    /// (recommended-after-get-help) What Madeira or Get Help added to the end of a config: from the first
+    /// "# Get Help added these" or "# Added by Madeira:" comment to the end, kept exactly as it is (a line the
+    /// player typed below that comment included). `base` is what stands above it, trailing blank lines dropped.
+    /// A config with no such comment is all `base`, unchanged.
+    static func splitAdded(_ text: String) -> (base: String, tail: String) {
+        var rows = text.components(separatedBy: "\n")
+        if rows.last == "" { rows.removeLast() }
+        guard let i = rows.firstIndex(where: { isAddedHeader($0) }) else { return (text, "") }
+        var head = Array(rows[..<i])
+        while let last = head.last, last.trimmingCharacters(in: .whitespaces).isEmpty { head.removeLast() }
+        return (head.isEmpty ? "" : head.joined(separator: "\n") + "\n", rows[i...].joined(separator: "\n") + "\n")
+    }
+
+    private static func isAddedHeader(_ row: String) -> Bool {
+        let r = row.trimmingCharacters(in: .whitespaces)
+        return r.hasPrefix("# Get Help added these") || r.hasPrefix("# Added by Madeira:")
+    }
+
     private static func due(_ windowsPath: String, _ found: GameRecommendation?, ownLines: String?,
                             title: String) -> (rec: GameRecommendation, kind: Write)? {
         let mark = marks[windowsPath.lowercased()]
-        guard mark != "", let rec = found else { return nil }
+        guard let rec = found else { return nil }
         let text = GameProfile(windowsPath: windowsPath).text
+        // (recommended-after-get-help) Get Help's and Madeira's own additions at the end do not count as the
+        // player's config: the list is compared and written without them, and they are put back after it.
+        let (base, tail) = splitAdded(text)
+        if mark == "" {
+            // Kept its own config at first sight. When all that is in it is Madeira's or Get Help's additions,
+            // nothing of the player's is there to protect: the list is written as on first sight. A config the
+            // player emptied has no additions and stays empty.
+            guard base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !tail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  (ownLines ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            LogStore.shared.log("[recommended] \(title): only Get Help's or Madeira's own lines in the config; \(rec.id) v\(rec.version) goes in above them")
+            return (rec: rec, kind: .firstSight)
+        }
         if let mark {
-            // Written before: a newer list replaces it while the file is exactly what was written.
-            guard mark != stamp(rec), mark.hasSuffix("#" + fileHash(text)) else { return nil }
+            // Written before: a newer list replaces it while the file above the additions is exactly what was written.
+            guard mark != stamp(rec), mark.hasSuffix("#" + fileHash(base)) else { return nil }
             // The standard list gives way to the game's own list as on first sight, switches too.
-            let fromStandard = mark.hasPrefix(standard.id + "#") && rec.id != standard.id
+            let fromStandard = (mark.hasPrefix(standard.id + "#") || mark.hasPrefix("engine-"))
+                && rec.id != standard.id && !rec.id.hasPrefix("engine-")
             return (rec: rec, kind: fromStandard ? Write.firstSight : Write.updated)
         }
-        if !(text + (ownLines ?? "")).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !(base + (ownLines ?? "")).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             // First seen with a config of its own: it stays, now and later.
             setMark("", windowsPath)
             LogStore.shared.log("[recommended] \(title): keeps its own config; \(rec.id) v\(rec.version) is one Reset to Recommended away")
@@ -144,8 +217,11 @@ extension GameRecommendations {
     private static func put(_ rec: GameRecommendation, to windowsPath: String, _ kind: Write, title: String,
                             switches: Bool = true) -> Bool {
         let file = GameProfile(windowsPath: windowsPath)
-        file.text = rec.fileText
-        guard file.text == rec.fileText else {
+        // (recommended-after-get-help) Madeira's and Get Help's additions stay, below the list. A reset writes the list alone.
+        let tail = kind == .reset ? "" : splitAdded(file.text).tail
+        let want = tail.isEmpty ? rec.fileText : rec.fileText + "\n" + tail
+        file.text = want
+        guard file.text == want else {
             LogStore.shared.log("[recommended] \(title): could not write \(rec.id)", level: .error)
             return false
         }
@@ -157,6 +233,8 @@ extension GameRecommendations {
         }
         setMark(stamp(rec), windowsPath)
         LogStore.shared.log("[recommended] \(title): \(rec.id) v\(rec.version) written (\(kind.rawValue))")
+        // (shared-configs) Written by itself: ask Keep or Undo (SharedConfigsNotice).
+        if kind != .reset, SharedConfigs.isShared(rec) { SharedConfigs.applied(title: title, windowsPath: windowsPath) }
         return true
     }
 

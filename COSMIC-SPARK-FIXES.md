@@ -1,9 +1,11 @@
 # Spark fixes in Cosmic
 
 [Spark](https://github.com/kazi-kaz/Spark) is an Iridium fork whose runtime is
-Madeira as of 2026-09-30 (`40d5e748`) plus its own fixes. Cosmic is built on
+Madeira as of 2026-09-30 (`40d5e748`) plus its own fixes. Cosmic was built on
 Madeira `fbad430` (2026-11-12), six weeks newer, so each Spark change was
-merged against the newer code rather than copied. Spark's changes to Madeira's
+merged against the newer code rather than copied. Cosmic now merges Madeira
+Nightly 0.2.72 (Wine 11.22, FEX 2611, DXMT 0.80; see
+[COSMIC-UPSTREAM.md](COSMIC-UPSTREAM.md)), and every fix below carried over. Spark's changes to Madeira's
 code are GPL-3.0-or-later with the Madeira Converter Exception, like Cosmic.
 
 None of these is device-tested in Cosmic yet. Each keeps a switch.
@@ -13,12 +15,12 @@ None of these is device-tested in Cosmic yet. Each keeps a switch.
 | Fix | Files | Switch |
 |---|---|---|
 | Truncated 32-bit stack pointers: a fault below 4 GB in translated code is retried with the high bits of the guest RSP (MX Bikes) | `build/ntdll-unix/signal_arm64_ios.c` | `MADEIRA_TRUNC_PTR=0` |
-| Trampoline slots of exited threads are reused once the 1024 fresh slots run out, instead of sharing slot 0 with a live thread (long Ren'Py sessions) | `signal_arm64_ios.c`, `virtual_ios.c` | `MADEIRA_TRAMP_REUSE=0` |
+| Trampoline slots of exited threads are reused once the fresh slots run out (1020 since 0.2.72, which keeps the page's last 64 bytes for its RtlPcToFileHeader trampoline), instead of sharing slot 0 with a live thread (long Ren'Py sessions) | `signal_arm64_ios.c`, `virtual_ios.c` | `MADEIRA_TRAMP_REUSE=0` |
 | A child process's ntdll copy is kept out of the JIT-pool freelist (stray writes into a reused range; MX Bikes, Pseudoregalia) | `virtual_ios.c` | `MADEIRA_POOL_REUSE_NTDLL=1` reuses |
 | Base-relocation directories that are not relocation tables are ignored, and every DIR64 write is bounded to the image (Ren'Py launcher, `pythonw.exe`) | `virtual_ios.c` | - |
 | `cmd.exe /c ver` is refused: CPython runs it on every `platform.win32_ver()` and each child cost ~50 MB of pool (Ren'Py 8) | `build/ntdll-unix/process_ios.c` | `MADEIRA_CMD_VER=1` starts it |
 | FEX's `0xFExxxxxx` UNIMPLEMENTED() exit codes are named in the log | `process_ios.c` | - |
-| `pipe()` + `fcntl()` instead of `pipe2()` on iOS | `process_ios.c`, `server_ios.c` | - |
+| `pipe()` + `fcntl()` instead of `pipe2()` on iOS in the two process-start paths (`server_pipe` uses upstream's iOS 27 guard, see below) | `process_ios.c` | - |
 | Click activation: `GA_ROOT` answering 0 falls back to walking `GA_PARENT`; a press on a window that cannot come to the front is delivered and the window made active in its thread (Ren'Py taps) | `build/win32u-unix/message_ios.c` | `MADEIRA_EAT_UNFOCUSED_CLICK=1` restores Wine's discard |
 | The foreground lock does not block a foreground change in the single-game session | `build/wineserver/queue_ios.c` | - |
 | The detached desktop's cursor clip follows `MADEIRA_SCREEN_W/H` instead of a fixed 1024x768, and the size is published from `EnumDisplayMonitors` and the virtual-screen metrics | `build/wineserver/window_ios.c`, `build/win32u-unix/sysparams_ios.c` | - |
@@ -31,6 +33,7 @@ Host checks from Spark: `tests/host/check-trunc-ptr.py`, `check-ntdll-quarantine
 
 ## Already in Madeira (upstream fixed it its own way)
 
+- `server_pipe()`'s `pipe2()` (0.2.72): called only under `__builtin_available(iOS 27.0, *)`, with `pipe()` + `FD_CLOEXEC` on iOS 26. Cosmic takes this instead of Spark's pipe()-always change there.
 - Thread-registry reuse (#397, `MADEIRA_THREAD_REUSE`), with a FEX lock-stamp check.
 - WoW64 thread TLS and native ARM64 entry points through the JIT-pool copy (Madeira's Wine fork).
 - Stale FEX alias entries across processes: each x64 process now has its own alias table (`MADEIRA_ALIAS_PER_PROCESS`).

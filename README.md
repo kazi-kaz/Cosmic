@@ -1,8 +1,9 @@
 # Cosmic
 
 Cosmic is a performance-tuned build of [Madeira](https://github.com/willfaust/madeira)
-for running Windows PC games on a non-jailbroken iPhone with JIT. It keeps
-Madeira's whole runtime (Wine 11 for ARM64EC, FEX-Emu, DXMT for Direct3D 9-11 on
+for running Windows PC games on a non-jailbroken iPhone with JIT, currently on
+Madeira Nightly 0.2.72 ([COSMIC-UPSTREAM.md](COSMIC-UPSTREAM.md)). It keeps
+Madeira's whole runtime (Wine 11.22 for ARM64EC, FEX-Emu, DXMT for Direct3D 9-11 on
 Metal, madeira-d3d12 for Direct3D 12 on Metal, plus the MoltenVK, KosmicKrisp,
 DXVK and VKD3D-Proton stages) and changes how the hot paths are compiled.
 
@@ -244,6 +245,7 @@ proposing anything to it.
 - **spitefulowl** ([@spitefulowl](https://github.com/spitefulowl)): Wine and FEX runtime fixes, DXMT texture and memory fixes, audio, the swap tier, and library launch options
 - **meshoklv** ([@meshoklv](https://github.com/meshoklv)): controller fixes for games that ship their own XInput or need focus, touch taps that stay off the mouse, and a crash-guard fix
 - **TheHadesc** ([@TheHadesc](https://github.com/TheHadesc)): Madeira Dock starts for games whose Steam launch entries do not start at zero, and a touch gamepad that survives the in-game keyboard
+- **camhawk** ([@insertfloppy](https://github.com/insertfloppy)): Get Help, an in-app helper that suggests fixes for a player's game problems, Battle.net and mod support, the nightly test builds, and fixes that got many games running
 
 Madeira is built on [Wine](https://www.winehq.org/), [FEX-Emu](https://github.com/FEX-Emu/FEX),
 [DXMT](https://github.com/3Shain/DXMT) by Feifan He (3Shain) with the Direct3D 9
