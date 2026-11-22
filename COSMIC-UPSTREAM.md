@@ -25,6 +25,12 @@ upstream import (not on `main`), then merge it into `main`.
   (`app/Madeira/{arm64ec,aarch64}-windows`) are the files in the 0.2.72 IPA. The file list there is
   what `build/windows-runtime/targets.py` builds, and it includes the new aarch64
   `d3dcompiler_47.dll` prebuilt.
+- Removed after the import: 19 ARM64EC DLLs (`crtdll`, `d3d8`, `d3dim`, `d3dim700`, `dmband`,
+  `dmcompos`, `dmime`, `dmscript`, `dmstyle`, `dplay`, `dplayx`, `dpwsockx`, `msvcp70`, `msvcp71`,
+  `msvcr70`, `msvcr71`, `msvcrt20`, `msvcrt40`, `olepro32`). Since Wine 11.20 their Makefiles enable
+  only i386 (as on 64-bit Windows), so the windows stage cannot build them. The IPA still had stale
+  Wine 11.4 copies from Nov 5. This is the same fix as Madeira's own `f3d5146` on
+  `codex/wine-11.20-runtime`. Their 32-bit versions still ship in `i386-windows`.
 - Left out: the release's uncommitted edits that only work on the developer's WSL machine. These are
   `tools/build/build-wine.sh` and the moltenvk stage calling scripts in `~/madeira-shims`, `gcc` as
   the host compiler for GnuTLS and LuaJIT, and the dropped `Madeira.debug.dylib` IPA check.
