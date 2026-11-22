@@ -138,6 +138,16 @@ with tempfile.TemporaryDirectory(prefix='madeira-app-link-') as folder:
     typedef struct { PEB *Peb; struct { HANDLE UniqueProcess, UniqueThread; } ClientId; } TEB;
     static _Thread_local TEB *active_teb;
     static TEB *NtCurrentTeb(void) { return active_teb; }
+    /* Wine 11.22 (0.2.72): with no TEB the PEB and process id come from the unix
+     * lib's globals, and the thread id from the host thread's data (thread_data_key,
+     * one per pthread), which is the guest thread's own because each guest thread
+     * runs on its own host thread. */
+    #define ULongToHandle(x) ((HANDLE)(uintptr_t)(x))
+    static PEB fallback_peb, *peb = &fallback_peb;
+    static unsigned int pid = 4242;
+    struct thread_data { unsigned int tid; };
+    static _Thread_local struct thread_data host_data;
+    static struct thread_data *get_thread_data(void) { return &host_data; }
     ''' + '\n'.join(function(env_source, head) for head in heads) + '''
     static void *check_guest(void *arg)
     {
@@ -145,13 +155,18 @@ with tempfile.TemporaryDirectory(prefix='madeira-app-link-') as folder:
         PEB peb = {0};
         TEB first = { &peb, { (void *)(id * 10), (void *)(id * 10 + 1) } };
         TEB second = { &peb, { (void *)(id * 100), (void *)(id * 100 + 1) } };
+        host_data.tid = (unsigned int)(id * 1000 + 7);
         for (int i = 0; i < 10000; ++i)
         {
             active_teb = i & 1 ? &first : &second;
             assert(RtlGetCurrentPeb() == active_teb->Peb);
             assert(PsGetCurrentProcessId() == active_teb->ClientId.UniqueProcess);
-            assert(PsGetCurrentThreadId() == active_teb->ClientId.UniqueThread);
+            assert(PsGetCurrentThreadId() == ULongToHandle(host_data.tid));
         }
+        active_teb = 0;
+        assert(RtlGetCurrentPeb() == &fallback_peb);
+        assert(PsGetCurrentProcessId() == ULongToHandle(4242));
+        assert(PsGetCurrentThreadId() == ULongToHandle(id * 1000 + 7));
         return 0;
     }
     int main(void)
@@ -163,7 +178,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-app-link-') as folder:
         assert(!pthread_join(second, 0));
     }
     ''')
-        print('PASS Wine 11 exports follow guest TEB changes across threads; ALPC/input build inputs are present')
+        print('PASS Wine 11 exports: PEB and process id follow the guest TEB, thread id the host thread, globals without a TEB; ALPC/input build inputs are present')
 
     if 'static NSString *madeira_vulkan_library(' in bridge:
         vulkan = '''
