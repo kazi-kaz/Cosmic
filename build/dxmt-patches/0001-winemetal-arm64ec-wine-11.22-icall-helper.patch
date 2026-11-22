@@ -1,0 +1,21 @@
+diff --git a/src/winemetal/meson.build b/src/winemetal/meson.build
+index 82c6771..5c146ec 100644
+--- a/src/winemetal/meson.build
++++ b/src/winemetal/meson.build
+@@ -7,6 +7,16 @@ winemetal_src = [
+ 
+ winemetal_ld_args = []
+ 
++# Wine 11.22 moved the ARM64EC CHPE metadata out of libwinecrt0 (winebuild now
++# writes it for Wine's own modules), so this mingw-linked DLL takes
++# __chpe_metadata from the toolchain's chpe.o, which also defines
++# __icall_helper_arm64ec -- as does libwinecrt0's arm64ec.o, loaded first for
++# the same helper. The two are the same routine (Wine copied mingw-w64's), so
++# let the linker keep one (lld keeps chpe.o's) instead of failing on it.
++if is_arm64ec
++  winemetal_ld_args += [ '-Wl,--allow-multiple-definition' ]
++endif
++
+ winemetal_link_depends = []
+ 
+ wine_build_path = get_option('wine_build_path')
