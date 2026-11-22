@@ -177,6 +177,11 @@ class SteamSession {
         try await licenseListBox.value(timeout: timeout)
     }
 
+    /// Packages a free-license request just granted join the license list at once.
+    func addGrantedLicenses(_ packageIDs: [UInt32]) {
+        licenseListBox.add(packageIDs)
+    }
+
     /// Reset the idle disconnect timer — called after each activity
     private func resetIdleTimer() {
         idleDisconnectTask?.cancel()

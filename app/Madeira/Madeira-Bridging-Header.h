@@ -21,6 +21,13 @@
 // Wine file-based logging (server_ios.c)
 void wine_log_set_file(const char *path);
 
+// (game-child-exit) The child-process table as text (build/ntdll-unix/process_ios.c): one line per
+// process, tab-separated; LogTrail.gameChildEnd reads the ended ones for the [game-end] line.
+int madeira_child_report(char *buf, int len);
+// respawn-guard (process_ios.c): the image a self-respawn loop was stopped for this session, "" when none.
+int madeira_respawn_guard_image(char *buf, int len);
+void madeira_respawn_guard_reset(void);
+
 // UI log callback (wine_log_ios.c) — forwards C logs to Swift UI
 typedef void (*wine_ui_log_callback_t)(const char *message);
 void wine_set_ui_log_callback(wine_ui_log_callback_t cb);

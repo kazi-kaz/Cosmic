@@ -533,3 +533,23 @@ void madeira_pad_output_set_active(int active)
         if (g_hid && g_slot[0]) triggers_off(g_slot[0]);
     });
 }
+
+/* The game session is over (a normal exit, or a crash that came back to the
+ * library): nothing is left to send rumble, so every motor stops, the trigger
+ * effects go off, and the stored XInput motor speeds go to 0 so the next session
+ * does not start with the dead game's last value. Without this a crashed game
+ * leaves its last XInputSetState/DualSense report playing (the 30 s plain
+ * players are restarted every 25 s while the level stays up). Off: env.MADEIRA_PAD_OUTPUT_END = 0. */
+void madeira_pad_output_session_end(void)
+{
+    on_main(^{
+        int i;
+        for (i = 0; i < PAD_SLOTS; i++) {
+            winios_gamepad_set_vibration(i, 0, 0);
+            [g_rumble[i] stop];
+        }
+        if (g_slot[0] && g_triggers_set) triggers_off(g_slot[0]);
+        g_triggers_set = 0;
+        fprintf(stderr, "[hidpad-out] ml2108 session end: rumble and trigger effects stopped\n");
+    });
+}

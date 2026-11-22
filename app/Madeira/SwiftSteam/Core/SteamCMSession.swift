@@ -29,9 +29,14 @@ protocol SteamCMSession: AnyObject {
     func callServiceMethodWithResult(method: SteamServiceMethod, body: Data, timeout: TimeInterval) async throws -> (eresult: Int32, body: Data)
     /// Sends a unified-service notification (a method without a response).
     func sendServiceNotification(method: SteamServiceMethod, body: Data) async throws
+    /// (steam-free-game) Packages a free-license request just granted join the license list at once.
+    func addGrantedLicenses(_ packageIDs: [UInt32])
 }
 
 extension SteamCMSession {
+    /// A session without a license list (host-check fakes) keeps nothing.
+    func addGrantedLicenses(_ packageIDs: [UInt32]) {}
+
     /// A connection that reports no EResults answers OK.
     func callServiceMethodWithResult(method: SteamServiceMethod, body: Data, timeout: TimeInterval) async throws -> (eresult: Int32, body: Data) {
         (1, try await callServiceMethod(method: method, body: body, timeout: timeout))

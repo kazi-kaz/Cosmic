@@ -55,6 +55,12 @@ semaphore_t ios_srv_wake_sem = 0;
  * missed (the 1 ms tick stays as the floor). MADEIRA_SRV_WAKE_COALESCE=0
  * restores one signal per request. */
 static volatile int ios_srv_wake_pending;
+/* [init-hang] (LOG ONLY): read by ntdll's init_first_thread watchdog (server_ios.c
+ * ios_init_hang_watch) to say whether this loop still runs and, if not, where its
+ * thread is. Set by main_loop; nothing here changes what the loop does. */
+mach_port_t ios_srv_mach_thread;
+volatile unsigned long long ios_srv_pass_total, ios_srv_pass_ns;
+unsigned long long ios_srv_stack_lo, ios_srv_stack_hi;
 static int ios_srv_wake_coalesce = -1;
 
 /* A switch the app exports as env.NAME: madeira.cfg's line (with the game's own lines,
@@ -397,27 +403,11 @@ static void fd_destroy( struct object *obj );
 
 static const struct object_ops fd_ops =
 {
-    sizeof(struct fd),        /* size */
-    &no_type,                 /* type */
-    fd_dump,                  /* dump */
-    NULL,                     /* add_queue */
-    NULL,                     /* remove_queue */
-    NULL,                     /* signaled */
-    NULL,                     /* satisfied */
-    no_signal,                /* signal */
-    no_get_fd,                /* get_fd */
-    fd_get_sync,              /* get_sync */
-    default_map_access,       /* map_access */
-    default_get_sd,           /* get_sd */
-    default_set_sd,           /* set_sd */
-    no_get_full_name,         /* get_full_name */
-    no_lookup_name,           /* lookup_name */
-    no_link_name,             /* link_name */
-    NULL,                     /* unlink_name */
-    no_open_file,             /* open_file */
-    no_kernel_obj_list,       /* get_kernel_obj_list */
-    no_close_handle,          /* close_handle */
-    fd_destroy                /* destroy */
+    .size     = sizeof(struct fd),
+    .type     = &no_type,
+    .dump     = fd_dump,
+    .get_sync = fd_get_sync,
+    .destroy  = fd_destroy,
 };
 
 /* device object */
@@ -439,27 +429,10 @@ static void device_destroy( struct object *obj );
 
 static const struct object_ops device_ops =
 {
-    sizeof(struct device),    /* size */
-    &no_type,                 /* type */
-    device_dump,              /* dump */
-    no_add_queue,             /* add_queue */
-    NULL,                     /* remove_queue */
-    NULL,                     /* signaled */
-    NULL,                     /* satisfied */
-    no_signal,                /* signal */
-    no_get_fd,                /* get_fd */
-    default_get_sync,         /* get_sync */
-    default_map_access,       /* map_access */
-    default_get_sd,           /* get_sd */
-    default_set_sd,           /* set_sd */
-    no_get_full_name,         /* get_full_name */
-    no_lookup_name,           /* lookup_name */
-    no_link_name,             /* link_name */
-    NULL,                     /* unlink_name */
-    no_open_file,             /* open_file */
-    no_kernel_obj_list,       /* get_kernel_obj_list */
-    no_close_handle,          /* close_handle */
-    device_destroy            /* destroy */
+    .size    = sizeof(struct device),
+    .type    = &no_type,
+    .dump    = device_dump,
+    .destroy = device_destroy,
 };
 
 /* inode object */
@@ -480,27 +453,10 @@ static void inode_destroy( struct object *obj );
 
 static const struct object_ops inode_ops =
 {
-    sizeof(struct inode),     /* size */
-    &no_type,                 /* type */
-    inode_dump,               /* dump */
-    no_add_queue,             /* add_queue */
-    NULL,                     /* remove_queue */
-    NULL,                     /* signaled */
-    NULL,                     /* satisfied */
-    no_signal,                /* signal */
-    no_get_fd,                /* get_fd */
-    default_get_sync,         /* get_sync */
-    default_map_access,       /* map_access */
-    default_get_sd,           /* get_sd */
-    default_set_sd,           /* set_sd */
-    no_get_full_name,         /* get_full_name */
-    no_lookup_name,           /* lookup_name */
-    no_link_name,             /* link_name */
-    NULL,                     /* unlink_name */
-    no_open_file,             /* open_file */
-    no_kernel_obj_list,       /* get_kernel_obj_list */
-    no_close_handle,          /* close_handle */
-    inode_destroy             /* destroy */
+    .size    = sizeof(struct inode),
+    .type    = &no_type,
+    .dump    = inode_dump,
+    .destroy = inode_destroy,
 };
 
 /* file lock object */
@@ -525,27 +481,11 @@ static void file_lock_destroy( struct object *obj );
 
 static const struct object_ops file_lock_ops =
 {
-    sizeof(struct file_lock),   /* size */
-    &no_type,                   /* type */
-    file_lock_dump,             /* dump */
-    NULL,                       /* add_queue */
-    NULL,                       /* remove_queue */
-    NULL,                       /* signaled */
-    NULL,                       /* satisfied */
-    no_signal,                  /* signal */
-    no_get_fd,                  /* get_fd */
-    file_lock_get_sync,         /* get_sync */
-    default_map_access,         /* map_access */
-    default_get_sd,             /* get_sd */
-    default_set_sd,             /* set_sd */
-    no_get_full_name,           /* get_full_name */
-    no_lookup_name,             /* lookup_name */
-    no_link_name,               /* link_name */
-    NULL,                       /* unlink_name */
-    no_open_file,               /* open_file */
-    no_kernel_obj_list,         /* get_kernel_obj_list */
-    no_close_handle,            /* close_handle */
-    file_lock_destroy,          /* destroy */
+    .size     = sizeof(struct file_lock),
+    .type     = &no_type,
+    .dump     = file_lock_dump,
+    .get_sync = file_lock_get_sync,
+    .destroy  = file_lock_destroy,
 };
 
 
@@ -677,7 +617,8 @@ void ios_usd_report_alias( void *ptr, size_t size, const char *when )
 static void set_user_shared_data_time(void)
 {
     timeout_t tick_count = monotonic_time / 10000;
-    static timeout_t last_timezone_update;
+    static timeout_t last_timezone_update, last_timezone_bias = 65535, adjusted_timezone_bias;
+    static int current_year = -1;
     timeout_t timezone_bias;
     struct tm *tm, tm1, tm2;
     time_t now;
@@ -688,13 +629,19 @@ static void set_user_shared_data_time(void)
         tm = gmtime( &now );
         timezone_bias = mktime( tm ) - now;
         tm = localtime( &now );
-        if (tm->tm_isdst)
+        if (current_year != tm->tm_year || last_timezone_bias != timezone_bias)
         {
-            tm1 = tm2 = *tm;
-            tm1.tm_isdst = 0;
-            tm2.tm_isdst = 1;
-            timezone_bias += mktime(&tm1) < mktime(&tm2) ? 3600 : -3600;
+            current_year = tm->tm_year;
+            last_timezone_bias = adjusted_timezone_bias = timezone_bias;
+            if (tm->tm_isdst)
+            {
+                tm1 = tm2 = *tm;
+                tm1.tm_isdst = 0;
+                tm2.tm_isdst = 1;
+                adjusted_timezone_bias += mktime(&tm1) < mktime(&tm2) ? 3600 : -3600;
+            }
         }
+        timezone_bias = adjusted_timezone_bias;
         timezone_bias *= TICKS_PER_SEC;
 
         atomic_store_long(&user_shared_data->TimeZoneBias.High2Time, timezone_bias >> 32);
@@ -936,9 +883,12 @@ static signed char ios_fd_family_is_inet( int fd )
 
 static int get_next_timeout( struct timespec *ts );
 
+static unsigned int ios_iostuck_deliv[2048];   /* [io-stuck] rev 3: events handed to each poll user */
 static inline void fd_poll_event( struct fd *fd, int event )
 {
-    fd->fd_ops->poll_event( fd, event );
+    if (fd->poll_index >= 0 && fd->poll_index < 2048) ios_iostuck_deliv[fd->poll_index]++;
+    if (fd->fd_ops->poll_event) fd->fd_ops->poll_event( fd, event );
+    else default_poll_event( fd, event );
 }
 
 #ifdef USE_EPOLL
@@ -1502,6 +1452,378 @@ static signed char ios_fd_is_inet( int user, int fd )
     return ios_inet_cache_val[user];
 }
 
+/* ============================================================
+ * [io-stuck] (LOG ONLY) -- is input sitting ready that nobody was woken for?
+ *
+ * BattleNet Test, Nov 14 2026: the Battle.net launcher freezes after login
+ * with every thread idle (server_select / read / ulock) and every message
+ * queue empty ([srv-queues] post=0). [srv-stuck] names the waits, and the two
+ * that begin at the freeze are I/O completion waits. What no line shows is
+ * the I/O side itself: this loop does not trust poll() for non-INET fds and
+ * synthesises their events, so "data arrived and nothing was told" cannot be
+ * seen from the outside.
+ *
+ * This asks the kernel directly, on the existing 10 s diagnostic cadence:
+ * one zero-timeout poll() plus one FIONREAD per live poll user. An fd that is
+ * readable on two dumps in a row (10 s or more) is reported with what the
+ * server is watching it for, whether async readers are queued on it, its
+ * completion port, and who opened it.
+ *
+ * It changes no state: it does not read from any fd, does not touch pollfd[],
+ * the INET cache, or any queue. Off with env.MADEIRA_IO_STUCK=0.
+ * ============================================================ */
+#include <sys/socket.h>
+#include <netinet/in.h>
+#define IOS_IOSTUCK_SLOTS 2048
+/* rev 3: same layout as ntdll-unix/server_ios.c ios_srv_inflight */
+struct ios_inflight_entry { volatile unsigned int tid; volatile int request_fd; volatile int req; volatile unsigned long long t0_ns; };
+extern struct ios_inflight_entry ios_srv_inflight[4096];
+#define IOS_IOSTUCK_ROWS  32
+
+static const char *ios_iostuck_kind( int unix_fd, char *buf, size_t len )
+{
+    struct stat st;
+    if (fstat( unix_fd, &st ) != 0) return "?";
+    if (S_ISFIFO( st.st_mode )) return "pipe";
+    if (S_ISCHR( st.st_mode )) return "chardev";
+    if (S_ISREG( st.st_mode )) return "file";
+    if (S_ISDIR( st.st_mode )) return "dir";
+    if (S_ISSOCK( st.st_mode ))
+    {
+        struct sockaddr_storage ss;
+        socklen_t sl = sizeof(ss);
+        int type = 0, port = 0;
+        socklen_t tl = sizeof(type);
+        const char *fam = "sock";
+        memset( &ss, 0, sizeof(ss) );
+        if (getsockname( unix_fd, (struct sockaddr *)&ss, &sl ) == 0)
+        {
+            if (ss.ss_family == AF_INET) fam = "inet";
+            else if (ss.ss_family == AF_INET6) fam = "inet6";
+            else if (ss.ss_family == AF_UNIX) fam = "unix";
+        }
+        getsockopt( unix_fd, SOL_SOCKET, SO_TYPE, &type, &tl );
+        /* remote PORT only (443, 1119...): enough to tell web from game traffic,
+         * and no address goes into a log that players share */
+        sl = sizeof(ss);
+        memset( &ss, 0, sizeof(ss) );
+        if (getpeername( unix_fd, (struct sockaddr *)&ss, &sl ) == 0)
+        {
+            if (ss.ss_family == AF_INET) port = ntohs( ((struct sockaddr_in *)&ss)->sin_port );
+            else if (ss.ss_family == AF_INET6) port = ntohs( ((struct sockaddr_in6 *)&ss)->sin6_port );
+        }
+        snprintf( buf, len, "%s-%s peer-port=%d", fam,
+                  type == SOCK_STREAM ? "tcp" : (type == SOCK_DGRAM ? "udp" : "other"), port );
+        return buf;
+    }
+    return "other";
+}
+
+static void ios_dump_io_stuck( int client_fd_start )
+{
+    static unsigned int deliv_prev[IOS_IOSTUCK_SLOTS];
+    extern int ios_iostuck_thread_fmt( struct object *obj, struct fd *fd, char *buf, size_t len );
+    static struct { struct fd *fd; int unix_fd; int bytes; unsigned short n; } seen[IOS_IOSTUCK_SLOTS];
+    static struct pollfd probe[IOS_IOSTUCK_SLOTS];
+    static unsigned char is_free[IOS_IOSTUCK_SLOTS];
+    static int on = -1;
+    int i, n, guard, rows = 0, live = 0, ready = 0, stuck = 0, files_skipped = 0;
+    struct fd **p;
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_IO_STUCK" );
+        on = !(e && *e == '0');
+    }
+    if (!on || !poll_users || !pollfd) return;
+
+    n = nb_users < IOS_IOSTUCK_SLOTS ? nb_users : IOS_IOSTUCK_SLOTS;
+    if (n <= 1) return;
+
+    /* free slots hold freelist links, not fd pointers: mark them first */
+    memset( is_free, 0, n );
+    for (p = freelist, guard = 0; p && guard <= nb_users; p = (struct fd **)*p, guard++)
+    {
+        long idx = p - poll_users;
+        if (idx < 0 || idx >= nb_users) break;
+        if (idx < n) is_free[idx] = 1;
+    }
+
+    for (i = 0; i < n; i++)
+    {
+        struct fd *fd = is_free[i] ? NULL : poll_users[i];
+        probe[i].fd = -1;
+        probe[i].events = 0;
+        probe[i].revents = 0;
+        /* slot 0 is the master socket; regular files are always ready */
+        if (i == 0 || !fd || fd->unix_fd < 0 || fd->inode)
+        {
+            seen[i].fd = NULL;
+            seen[i].n = 0;
+            continue;
+        }
+        probe[i].fd = fd->unix_fd;
+        probe[i].events = POLLIN;
+        live++;
+    }
+
+    if (poll( probe, n, 0 ) < 0)
+    {
+        fprintf( stderr, "[io-stuck] probe poll failed errno=%d, skipped rev=io-stuck-3\n", errno );
+        return;
+    }
+
+    for (i = 1; i < n; i++)
+    {
+        struct fd *fd;
+        short re;
+        int bytes = -1, same, watch, rq, wq, oq;
+        const char *verdict;
+        char kind[64];
+
+        if (probe[i].fd < 0) continue;
+        fd = poll_users[i];
+        re = probe[i].revents & (POLLIN | POLLHUP | POLLERR);
+        if (ioctl( fd->unix_fd, FIONREAD, &bytes ) != 0) bytes = -1;
+        if (!re && bytes <= 0)
+        {
+            seen[i].fd = NULL;
+            seen[i].n = 0;
+            continue;
+        }
+        ready++;
+        same = (seen[i].fd == fd && seen[i].unix_fd == fd->unix_fd);
+        if (same)
+        {
+            if (seen[i].n < 0xffff) seen[i].n++;
+        }
+        else
+        {
+            seen[i].fd = fd;
+            seen[i].unix_fd = fd->unix_fd;
+            seen[i].n = 1;
+        }
+        same = same && seen[i].bytes == bytes;
+        seen[i].bytes = bytes;
+        if (seen[i].n < 2) continue;
+        stuck++;
+        /* rev 2: an unwatched regular file (a mapping's fd) is always readable
+         * and never waited on; io-stuck-1 filled all 32 rows with them */
+        if (pollfd[i].fd < 0 || !pollfd[i].events)
+        {
+            struct stat fst;
+            if (fstat( fd->unix_fd, &fst ) == 0 && S_ISREG( fst.st_mode ))
+            {
+                files_skipped++;
+                continue;
+            }
+        }
+        if (rows >= IOS_IOSTUCK_ROWS) continue;
+        rows++;
+
+        watch = pollfd[i].fd >= 0 ? pollfd[i].events : -1;
+        rq = !list_empty( &fd->read_q.queue );
+        wq = !list_empty( &fd->write_q.queue );
+        oq = !list_empty( &fd->wait_q.queue );
+        if (watch >= 0 && (watch & POLLIN))
+            verdict = "WATCHED-NOT-DELIVERED (server wants read events, input ready, nothing fired)";
+        else if (rq || oq)
+            verdict = "ASYNC-QUEUED-NOT-WATCHED (a reader is queued but the server is not watching)";
+        else
+            verdict = "unwatched (nobody has asked to read it yet)";
+
+        fprintf( stderr, "[io-stuck] slot=%d unix_fd=%d %s ready=%s%s%s bytes=%d%s seen=%u dumps "
+                 "watch=%s%s%s%s async read=%d write=%d wait=%d completion=%p opened-by pid=%04x tid=%04x %s\n",
+                 i, fd->unix_fd, ios_iostuck_kind( fd->unix_fd, kind, sizeof(kind) ),
+                 (re & POLLIN) ? "IN" : "", (re & POLLHUP) ? "+HUP" : "", (re & POLLERR) ? "+ERR" : "",
+                 bytes, same ? " (unchanged)" : "", (unsigned)seen[i].n,
+                 watch < 0 ? "OFF" : "", (watch > 0 && (watch & POLLIN)) ? "IN" : "",
+                 (watch > 0 && (watch & POLLOUT)) ? "+OUT" : "", watch == 0 ? "none" : "",
+                 rq, wq, oq, (void *)fd->completion, fd->open_pid, fd->open_tid, verdict );
+        if (watch > 0 && (watch & POLLIN) && fd->user && fd->user->ops && fd->user->ops->dump)
+        {
+            /* rev 2: who owns it (a thread's request pipe dumps as
+             * "Thread id=... state=..."); the server's own debug print */
+            char tl[256];
+            fprintf( stderr, "[io-stuck]   owner: " );
+            fd->user->ops->dump( fd->user, 0 );
+            /* rev 3: did the loop hand this slot any event since the last dump,
+             * how the INET cache classes it, and what read_request last saw */
+            fprintf( stderr, "[io-stuck]   loop: events-delivered-since-last-dump=%u inet-cache=%d "
+                     "client-fd-start=%d %s\n",
+                     i < 2048 ? ios_iostuck_deliv[i] - deliv_prev[i] : 0,
+                     (i < ios_inet_cache_size && ios_inet_cache_fd[i] == fd->unix_fd) ? ios_inet_cache_val[i] : -1,
+                     client_fd_start, i < client_fd_start ? "(BELOW client start: FIONREAD path)" : "" );
+            if (ios_iostuck_thread_fmt( fd->user, fd, tl, sizeof(tl) ))
+                fprintf( stderr, "[io-stuck]   %s\n", tl );
+            /* rev 3: which client thread is inside a server call on THIS pipe
+             * (ntdll-unix/server_ios.c ios_srv_inflight) -- names the writer */
+            {
+                unsigned long long now = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
+                int k, found = 0;
+                for (k = 0; k < 4096; k++)
+                {
+                    unsigned int wt = __atomic_load_n( &ios_srv_inflight[k].tid, __ATOMIC_ACQUIRE );
+                    if (!wt || ios_srv_inflight[k].request_fd != fd->unix_fd) continue;
+                    found++;
+                    fprintf( stderr, "[io-stuck]   writer: client tid=%04x is inside server request #%d on this pipe for %llums (waiting for the reply)\n",
+                             wt, ios_srv_inflight[k].req, (now - ios_srv_inflight[k].t0_ns) / 1000000ull );
+                }
+                if (!found)
+                    fprintf( stderr, "[io-stuck]   writer: no client thread is inside a server call on this pipe\n" );
+            }
+        }
+        if (fd->completion)
+        {
+            /* struct completion starts with its object header; dump() is the
+             * server's own debug print (queue depth) and prints its own newline */
+            struct object *cobj = (struct object *)fd->completion;
+            fprintf( stderr, "[io-stuck]   completion %p: ", (void *)cobj );
+            cobj->ops->dump( cobj, 0 );
+        }
+    }
+
+    for (i = 0; i < n && i < 2048; i++) deliv_prev[i] = ios_iostuck_deliv[i];
+    fprintf( stderr, "[io-stuck] ---- users=%d probed=%d readable-now=%d readable-10s+=%d shown=%d "
+             "unwatched-files-skipped=%d rev=io-stuck-3\n",
+             nb_users, live, ready, stuck, rows, files_skipped );
+}
+
+/* ============================================================
+ * [sock-census] (log only, Battle.net launcher freeze)
+ *
+ * The pipe census (Test 5) showed no lost named-pipe or IOCP wake-up at the
+ * freeze, and io-stuck cannot see sockets' own queues (sock.c keeps read_q,
+ * write_q and AFD poll requests itself). On the same 10 s cadence this walks
+ * every poll user that is a socket and compares three things:
+ *   want  = what sock.c asks to be polled for right now (sock_get_poll_events)
+ *   watch = what the server loop is actually polling it for (pollfd[].events)
+ *   ready = a zero-timeout poll() and FIONREAD on the unix fd
+ * A socket is flagged when, on two dumps in a row (10 s or more):
+ *   STALE-WATCH      want != watch (a missed set_fd_events / reselect)
+ *   READ-WAIT-ON-DATA a recv async is really waiting AND the fd has data/HUP
+ *   POLL-WAIT-ON-DATA an AFD poll asks for READ AND the fd is readable
+ * Every 6th dump (about once a minute) it also lists every connected or
+ * connecting socket, capped, so a frozen log always shows the full picture.
+ *
+ * Changes no state: no read, no pollfd[] write, no queue change.
+ * Off with env.MADEIRA_SOCK_CENSUS=0. Helper lives in sock_census_ios.c.
+ * ============================================================ */
+#define IOS_SC_N 16
+#define IOS_SC_ROWS 40
+extern int ios_sock_census_info( void *user, int *out, char *desc, size_t len );
+
+static void ios_sock_census( void )
+{
+    static struct { struct fd *fd; int unix_fd; unsigned short stale, rdata, pdata; } seen[IOS_IOSTUCK_SLOTS];
+    static unsigned char is_free[IOS_IOSTUCK_SLOTS];
+    static unsigned int dump_no;
+    static int on = -1;
+    int i, n, guard, rows = 0, socks = 0, tcp_live = 0, rwaiting = 0, pwaiting = 0, with_data = 0;
+    int f_stale = 0, f_rdata = 0, f_pdata = 0, list_all;
+    struct fd **p;
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_SOCK_CENSUS" );
+        on = !(e && *e == '0');
+    }
+    if (!on || !poll_users || !pollfd) return;
+
+    n = nb_users < IOS_IOSTUCK_SLOTS ? nb_users : IOS_IOSTUCK_SLOTS;
+    if (n <= 1) return;
+    list_all = (dump_no++ % 6) == 0;
+
+    /* free slots hold freelist links, not fd pointers: mark them first */
+    memset( is_free, 0, n );
+    for (p = freelist, guard = 0; p && guard <= nb_users; p = (struct fd **)*p, guard++)
+    {
+        long idx = p - poll_users;
+        if (idx < 0 || idx >= nb_users) break;
+        if (idx < n) is_free[idx] = 1;
+    }
+
+    for (i = 1; i < n; i++)
+    {
+        struct fd *fd = is_free[i] ? NULL : poll_users[i];
+        int o[IOS_SC_N], watch, want, bytes = -1, data, is_live, show;
+        short re = 0;
+        char desc[160];
+        const char *why;
+
+        if (!fd || !fd->user || !ios_sock_census_info( fd->user, o, desc, sizeof(desc) ))
+        {
+            seen[i].fd = NULL;
+            seen[i].stale = seen[i].rdata = seen[i].pdata = 0;
+            continue;
+        }
+        socks++;
+        if (seen[i].fd != fd || seen[i].unix_fd != fd->unix_fd)
+        {
+            seen[i].fd = fd;
+            seen[i].unix_fd = fd->unix_fd;
+            seen[i].stale = seen[i].rdata = seen[i].pdata = 0;
+        }
+
+        watch = pollfd[i].fd == -1 ? -1 : pollfd[i].events;
+        want = o[0];
+        if (fd->unix_fd >= 0)
+        {
+            struct pollfd pr;
+            pr.fd = fd->unix_fd;
+            pr.events = POLLIN | POLLOUT;
+            pr.revents = 0;
+            if (poll( &pr, 1, 0 ) > 0) re = pr.revents;
+            if (ioctl( fd->unix_fd, FIONREAD, &bytes ) != 0) bytes = -1;
+        }
+        data = bytes > 0 || (re & (POLLIN | POLLHUP | POLLERR));
+        is_live = o[11] == 2 /* connecting */ || o[11] == 3 /* connected */;
+        if (o[12] && is_live) tcp_live++;
+        if (o[1]) rwaiting++;
+        if (o[4]) pwaiting++;
+        if (data) with_data++;
+
+        /* want -1 and an unwatched slot are the same thing */
+        if ((want < 0 ? -1 : want) != watch) { if (seen[i].stale < 0xffff) seen[i].stale++; }
+        else seen[i].stale = 0;
+        if (o[1] && data) { if (seen[i].rdata < 0xffff) seen[i].rdata++; }
+        else seen[i].rdata = 0;
+        if (o[5] && (re & (POLLIN | POLLHUP | POLLERR))) { if (seen[i].pdata < 0xffff) seen[i].pdata++; }
+        else seen[i].pdata = 0;
+
+        if (seen[i].stale >= 2) f_stale++;
+        if (seen[i].rdata >= 2) f_rdata++;
+        if (seen[i].pdata >= 2) f_pdata++;
+
+        if (seen[i].rdata >= 2) why = "READ-WAIT-ON-DATA";
+        else if (seen[i].pdata >= 2) why = "POLL-WAIT-ON-DATA";
+        else if (seen[i].stale >= 2) why = "STALE-WATCH";
+        else why = NULL;
+        show = why || (list_all && (is_live || o[1] || o[4] || o[11] == 0 /* listening */));
+        if (!show || rows >= IOS_SC_ROWS) continue;
+        rows++;
+        fprintf( stderr, "[sock-census] %s slot=%d fd=%d %s want=%s%s%s%s watch=%s%s%s%s ready=%s%s%s%s "
+                 "bytes=%d recv-wait=%d recv-queued=%d send-wait=%d afd-polls=%d(read=%d) "
+                 "accept-wait=%d connect-wait=%d for=%ds\n",
+                 why ? why : "all:", i, fd->unix_fd, desc,
+                 want < 0 ? "none" : "", want > 0 && (want & POLLIN) ? "IN" : "",
+                 want > 0 && (want & POLLOUT) ? "+OUT" : "", want > 0 && (want & POLLPRI) ? "+PRI" : "",
+                 watch < 0 ? "none" : "", watch > 0 && (watch & POLLIN) ? "IN" : "",
+                 watch > 0 && (watch & POLLOUT) ? "+OUT" : "", watch > 0 && (watch & POLLPRI) ? "+PRI" : "",
+                 re ? "" : "-", (re & POLLIN) ? "IN" : "", (re & POLLOUT) ? "+OUT" : "",
+                 (re & (POLLHUP | POLLERR)) ? "+HUP" : "",
+                 bytes, o[1], o[2], o[3], o[4], o[5], o[6], o[7],
+                 10 * (seen[i].rdata > seen[i].pdata
+                       ? (seen[i].rdata > seen[i].stale ? seen[i].rdata : seen[i].stale)
+                       : (seen[i].pdata > seen[i].stale ? seen[i].pdata : seen[i].stale)) );
+    }
+
+    fprintf( stderr, "[sock-census] ---- sockets=%d tcp-live=%d recv-waiting=%d afd-polling=%d with-data=%d "
+             "stale-watch-10s+=%d recv-wait-on-data-10s+=%d poll-wait-on-data-10s+=%d shown=%d%s\n",
+             socks, tcp_live, rwaiting, pwaiting, with_data, f_stale, f_rdata, f_pdata, rows,
+             list_all ? " (full list)" : "" );
+}
+
 void main_loop(void)
 {
     int i, ret, timeout;
@@ -1520,6 +1842,12 @@ void main_loop(void)
         sigfillset(&all_sigs);
         pthread_sigmask(SIG_SETMASK, &all_sigs, NULL);
         ws_log("[wineserver-fd] main_loop: blocked all signals on wineserver thread");
+        {   /* [init-hang]: who this thread is, for the watchdog in server_ios.c */
+            pthread_t self = pthread_self();
+            ios_srv_stack_hi = (unsigned long long)(uintptr_t)pthread_get_stackaddr_np( self );
+            ios_srv_stack_lo = ios_srv_stack_hi - pthread_get_stacksize_np( self );
+            ios_srv_mach_thread = mach_thread_self();   /* holds a reference: the name stays this thread's */
+        }
     }
 
     /* iOS: poll/kqueue don't detect events on Unix domain sockets in the app sandbox.
@@ -1662,6 +1990,22 @@ void main_loop(void)
                          * and NOT a synchronous all-thread stack sample,
                          * which would perturb the scheduler we are measuring. */
                         ios_dump_stuck_waits();
+                        /* [io-stuck]: log only, same 10 s cadence (see above main_loop) */
+                        ios_dump_io_stuck( ios_client_fd_start );
+                        /* [pipe-census]: named pipes + completion ports (named_pipe.c, completion.c) */
+                        {
+                            extern void ios_pipe_census( void );
+                            extern void ios_completion_census( void );
+                            static int pc_on = -1;
+                            if (pc_on < 0)
+                            {
+                                const char *e = getenv( "MADEIRA_PIPE_CENSUS" );
+                                pc_on = !(e && *e == '0');
+                            }
+                            if (pc_on) { ios_pipe_census(); ios_completion_census(); }
+                        }
+                        /* [sock-census]: sockets' own queues vs what is polled (sock_census_ios.c) */
+                        ios_sock_census();
                     }
                 }
             }
@@ -1811,6 +2155,8 @@ void main_loop(void)
             {
                 unsigned long long now_ns = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
                 ios_pass_n++;
+                ios_srv_pass_total++;                                   /* [init-hang] */
+                __atomic_store_n( &ios_srv_pass_ns, now_ns, __ATOMIC_RELAXED );
                 if (ios_doorbell)
                 {
                     ios_doorbell_service();
@@ -2590,7 +2936,7 @@ void unlock_fd( struct fd *fd, file_pos_t start, file_pos_t count )
             return;
         }
     }
-    set_error( STATUS_FILE_LOCK_CONFLICT );
+    set_error( STATUS_RANGE_NOT_LOCKED );
 }
 
 
@@ -2636,6 +2982,13 @@ static void fd_destroy( struct object *obj )
         free( fd->unix_name );
     }
     if (fd->sync) release_object( fd->sync );
+}
+
+static inline bool is_replace_file_disposition( unsigned int disposition )
+{
+    return (disposition == FILE_SUPERSEDE ||
+            disposition == FILE_OVERWRITE ||
+            disposition == FILE_OVERWRITE_IF);
 }
 
 /* check if the desired access is possible without violating */
@@ -2695,7 +3048,7 @@ static void ml960_report_sharing( struct fd *fd, unsigned int access, unsigned i
 }
 
 static unsigned int check_sharing( struct fd *fd, unsigned int access, unsigned int sharing,
-                                   unsigned int open_flags, unsigned int options )
+                                   unsigned int disposition, unsigned int options )
 {
     /* only a few access bits are meaningful wrt sharing */
     const unsigned int read_access = FILE_READ_DATA | FILE_EXECUTE;
@@ -2732,7 +3085,7 @@ static unsigned int check_sharing( struct fd *fd, unsigned int access, unsigned 
     }
     if ((existing_access & FILE_MAPPING_IMAGE) && (options & FILE_DELETE_ON_CLOSE))
         return STATUS_CANNOT_DELETE;
-    if ((existing_access & FILE_MAPPING_ACCESS) && (open_flags & O_TRUNC))
+    if ((existing_access & FILE_MAPPING_ACCESS) && is_replace_file_disposition( disposition ))
         return STATUS_USER_MAPPED_FILE;
     if (!(access & all_access))
         return 0;  /* if access mode is 0, sharing mode is ignored (except for mappings) */
@@ -2765,6 +3118,13 @@ void set_fd_events( struct fd *fd, int events )
         pollfd[user].fd = fd->unix_fd;
         pollfd[user].events = events;
     }
+}
+
+/* get the events we want to poll() for */
+static int get_poll_events( struct fd *fd )
+{
+    if (fd->fd_ops->get_poll_events) return fd->fd_ops->get_poll_events( fd );
+    return default_fd_get_poll_events( fd );
 }
 
 /* prepare an fd for unmounting its corresponding device */
@@ -2918,7 +3278,7 @@ struct fd *dup_fd_object( struct fd *orig, unsigned int access, unsigned int sha
         fd->closed = closed;
         fd->inode = (struct inode *)grab_object( orig->inode );
         list_add_head( &fd->inode->open, &fd->inode_entry );
-        if ((err = check_sharing( fd, access, sharing, 0, options )))
+        if ((err = check_sharing( fd, access, sharing, FILE_OPEN, options )))
         {
             set_error( err );
             goto failed;
@@ -3030,10 +3390,26 @@ static WCHAR *dup_nt_name( struct fd *root, struct unicode_str name, data_size_t
     return ret;
 }
 
-void get_nt_name( struct fd *fd, struct unicode_str *name )
+struct unicode_str get_nt_name( struct fd *fd )
 {
-    name->str = fd->nt_name;
-    name->len = fd->nt_namelen;
+    struct unicode_str name = { .str = fd->nt_name, .len = fd->nt_namelen };
+    return name;
+}
+
+static int open_file_or_dir( const char *name, unsigned int access, int flags, mode_t mode )
+{
+    int fd, rw_mode = O_RDONLY;
+
+    if (access & (FILE_WRITE_DATA | FILE_APPEND_DATA))
+        rw_mode = (access & FILE_READ_DATA) ? O_RDWR : O_WRONLY;
+
+    fd = open( name, rw_mode | flags | O_NONBLOCK, mode );
+
+    /* if we tried to open a directory for write access, retry read-only */
+    if (fd == -1 && errno == EISDIR && (rw_mode != O_RDONLY || (flags & O_CREAT)))
+        fd = open( name, O_RDONLY | O_NONBLOCK, mode );
+
+    return fd;
 }
 
 #ifdef WINE_IOS
@@ -3087,7 +3463,7 @@ static int ios_replace_readonly_link( const char *name, int flags, unsigned int 
         enabled = !(e && e[0] == '0');
     }
     if (!enabled || (err != EACCES && err != EPERM && err != EROFS)) return 0;
-    if (!(flags & O_TRUNC) || !(access & FILE_UNIX_WRITE_ACCESS) || (options & FILE_DIRECTORY_FILE)) return 0;
+    if (!(flags & O_TRUNC) || !(access & (FILE_WRITE_DATA | FILE_APPEND_DATA)) || (options & FILE_DIRECTORY_FILE)) return 0;
     if (lstat( name, &st ) == -1 || !S_ISLNK( st.st_mode )) goto keep;
     if (stat( name, &st ) == -1 || !S_ISREG( st.st_mode ) || ios_link_target_in_use( &st )) goto keep;
     if (unlink( name ) == -1) goto keep;
@@ -3104,18 +3480,16 @@ keep:
 
 /* open() wrapper that returns a struct fd with no fd user set */
 struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_name,
-                    int flags, mode_t *mode, unsigned int access,
-                    unsigned int sharing, unsigned int options )
+                    mode_t *mode, unsigned int access, unsigned int sharing,
+                    unsigned int disposition, unsigned int options )
 {
     struct stat st;
     struct closed_fd *closed_fd;
     struct fd *fd;
     int root_fd = -1;
-    int rw_mode;
     char *path;
 
-    if (((options & FILE_DELETE_ON_CLOSE) && !(access & DELETE)) ||
-        ((options & FILE_DIRECTORY_FILE) && (flags & O_TRUNC)))
+    if ((options & FILE_DELETE_ON_CLOSE) && !(access & DELETE))
     {
         set_error( STATUS_INVALID_PARAMETER );
         return NULL;
@@ -3141,51 +3515,73 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
         }
     }
 
-    /* create the directory if needed */
-    if ((options & FILE_DIRECTORY_FILE) && (flags & O_CREAT))
+    if (options & FILE_DIRECTORY_FILE)
     {
-        if (mkdir( name, *mode ) == -1)
+        switch (disposition)
         {
-            if (errno != EEXIST || (flags & O_EXCL))
+        case FILE_CREATE:
+        case FILE_OPEN_IF:
+            if (mkdir( name, *mode ) != -1)
             {
-                file_set_error();
-                goto error;
+                dircache_changed();
+                break;
             }
-        }
-        else dircache_changed();
-        flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
-    }
-
-    if ((access & FILE_UNIX_WRITE_ACCESS) && !(options & FILE_DIRECTORY_FILE))
-    {
-        if (access & FILE_UNIX_READ_ACCESS) rw_mode = O_RDWR;
-        else rw_mode = O_WRONLY;
-    }
-    else rw_mode = O_RDONLY;
-
-    if ((fd->unix_fd = open( name, rw_mode | (flags & ~O_TRUNC), *mode )) == -1)
-    {
-#ifdef WINE_IOS
-        if (ios_replace_readonly_link( name, flags, access, options ) &&
-            (fd->unix_fd = open( name, rw_mode | O_CREAT | (flags & ~O_TRUNC), *mode )) != -1)
-            errno = 0;
-#endif
-        /* if we tried to open a directory for write access, retry read-only */
-        if (errno == EISDIR)
-        {
-            if ((access & FILE_UNIX_WRITE_ACCESS) || (flags & O_CREAT))
-                fd->unix_fd = open( name, O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)), *mode );
-        }
-
-        if (fd->unix_fd == -1)
-        {
-            /* check for trailing slash on file path */
-            if ((errno == ENOENT || (errno == ENOTDIR && !(options & FILE_DIRECTORY_FILE))) && name[strlen(name) - 1] == '/')
-                set_error( STATUS_OBJECT_NAME_INVALID );
-            else
-                file_set_error();
+            if (errno == EEXIST && disposition == FILE_OPEN_IF) break;
+            file_set_error();
+            goto error;
+        case FILE_OPEN:
+            break;
+        case FILE_SUPERSEDE:
+        case FILE_OVERWRITE:
+        case FILE_OVERWRITE_IF:
+            set_error( STATUS_INVALID_PARAMETER );
             goto error;
         }
+        fd->unix_fd = open( name, O_RDONLY | O_NONBLOCK, *mode );
+    }
+    else
+    {
+        switch (disposition)
+        {
+        case FILE_OPEN:
+            fd->unix_fd = open_file_or_dir( name, access, 0, *mode );
+            break;
+        case FILE_CREATE:
+            fd->unix_fd = open_file_or_dir( name, access, O_CREAT | O_EXCL, *mode );
+            break;
+        case FILE_OVERWRITE:
+            fd->unix_fd = open_file_or_dir( name, access | FILE_WRITE_DATA, 0, *mode );
+            break;
+        case FILE_OVERWRITE_IF:
+            fd->unix_fd = open_file_or_dir( name, access | FILE_WRITE_DATA, O_CREAT, *mode );
+            break;
+        case FILE_OPEN_IF:
+        case FILE_SUPERSEDE:
+            fd->unix_fd = open_file_or_dir( name, access, O_CREAT, *mode );
+            break;
+        }
+#ifdef WINE_IOS
+        /* Madeira: an overwrite through a link to a read-only file replaces the link (11.22 port:
+         * the dispositions that used to carry O_TRUNC are supersede, overwrite and overwrite-if) */
+        if (fd->unix_fd == -1 &&
+            (disposition == FILE_SUPERSEDE || disposition == FILE_OVERWRITE || disposition == FILE_OVERWRITE_IF) &&
+            ios_replace_readonly_link( name, O_TRUNC, disposition == FILE_SUPERSEDE ? access : access | FILE_WRITE_DATA,
+                                       options ))
+        {
+            fd->unix_fd = open_file_or_dir( name, disposition == FILE_SUPERSEDE ? access : access | FILE_WRITE_DATA,
+                                            O_CREAT, *mode );
+        }
+#endif
+    }
+
+    if (fd->unix_fd == -1)
+    {
+        /* check for trailing slash on file path */
+        if ((errno == ENOENT || (errno == ENOTDIR && !(options & FILE_DIRECTORY_FILE))) && name[strlen(name) - 1] == '/')
+            set_error( STATUS_OBJECT_NAME_INVALID );
+        else
+            file_set_error();
+        goto error;
     }
 
     fd->nt_name = dup_nt_name( root, nt_name, &fd->nt_namelen );
@@ -3233,23 +3629,24 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
             set_error( STATUS_FILE_IS_A_DIRECTORY );
             goto error;
         }
-        if ((err = check_sharing( fd, access, sharing, flags, options )))
+        if ((err = check_sharing( fd, access, sharing, disposition, options )))
         {
             set_error( err );
             goto error;
         }
 
         /* can't unlink files if we don't have permission to access */
-        if ((options & FILE_DELETE_ON_CLOSE) && !(flags & O_CREAT) &&
+        if ((options & FILE_DELETE_ON_CLOSE) &&
+            (disposition == FILE_OPEN || disposition == FILE_OVERWRITE) &&
             !(st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)))
         {
             set_error( STATUS_CANNOT_DELETE );
             goto error;
         }
 
-        fd->closed->disp_flags = (options & FILE_DELETE_ON_CLOSE) ?
-            FILE_DISPOSITION_DELETE : 0;
-        if (flags & O_TRUNC)
+        fd->closed->disp_flags = (options & FILE_DELETE_ON_CLOSE) ? FILE_DISPOSITION_DELETE : 0;
+
+        if (is_replace_file_disposition( disposition ))
         {
             if (S_ISDIR(st.st_mode))
             {
@@ -3454,7 +3851,7 @@ void default_poll_event( struct fd *fd, int event )
 
     /* if an error occurred, stop polling this fd to avoid busy-looping */
     if (event & (POLLERR | POLLHUP)) set_fd_events( fd, -1 );
-    else if (!fd->inode) set_fd_events( fd, fd->fd_ops->get_poll_events( fd ) );
+    else if (!fd->inode) set_fd_events( fd, get_poll_events( fd ) );
 }
 
 void fd_queue_async( struct fd *fd, struct async *async, int type )
@@ -3482,7 +3879,7 @@ void fd_queue_async( struct fd *fd, struct async *async, int type )
     if (type != ASYNC_TYPE_WAIT)
     {
         if (!fd->inode)
-            set_fd_events( fd, fd->fd_ops->get_poll_events( fd ) );
+            set_fd_events( fd, get_poll_events( fd ) );
         else  /* regular files are always ready for read and write */
             async_wake_up( queue, STATUS_ALERTED );
     }
@@ -3508,22 +3905,14 @@ void fd_async_wake_up( struct fd *fd, int type, unsigned int status )
 
 void fd_cancel_async( struct fd *fd, struct async *async )
 {
-    fd->fd_ops->cancel_async( fd, async );
+    if (fd->fd_ops->cancel_async) fd->fd_ops->cancel_async( fd, async );
+    else async_terminate( async, STATUS_CANCELLED );
 }
 
 void fd_reselect_async( struct fd *fd, struct async_queue *queue )
 {
-    fd->fd_ops->reselect_async( fd, queue );
-}
-
-void no_fd_queue_async( struct fd *fd, struct async *async, int type, int count )
-{
-    set_error( STATUS_OBJECT_TYPE_MISMATCH );
-}
-
-void default_fd_cancel_async( struct fd *fd, struct async *async )
-{
-    async_terminate( async, STATUS_CANCELLED );
+    if (fd->fd_ops->reselect_async) fd->fd_ops->reselect_async( fd, queue );
+    else default_fd_reselect_async( fd, queue );
 }
 
 void default_fd_queue_async( struct fd *fd, struct async *async, int type, int count )
@@ -3537,9 +3926,9 @@ void default_fd_reselect_async( struct fd *fd, struct async_queue *queue )
 {
     if (queue == &fd->read_q || queue == &fd->write_q)
     {
-        int poll_events = fd->fd_ops->get_poll_events( fd );
+        int poll_events = get_poll_events( fd );
         int events = check_fd_events( fd, poll_events );
-        if (events) fd->fd_ops->poll_event( fd, events );
+        if (events) fd_poll_event( fd, events );
         else set_fd_events( fd, poll_events );
     }
 }
@@ -3559,6 +3948,7 @@ static int is_dir_empty( int fd )
         return -1;
     }
 
+    rewinddir( dir );
     empty = 1;
     while (empty && (de = readdir( dir )))
     {
@@ -3569,35 +3959,15 @@ static int is_dir_empty( int fd )
     return empty;
 }
 
-static inline int is_valid_mounted_device( struct stat *st )
-{
-#if defined(linux) || defined(__sun__)
-    return S_ISBLK( st->st_mode );
-#else
-    /* disks are char devices on *BSD */
-    return S_ISCHR( st->st_mode );
-#endif
-}
-
 /* close all Unix file descriptors on a device to allow unmounting it */
-static void unmount_device( struct fd *device_fd )
+static void unmount_device( dev_t dev )
 {
     unsigned int i;
-    struct stat st;
     struct device *device;
     struct inode *inode;
     struct fd *fd;
-    int unix_fd = get_unix_fd( device_fd );
 
-    if (unix_fd == -1) return;
-
-    if (fstat( unix_fd, &st ) == -1 || !is_valid_mounted_device( &st ))
-    {
-        set_error( STATUS_INVALID_PARAMETER );
-        return;
-    }
-
-    if (!(device = get_device( st.st_rdev, -1 ))) return;
+    if (!(device = get_device( dev, -1 ))) return;
 
     for (i = 0; i < INODE_HASH_SIZE; i++)
     {
@@ -3826,30 +4196,6 @@ static void delete_reparse_point( struct fd *fd, struct async *async )
     xattr_fremove( fd->unix_fd, XATTR_REPARSE );
 }
 
-/* default read() routine */
-void no_fd_read( struct fd *fd, struct async *async, file_pos_t pos )
-{
-    set_error( STATUS_OBJECT_TYPE_MISMATCH );
-}
-
-/* default write() routine */
-void no_fd_write( struct fd *fd, struct async *async, file_pos_t pos )
-{
-    set_error( STATUS_OBJECT_TYPE_MISMATCH );
-}
-
-/* default flush() routine */
-void no_fd_flush( struct fd *fd, struct async *async )
-{
-    set_error( STATUS_OBJECT_TYPE_MISMATCH );
-}
-
-/* default get_file_info() routine */
-void no_fd_get_file_info( struct fd *fd, obj_handle_t handle, unsigned int info_class )
-{
-    set_error( STATUS_OBJECT_TYPE_MISMATCH );
-}
-
 /* default get_file_info() routine */
 void default_fd_get_file_info( struct fd *fd, obj_handle_t handle, unsigned int info_class )
 {
@@ -3923,16 +4269,102 @@ void default_fd_get_file_info( struct fd *fd, obj_handle_t handle, unsigned int 
     }
 }
 
-/* default get_volume_info() routine */
-void no_fd_get_volume_info( struct fd *fd, struct async *async, unsigned int info_class )
+static void set_fd_eof( struct fd *fd, file_pos_t eof )
 {
-    set_error( STATUS_OBJECT_TYPE_MISMATCH );
+    struct stat st;
+
+    if (!fd->inode)
+    {
+        set_error( STATUS_OBJECT_TYPE_MISMATCH );
+        return;
+    }
+
+    if (fd->unix_fd == -1)
+    {
+        set_error( fd->no_fd_status );
+        return;
+    }
+    if (fstat( fd->unix_fd, &st) == -1)
+    {
+        file_set_error();
+        return;
+    }
+    if (eof < st.st_size)
+    {
+        struct fd *fd_ptr;
+        LIST_FOR_EACH_ENTRY( fd_ptr, &fd->inode->open, struct fd, inode_entry )
+        {
+            if (fd_ptr->access & FILE_MAPPING_ACCESS)
+            {
+                set_error( STATUS_USER_MAPPED_FILE );
+                return;
+            }
+        }
+        {
+            /* ml562: name every SHRINK of a file we may be backing a section with.
+             * ml561 showed section files that are short at map time; this says
+             * whether they were born short or truncated afterwards. */
+            struct stat bst;
+            if (!fstat( fd->unix_fd, &bst ) && (off_t)eof < bst.st_size)
+            {
+                static unsigned long shrinkn;
+                if (++shrinkn <= 64)
+                    ws_log("[srv-eof] SHRINK fd=%d dev=%llu ino=%llu %lld -> %lld rev=ml563\n",
+                           fd->unix_fd, (unsigned long long)bst.st_dev,
+                           (unsigned long long)bst.st_ino,
+                           (long long)bst.st_size, (long long)eof);
+            }
+        }
+        if (ftruncate( fd->unix_fd, eof ) == -1) file_set_error();
+    }
+    else grow_file( fd->unix_fd, eof );
 }
 
-/* default ioctl() routine */
-void no_fd_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+/* default set_file_info() routine */
+void default_fd_set_file_info( struct fd *fd, struct async *async, unsigned int info_class )
 {
-    set_error( STATUS_OBJECT_TYPE_MISMATCH );
+    switch (info_class)
+    {
+    case FileIoCompletionNotificationInformation:
+        {
+            const FILE_IO_COMPLETION_NOTIFICATION_INFORMATION *info = get_req_data();
+
+            if (get_req_data_size() < sizeof(*info))
+            {
+                set_error( STATUS_INFO_LENGTH_MISMATCH );
+                return;
+            }
+
+            if (is_fd_overlapped( fd ))
+            {
+                if (info->Flags & FILE_SKIP_SET_EVENT_ON_HANDLE)
+                    set_fd_signaled( fd, 0 );
+                /* removing flags is not allowed */
+                fd->comp_flags |= info->Flags & ( FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
+                                                | FILE_SKIP_SET_EVENT_ON_HANDLE
+                                                | FILE_SKIP_SET_USER_EVENT_ON_FAST_IO );
+            }
+            else set_error( STATUS_INVALID_PARAMETER );
+            break;
+        }
+
+    case FileEndOfFileInformation:
+        {
+            const FILE_END_OF_FILE_INFORMATION *info = get_req_data();
+
+            if (get_req_data_size() < sizeof(*info))
+            {
+                set_error( STATUS_INVALID_PARAMETER_3 );
+                return;
+            }
+
+            set_fd_eof( fd, info->EndOfFile.QuadPart );
+            break;
+        }
+
+    default:
+        set_error( STATUS_NOT_IMPLEMENTED );
+    }
 }
 
 /* default ioctl() routine */
@@ -3940,10 +4372,6 @@ void default_fd_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 {
     switch(code)
     {
-    case FSCTL_DISMOUNT_VOLUME:
-        unmount_device( fd );
-        break;
-
     case FSCTL_SET_REPARSE_POINT:
         set_reparse_point( fd, async );
         break;
@@ -4192,57 +4620,6 @@ failed:
     free( name );
 }
 
-static void set_fd_eof( struct fd *fd, file_pos_t eof )
-{
-    struct stat st;
-
-    if (!fd->inode)
-    {
-        set_error( STATUS_OBJECT_TYPE_MISMATCH );
-        return;
-    }
-
-    if (fd->unix_fd == -1)
-    {
-        set_error( fd->no_fd_status );
-        return;
-    }
-    if (fstat( fd->unix_fd, &st) == -1)
-    {
-        file_set_error();
-        return;
-    }
-    if (eof < st.st_size)
-    {
-        struct fd *fd_ptr;
-        LIST_FOR_EACH_ENTRY( fd_ptr, &fd->inode->open, struct fd, inode_entry )
-        {
-            if (fd_ptr->access & FILE_MAPPING_ACCESS)
-            {
-                set_error( STATUS_USER_MAPPED_FILE );
-                return;
-            }
-        }
-        {
-            /* ml562: name every SHRINK of a file we may be backing a section with.
-             * ml561 showed section files that are short at map time; this says
-             * whether they were born short or truncated afterwards. */
-            struct stat bst;
-            if (!fstat( fd->unix_fd, &bst ) && (off_t)eof < bst.st_size)
-            {
-                static unsigned long shrinkn;
-                if (++shrinkn <= 64)
-                    ws_log("[srv-eof] SHRINK fd=%d dev=%llu ino=%llu %lld -> %lld rev=ml563\n",
-                           fd->unix_fd, (unsigned long long)bst.st_dev,
-                           (unsigned long long)bst.st_ino,
-                           (long long)bst.st_size, (long long)eof);
-            }
-        }
-        if (ftruncate( fd->unix_fd, eof ) == -1) file_set_error();
-    }
-    else grow_file( fd->unix_fd, eof );
-}
-
 struct completion *fd_get_completion( struct fd *fd, apc_param_t *p_key )
 {
     *p_key = fd->comp_key;
@@ -4264,9 +4641,10 @@ DECL_HANDLER(flush)
 
     if (!fd) return;
 
-    if ((async = create_request_async( fd, fd->comp_flags, &req->async, 0 )))
+    if ((async = create_request_async( fd, &req->async, 0 )))
     {
-        fd->fd_ops->flush( fd, async );
+        if (fd->fd_ops->flush) fd->fd_ops->flush( fd, async );
+        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
         reply->event = async_handoff( async, NULL, 1 );
         release_object( async );
     }
@@ -4280,9 +4658,37 @@ DECL_HANDLER(get_file_info)
 
     if (fd)
     {
-        fd->fd_ops->get_file_info( fd, req->handle, req->info_class );
+        if (fd->fd_ops->get_file_info) fd->fd_ops->get_file_info( fd, req->handle, req->info_class );
+        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
         release_object( fd );
     }
+}
+
+static unsigned int get_set_info_class_access( unsigned int class )
+{
+    switch (class)
+    {
+        case FilePipeInformation: return FILE_WRITE_ATTRIBUTES;
+        default: return 0;
+    }
+}
+
+/* set file info */
+DECL_HANDLER(set_file_info)
+{
+    struct fd *fd = get_handle_fd_obj( current->process, req->handle, get_set_info_class_access( req->info_class ));
+    struct async *async;
+
+    if (!fd) return;
+
+    if ((async = create_request_async( fd, &req->async, 0 )))
+    {
+        if (fd->fd_ops->set_file_info) fd->fd_ops->set_file_info( fd, async, req->info_class );
+        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
+        reply->wait = async_handoff( async, NULL, 1 );
+        release_object( async );
+    }
+    release_object( fd );
 }
 
 /* query volume info */
@@ -4293,9 +4699,10 @@ DECL_HANDLER(get_volume_info)
 
     if (!fd) return;
 
-    if ((async = create_request_async( fd, fd->comp_flags, &req->async, 0 )))
+    if ((async = create_request_async( fd, &req->async, 0 )))
     {
-        fd->fd_ops->get_volume_info( fd, async, req->info_class );
+        if (fd->fd_ops->get_volume_info) fd->fd_ops->get_volume_info( fd, async, req->info_class );
+        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
         reply->wait = async_handoff( async, NULL, 1 );
         release_object( async );
     }
@@ -4305,18 +4712,36 @@ DECL_HANDLER(get_volume_info)
 /* open a file object */
 DECL_HANDLER(open_file_object)
 {
-    struct unicode_str name = get_req_unicode_str();
-    struct object *obj, *result, *root = NULL;
+    struct object *obj, *result;
+    struct object_params params = { .name = get_req_unicode_str(), .attr = req->attributes };
+    struct fd *fd;
+    struct async *async;
 
-    if (req->rootdir && !(root = get_handle_obj( current->process, req->rootdir, 0, NULL ))) return;
+    if (req->rootdir && !(params.root = get_handle_obj( current->process, req->rootdir, 0, NULL ))) return;
 
-    obj = open_named_object( root, NULL, &name, req->attributes );
-    if (root) release_object( root );
+    obj = open_named_object( &params );
+    if (params.root) release_object( params.root );
     if (!obj) return;
 
-    if ((result = obj->ops->open_file( obj, req->access, req->sharing, req->options )))
+    if (!obj->ops->open_file) set_error( STATUS_OBJECT_TYPE_MISMATCH );
+    else if ((result = obj->ops->open_file( obj, req->access, req->sharing, req->options )))
     {
+        struct async_data async_data = {.user = req->async_user};
+
         reply->handle = alloc_handle( current->process, result, req->access, req->attributes );
+        async_data.handle = reply->handle;
+
+        if (reply->handle && (fd = get_obj_fd( result )))
+        {
+            if (fd->fd_ops->create && (async = create_request_async( fd, &async_data, 1 )))
+            {
+                fd->fd_ops->create( fd, async, req->access, req->sharing, req->options );
+                reply->wait = async_handoff( async, NULL, 1 );
+                release_object( async );
+            }
+            release_object( fd );
+        }
+
         release_object( result );
     }
     release_object( obj );
@@ -4383,9 +4808,10 @@ DECL_HANDLER(read)
 
     if (!fd) return;
 
-    if ((async = create_request_async( fd, fd->comp_flags, &req->async, 0 )))
+    if ((async = create_request_async( fd, &req->async, 0 )))
     {
-        fd->fd_ops->read( fd, async, req->pos );
+        if (fd->fd_ops->read) fd->fd_ops->read( fd, async, req->pos );
+        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
         reply->wait = async_handoff( async, NULL, 0 );
         reply->options = fd->options;
         release_object( async );
@@ -4401,9 +4827,10 @@ DECL_HANDLER(write)
 
     if (!fd) return;
 
-    if ((async = create_request_async( fd, fd->comp_flags, &req->async, 0 )))
+    if ((async = create_request_async( fd, &req->async, 0 )))
     {
-        fd->fd_ops->write( fd, async, req->pos );
+        if (fd->fd_ops->write) fd->fd_ops->write( fd, async, req->pos );
+        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
         reply->wait = async_handoff( async, &reply->size, 0 );
         reply->options = fd->options;
         release_object( async );
@@ -4420,9 +4847,10 @@ DECL_HANDLER(ioctl)
 
     if (!fd) return;
 
-    if ((async = create_request_async( fd, fd->comp_flags, &req->async, 0 )))
+    if ((async = create_request_async( fd, &req->async, 0 )))
     {
-        fd->fd_ops->ioctl( fd, req->code, async );
+        if (fd->fd_ops->ioctl) fd->fd_ops->ioctl( fd, req->code, async );
+        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
         reply->wait = async_handoff( async, NULL, 0 );
         reply->options = fd->options;
         release_object( async );
@@ -4452,7 +4880,8 @@ DECL_HANDLER(register_async)
 
     if ((fd = get_handle_fd_obj( current->process, req->async.handle, access )))
     {
-        if (get_unix_fd( fd ) != -1 && (async = create_async( fd, current, &req->async, NULL )))
+        if (!fd->fd_ops->queue_async) set_error( STATUS_OBJECT_TYPE_MISMATCH );
+        else if (get_unix_fd( fd ) != -1 && (async = create_async( fd, current, &req->async, NULL )))
         {
             fd->fd_ops->queue_async( fd, async, req->type, req->count );
             release_object( async );
@@ -4487,27 +4916,6 @@ DECL_HANDLER(add_fd_completion)
     {
         if (fd->completion && (req->async || !(fd->comp_flags & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)))
             add_completion( fd->completion, fd->comp_key, req->cvalue, req->status, req->information );
-        release_object( fd );
-    }
-}
-
-/* set fd completion information */
-DECL_HANDLER(set_fd_completion_mode)
-{
-    struct fd *fd = get_handle_fd_obj( current->process, req->handle, 0 );
-    if (fd)
-    {
-        if (is_fd_overlapped( fd ))
-        {
-            if (req->flags & FILE_SKIP_SET_EVENT_ON_HANDLE)
-                set_fd_signaled( fd, 0 );
-            /* removing flags is not allowed */
-            fd->comp_flags |= req->flags & ( FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
-                                           | FILE_SKIP_SET_EVENT_ON_HANDLE
-                                           | FILE_SKIP_SET_USER_EVENT_ON_FAST_IO );
-        }
-        else
-            set_error( STATUS_INVALID_PARAMETER );
         release_object( fd );
     }
 }
@@ -4556,13 +4964,7 @@ DECL_HANDLER(set_fd_name_info)
     if (root_fd) release_object( root_fd );
 }
 
-/* set fd eof information */
-DECL_HANDLER(set_fd_eof_info)
+DECL_HANDLER(unmount_device)
 {
-    struct fd *fd = get_handle_fd_obj( current->process, req->handle, 0 );
-    if (fd)
-    {
-        set_fd_eof( fd, req->eof );
-        release_object( fd );
-    }
+    unmount_device( req->dev );
 }

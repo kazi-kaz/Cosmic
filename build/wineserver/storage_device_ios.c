@@ -48,29 +48,34 @@ static enum server_fd_type storage_file_type( struct fd *fd );
 static void storage_volume_info( struct fd *fd, struct async *async, unsigned int info_class );
 static void storage_ioctl( struct fd *fd, ioctl_code_t code, struct async *async );
 
+/* Wine 11.22: designated initializers; an op left out takes the server default. */
 static const struct object_ops storage_device_ops =
 {
-    sizeof(struct storage_device), &device_type, storage_device_dump,
-    no_add_queue, NULL, NULL, no_satisfied, no_signal, no_get_fd,
-    default_get_sync, default_map_access, default_get_sd, default_set_sd,
-    default_get_full_name, no_lookup_name, directory_link_name,
-    default_unlink_name, storage_device_open, no_kernel_obj_list,
-    no_close_handle, no_destroy
+    .size          = sizeof(struct storage_device),
+    .type          = &device_type,
+    .dump          = storage_device_dump,
+    .get_full_name = default_get_full_name,
+    .open_file     = storage_device_open,
 };
 static const struct object_ops storage_file_ops =
 {
-    sizeof(struct storage_file), &file_type, storage_file_dump,
-    NULL, NULL, NULL, NULL, no_signal, storage_file_get_fd,
-    default_fd_get_sync, default_map_access, default_get_sd, default_set_sd,
-    storage_file_name, no_lookup_name, no_link_name, NULL, no_open_file,
-    no_kernel_obj_list, async_close_obj_handle, storage_file_destroy
+    .size          = sizeof(struct storage_file),
+    .type          = &file_type,
+    .dump          = storage_file_dump,
+    .get_fd        = storage_file_get_fd,
+    .get_sync      = default_fd_get_sync,
+    .get_full_name = storage_file_name,
+    .close_handle  = async_close_obj_handle,
+    .destroy       = storage_file_destroy,
 };
 static const struct fd_ops storage_fd_ops =
 {
-    default_fd_get_poll_events, default_poll_event, storage_file_type,
-    no_fd_read, no_fd_write, no_fd_flush, default_fd_get_file_info,
-    storage_volume_info, storage_ioctl, default_fd_cancel_async,
-    default_fd_queue_async, default_fd_reselect_async
+    .get_fd_type     = storage_file_type,
+    .get_file_info   = default_fd_get_file_info,
+    .get_volume_info = storage_volume_info,
+    .ioctl           = storage_ioctl,
+    .queue_async     = default_fd_queue_async,
+    .reselect_async  = default_fd_reselect_async,
 };
 
 static void storage_device_dump( struct object *obj, int verbose )
@@ -89,7 +94,7 @@ static struct fd *storage_file_get_fd( struct object *obj )
 static WCHAR *storage_file_name( struct object *obj, data_size_t max, data_size_t *len )
 {
     struct storage_file *file = (struct storage_file *)obj;
-    return file->device->obj.ops->get_full_name( &file->device->obj, max, len );
+    return default_get_full_name( &file->device->obj, max, len );
 }
 static enum server_fd_type storage_file_type( struct fd *fd )
 {
@@ -172,8 +177,12 @@ void madeira_storage_device_init( void )
         return;
     }
     storage_name( "\\Device\\Harddisk0", nameW, &name );
-    if (!(device = create_named_object( NULL, &storage_device_ops, &name,
-                                        OBJ_PERMANENT | OBJ_CASE_INSENSITIVE, NULL )))
+    {
+        struct object_params params = { .ops = &storage_device_ops, .name = name,
+                                        .attr = OBJ_PERMANENT | OBJ_CASE_INSENSITIVE };
+        device = create_named_object( &params );
+    }
+    if (!device)
     {
         fprintf( stderr, "[storage-device] v1 cannot create Harddisk0: %#x\n", get_error() );
         return;
@@ -181,7 +190,7 @@ void madeira_storage_device_init( void )
     device->disk.bytes = bytes;
     device->opens = device->ioctls = 0;
     storage_name( "\\??\\PhysicalDrive0", nameW, &name );
-    link = create_obj_symlink( NULL, &name, OBJ_PERMANENT | OBJ_CASE_INSENSITIVE, &device->obj, NULL );
+    link = create_obj_symlink( NULL, name, OBJ_PERMANENT | OBJ_CASE_INSENSITIVE, &device->obj, NULL );
     if (link) release_object( link );
     else fprintf( stderr, "[storage-device] v1 cannot link PhysicalDrive0: %#x\n", get_error() );
     fprintf( stderr, "[storage-device] v1 prefix disk bytes=%llu bus=virtual serial=unavailable "

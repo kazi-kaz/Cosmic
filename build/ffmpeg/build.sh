@@ -12,8 +12,15 @@
 #     MFT/DMO (wmav1, wmav2, wmapro, wmalossless, xma1, xma2), which FAudio
 #     uses for xWMA/XMA voices; MPEG-1 layer I/II/III and plain PCM decoders
 #     for the wg_parser.
-#   - libavformat: the wg_parser's demuxers -- mp3, wav and mov (MP4/MOV/M4A)
-#     -- and the mpegaudio parser the mp3 demuxer selects. No protocols: the
+#   - libavcodec, soft-video (MADEIRA_WG_SOFT_VIDEO, wg_parser_av_ios.c):
+#     the video decoders Apple's VideoToolbox does not have -- wmv1, wmv2,
+#     wmv3 and vc1 (Windows Media Video 7/8/9 and VC-1, the usual ASF/WMV game
+#     video), mpeg1video and mpeg2video (MPEG-1/2 system streams of older
+#     DirectShow titles) -- decoded in software.
+#   - libavformat: the wg_parser's demuxers -- mp3, wav and mov (MP4/MOV/M4A);
+#     soft-video adds asf (ASF/WMV/WMA), mpegps (.mpg) and mpegvideo (raw
+#     .m1v/.m2v) -- and the mpegaudio parser the mp3 demuxer selects, plus the
+#     mpegvideo and vc1 parsers the new demuxers ask for. No protocols: the
 #     parser reads through its own AVIOContext (the PE read thread's pull
 #     protocol), never a URL. No muxers.
 #   - libswresample, libavutil.
@@ -113,8 +120,11 @@ CONFIG_ARGS=(
     --enable-decoder=wmav1,wmav2,wmapro,wmalossless,xma1,xma2
     --enable-decoder=mp1,mp2,mp3
     --enable-decoder=pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le
+    --enable-decoder=wmv1,wmv2,wmv3,vc1,mpeg1video,mpeg2video
     --enable-demuxer=mp3,wav,mov
+    --enable-demuxer=asf,mpegps,mpegvideo
     --enable-parser=mpegaudio
+    --enable-parser=mpegvideo,vc1
     --disable-programs
     --disable-doc
     --disable-network

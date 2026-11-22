@@ -35,7 +35,7 @@ final class GamepadInput: @unchecked Sendable {
         }
     }
 
-    /// Publish player 1 before the game looks (MADEIRA_PAD_EARLY_SLOT=1; default OFF).
+    /// Publish player 1 before the game looks (MADEIRA_PAD_EARLY_SLOT; default ON for a paired pad, see below).
     ///
     /// Some input layers enumerate XInput once at startup and only rescan on a
     /// device-arrival broadcast, which this port does not deliver. Touch slot 0
@@ -48,13 +48,40 @@ final class GamepadInput: @unchecked Sendable {
     /// so player 1 then shows as connected for the whole session even while no
     /// controller is in use. That is why it is opt-in: without the switch,
     /// slot 0 connects only when a real source appears, as before.
+    ///
+    /// early-pad-default (Nov 19): with the switch UNSET, a controller that is
+    /// already paired when the game starts reserves slot 0 too (touch alone
+    /// still needs the switch). A paired pad is about to be used, so "player 1
+    /// connected from the start" is the truth, and games that scan once
+    /// (Sonic Generations: "first state query index=0: not connected", the pad
+    /// connected ~20 s later) then see it. env.MADEIRA_PAD_EARLY_SLOT = 0 turns
+    /// it off; = 1 keeps the old opt-in (touch or paired). Skipped when player 1
+    /// left XInput for a HID pad this session (hid/dualsense/generic, pad-auto).
     @MainActor func reserveSessionSlot(touchControls: Bool) {
-        guard Self.enabled, Self.optIn("MADEIRA_PAD_EARLY_SLOT") else { return }
-        let touch = touchControls && Self.touchEnabled
-        let paired = !GCController.controllers().isEmpty
+        guard Self.enabled else { return }
+        let setting = MadeiraConfig.gameValue("env.MADEIRA_PAD_EARLY_SLOT")
+            ?? MadeiraConfig.get("env.MADEIRA_PAD_EARLY_SLOT")
+            ?? ProcessInfo.processInfo.environment["MADEIRA_PAD_EARLY_SLOT"]
+        if setting == "0" { return }
+        let optedIn = setting == "1"
+        let touch = optedIn && touchControls && Self.touchEnabled
+        let paired = GCController.controllers().contains { $0.extendedGamepad != nil }
         guard touch || paired else { return }
-        queue.async { [self] in touchState.reserved = true; sample() }
-        LogStore.shared.log("[xinput] ml1990 slot=0 reserved for the session touch=\(touch ? 1 : 0) paired=\(paired ? 1 : 0)")
+        let why = optedIn ? "switch" : "paired-default"
+        queue.async { [self] in
+            // A HID session took player 1 off XInput: a reserved XInput slot would be a second pad.
+            if !optedIn, hidActive, !hidKeepsXInput {
+                LogStore.shared.log("[xinput] ml1990 slot=0 not reserved: player 1 is a HID pad this session")
+                return
+            }
+            // Keyboard-and-mouse mode keeps the pad off XInput; a reserved slot would show a pad at rest.
+            if !optedIn, keyboardMouse != nil {
+                LogStore.shared.log("[xinput] ml1990 slot=0 not reserved: controller is in keyboard-and-mouse mode")
+                return
+            }
+            touchState.reserved = true; sample()
+            LogStore.shared.log("[xinput] ml1990 slot=0 reserved for the session touch=\(touch ? 1 : 0) paired=\(paired ? 1 : 0) why=\(why) (env.MADEIRA_PAD_EARLY_SLOT = 0 turns this off)")
+        }
     }
 
     /// ml2100: how player 1 reaches Windows, `env.MADEIRA_PAD_MODE` from
@@ -72,7 +99,89 @@ final class GamepadInput: @unchecked Sendable {
         if let v = MadeiraConfig.gameValue(padModeKey) { return (v.lowercased(), "game") }
         if let v = MadeiraConfig.get(padModeKey), !v.isEmpty { return (v.lowercased(), "cfg") }
         if let v = ProcessInfo.processInfo.environment["MADEIRA_PAD_MODE"], !v.isEmpty { return (v.lowercased(), "env") }
-        return ("xinput", "default")
+        // Nothing chosen: automatic (padAuto), unless env.MADEIRA_PAD_AUTO = 0 keeps XInput.
+        return (padAutoEnabled() ? "auto" : "xinput", "default")
+    }
+
+    /// pad-auto: env.MADEIRA_PAD_AUTO = 0 (the game's own line, madeira.cfg or the process
+    /// environment) turns the automatic Controller API off: nothing chosen is then XInput, as before.
+    static func padAutoEnabled() -> Bool {
+        for v in [MadeiraConfig.gameValue("env.MADEIRA_PAD_AUTO"), MadeiraConfig.get("env.MADEIRA_PAD_AUTO"),
+                  ProcessInfo.processInfo.environment["MADEIRA_PAD_AUTO"]] {
+            if let v, !v.isEmpty { return !["0", "off", "false", "no"].contains(v.lowercased()) }
+        }
+        return true
+    }
+
+    /// pad-auto: the install folder of the game this session starts (a library entry's folder, never
+    /// a folder that holds several games); set by ContentView before beginPadSession, nil when none.
+    static var sessionGameFolder: URL?
+
+    /// pad-auto: the folder of a library entry's launch, the way [exe-window-auto] finds it.
+    static func gameFolder(relativePath: String, startsDirectly: Bool, drive: URL) -> URL? {
+        let parts = relativePath.split(separator: "/").map(String.init)
+        let rel = (!startsDirectly && (parts.last?.lowercased().hasSuffix(".exe") ?? false))
+            ? parts.dropLast().joined(separator: "/") : relativePath
+        let top = (rel.split(separator: "/").last.map(String.init) ?? "").lowercased()
+        if rel.isEmpty || ["common", "steamapps", "steam", "program files", "program files (x86)", "games", "windows", "system32", "syswow64"].contains(top) { return nil }
+        return drive.appendingPathComponent(rel, isDirectory: true)
+    }
+
+    /// pad-auto: whether a game folder wants player 1 as a generic HID gamepad, and why (for the log).
+    /// SDL2.dll / SDL3.dll (case-insensitive, up to three folders down) or a Godot 4 game: a .pck next to
+    /// the program, or the pack appended to an .exe, whose pack format version is 2 or more (Godot 3: 1).
+    /// A folder with FNA.dll or MonoGame.Framework.dll keeps XInput for its SDL2.dll (those games read pads
+    /// through SDL's GameController API, which has no mapping for the generic HID gamepad); Godot 4 still wins.
+    /// Those games read pads through SDL's joystick thread, which XInput slot 0 connecting late never
+    /// reaches (Slay the Spire 2 sees nothing on XInput; the generic HID gamepad works).
+    static func autoPadReason(folder: URL) -> String? {
+        let fm = FileManager.default
+        var found: String?
+        var seen = 0
+        var denied: String?
+        func scan(_ dir: URL, _ depth: Int) {
+            guard found == nil, depth <= 3, seen < 4000,
+                  let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return }
+            for name in names {
+                seen += 1
+                if seen > 4000 { return }
+                let lower = name.lowercased()
+                if lower == "fna.dll" || lower == "monogame.framework.dll" { denied = name }
+                let url = dir.appendingPathComponent(name)
+                if lower == "sdl2.dll" || lower == "sdl3.dll" { found = "\(name) in the game folder"; return }
+                if depth == 0, lower.hasSuffix(".pck"), godotPackVersion(url, appended: false).map({ $0 >= 2 }) == true {
+                    found = "Godot 4 game (\(name))"; return
+                }
+                if depth == 0, lower.hasSuffix(".exe"), godotPackVersion(url, appended: true).map({ $0 >= 2 }) == true {
+                    found = "Godot 4 game (\(name) with its pack inside)"; return
+                }
+                var isDir: ObjCBool = false
+                if depth < 3, fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue { scan(url, depth + 1) }
+                if found != nil { return }
+            }
+        }
+        scan(folder, 0)
+        if let f = found, let d = denied, !f.hasPrefix("Godot") { return "!\(f), but \(d) is there: FNA/MonoGame games keep XInput" }
+        return found
+    }
+
+    /// The Godot pack format version of a .pck file, or of the pack appended to an executable (its last
+    /// 12 bytes: the pack size, then "GDPC"); nil when it is not a Godot pack.
+    static func godotPackVersion(_ url: URL, appended: Bool) -> UInt32? {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        func u32(_ d: Data, _ at: Int) -> UInt32 { (0..<4).reduce(0) { $0 | UInt32(d[d.startIndex + at + $1]) << (8 * UInt32($1)) } }
+        var start: UInt64 = 0
+        if appended {
+            guard let size = try? h.seekToEnd(), size > 12, (try? h.seek(toOffset: size - 12)) != nil,
+                  let tail = try? h.read(upToCount: 12), tail.count == 12, u32(tail, 8) == 0x4350_4447 else { return nil }
+            let packSize = (0..<8).reduce(UInt64(0)) { $0 | UInt64(tail[tail.startIndex + $1]) << (8 * UInt64($1)) }
+            guard packSize > 0, packSize <= size - 12 else { return nil }
+            start = size - 12 - packSize
+        }
+        guard (try? h.seek(toOffset: start)) != nil, let head = try? h.read(upToCount: 8), head.count == 8,
+              u32(head, 0) == 0x4350_4447 else { return nil }
+        return u32(head, 4)
     }
 
     /// ml2106: what of a game's controller output reaches the physical pad
@@ -99,8 +208,22 @@ final class GamepadInput: @unchecked Sendable {
     /// the first Wine process read MADEIRA_HIDPAD to create the device and its
     /// registry entries. In XInput mode it only unsets that and logs.
     @MainActor func beginPadSession() {
-        let mode = Self.configuredPadMode()
+        var mode = Self.configuredPadMode()
         let output = Self.configuredPadOutput()
+        // pad-auto: nothing chosen (or "auto"): a game that reads pads through SDL or Godot 4 gets a
+        // generic HID gamepad, every other game XInput as before. The game's own line, an explicit
+        // xinput and env.MADEIRA_PAD_AUTO = 0 never reach here as "auto".
+        if mode.value == "auto" {
+            let folder = Self.sessionGameFolder
+            if let folder, let why = Self.autoPadReason(folder: folder), !why.hasPrefix("!") {
+                LogStore.shared.log("[pad-auto] picked generic HID: \(why) (env.MADEIRA_PAD_MODE = xinput or env.MADEIRA_PAD_AUTO = 0 keeps XInput)")
+                mode = ("generic", "auto")
+            } else {
+                let denyWhy = folder.flatMap { Self.autoPadReason(folder: $0) }.map { String($0.dropFirst()) }
+                LogStore.shared.log("[pad-auto] picked XInput: \(folder == nil ? "no single game folder for this launch" : denyWhy ?? "no SDL2.dll/SDL3.dll and not a Godot 4 game") (env.MADEIRA_PAD_AUTO = 0 turns this off)")
+                mode = ("xinput", "auto")
+            }
+        }
         unsetenv("MADEIRA_HIDPAD"); unsetenv("MADEIRA_HIDPAD_NAME")
         // An earlier session in this app run may have taken player 1 off XInput.
         queue.async { [self] in hidActive = false; hidKeepsXInput = false }
@@ -154,6 +277,30 @@ final class GamepadInput: @unchecked Sendable {
     /// Documents/madeira.cfg `env.NAME`, else the process environment; only "0" disables.
     static func flag(_ name: String) -> Bool {
         (MadeiraConfig.get("env.\(name)") ?? ProcessInfo.processInfo.environment[name]) != "0"
+    }
+
+    /// nintendo-position (Nov 21): XInput by position for Nintendo pads (Switch Pro,
+    /// Joy-Con). env.MADEIRA_PAD_NINTENDO_POSITION = 0 keeps Apple's label mapping.
+    static let nintendoPositionOn: Bool = flag("MADEIRA_PAD_NINTENDO_POSITION")
+    /// Answer per productCategory string, kept on `queue` (sample() is the only caller).
+    private static var nintendoByCategory = [String: Bool]()
+    static func nintendoPosition(_ controller: GCController?) -> Bool {
+        guard nintendoPositionOn, let category = controller?.productCategory else { return false }
+        if let known = nintendoByCategory[category] { return known }
+        // Switch Pro (and third-party pads in Switch mode) and the Joy-Con pair only:
+        // a single Joy-Con is held sideways and is left on Apple's mapping until tested.
+        let c = category.lowercased()
+        let nintendo = c.contains("switch pro") || c.contains("joy-con (l/r)")
+        nintendoByCategory[category] = nintendo
+        if nintendo {
+            LogStore.shared.log("[xinput] nintendo-position pad=\(category): A/B and X/Y sent by position (env.MADEIRA_PAD_NINTENDO_POSITION = 0 keeps labels)")
+        }
+        return nintendo
+    }
+    /// XInput A 0x1000 <-> B 0x2000, X 0x4000 <-> Y 0x8000.
+    static func swapFaceButtons(_ b: UInt16) -> UInt16 {
+        let rest = b & ~UInt16(0xF000)
+        return rest | ((b & 0x1000) << 1) | ((b & 0x2000) >> 1) | ((b & 0x4000) << 1) | ((b & 0x8000) >> 1)
     }
 
     /// The same sources, for behaviour that is off by default: only "1" enables.
@@ -548,6 +695,11 @@ final class GamepadInput: @unchecked Sendable {
                     (pad.buttonB, 0x2000), (pad.buttonX, 0x4000), (pad.buttonY, 0x8000)
                 ]
                 for (button, mask) in buttons where button?.isPressed == true { state.buttons |= mask }
+                // nintendo-position: Apple names a Nintendo pad's face buttons by their
+                // label (buttonA = the right "A"), Windows games expect XInput A at the
+                // bottom. Swap A/B and X/Y for the game; Madeira's menus keep labels.
+                let labelButtons = state.buttons
+                if Self.nintendoPosition(pad.controller) { state.buttons = Self.swapFaceButtons(state.buttons) }
                 state.left_trigger = Self.trigger(pad.leftTrigger.value)
                 state.right_trigger = Self.trigger(pad.rightTrigger.value)
                 state.lx = Self.axis(pad.leftThumbstick.xAxis.value)
@@ -570,7 +722,8 @@ final class GamepadInput: @unchecked Sendable {
                 // sees a connected pad at rest.
                 if i == 0 {
                     let library = LibraryController.shared
-                    library.sample(buttons: state.buttons, lx: state.lx, ly: state.ly)
+                    library.sample(buttons: labelButtons, lx: state.lx, ly: state.ly, lt: state.left_trigger, rt: state.right_trigger,
+                                   name: pad.controller?.vendorName)
                     if library.ownsInput {
                         state = winios_gamepad()
                         state.connected = 1

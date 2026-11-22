@@ -1,0 +1,97 @@
+Windows/iOS: do a Mono backpatch store that misses the RW alias outside the code invalidation lock
+
+MonoBackpatcherWrite write-owns CodeInvalidationMutex for its store. On iOS
+a store whose RW alias lookup misses goes to the guest's R+X page and
+faults; the ARM64EC access-violation handler then takes
+ThreadCreationMutex. So this thread waits for ThreadCreationMutex while
+holding CodeInvalidationMutex, the reverse of every other path
+(BTCpu64NotifyReadFile, NotifyUnmapViewOfSection, the write-fault path),
+and two threads wait on each other forever.
+
+Seen on 64-bit Unity games stuck loading (Test 12/13 Get Help logs, Nov 13
+2026: Silksong, ULTRAKILL, Cult of the Lamb, Boomerang Fu, PvZ RH, Body
+Pay): "[fexlock] STUCK" on CodeInvalidationMutex with the owner at
+MonoBackpatcherWrite (xtajit64.dll RVA 0x2044c) against
+"RtlpWaitForCriticalSection ... wait timed out" on GetThreadCreationMutex
+(RVA 0x42d858), held by a worker in BTCpu64NotifyReadFile /
+HandleImageUnmap.
+
+On a miss the store now runs after the lock scope ends, as an ordinary
+guest SMC write. A hit still stores to the writable alias under the lock.
+InvalidateGuestCodeRange is unchanged. Off: MADEIRA_MONO_MISS_UNLOCKED=0.
+
+Applies on FEX a77d5687 after 0001, 0002 and 0003 (they do not touch
+Core.cpp). Madeira-only: not for FEX-Emu.
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -3117,6 +3117,36 @@
+ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value) {
+   auto Thread = Frame->Thread;
+   auto CTX = static_cast<ContextImpl*>(Thread->CTX);
++  const auto Store = [Size](uint64_t To, uint64_t V) {
++    if (Size == 8) {
++      *reinterpret_cast<uint64_t*>(To) = V;
++    } else if (Size == 4) {
++      *reinterpret_cast<uint32_t*>(To) = V;
++    } else {
++      ERROR_AND_DIE_FMT("Unexpected write size for backpatcher: {}", Size);
++    }
++  };
++#ifdef FEX_IOS_HOST
++  /* MADEIRA [mono-miss-unlocked]: an alias miss stores AFTER CodeInvalidationMutex is released.
++   *
++   * On a miss the store below goes to the guest's R+X page and faults. The Windows fault handler
++   * (ARM64EC Module.cpp, the access-violation path before HandleRWXAccessViolation) takes
++   * ThreadCreationMutex, so this thread would wait for ThreadCreationMutex while WRITE-owning
++   * CodeInvalidationMutex. Every other path takes them the other way round, ThreadCreationMutex
++   * first (BTCpu64NotifyReadFile, NotifyUnmapViewOfSection, the write-fault path), so two threads
++   * wait on each other forever. Seen on 64-bit Unity games stuck loading (Test 12/13 Sentry logs,
++   * Nov 13 2026: Silksong, ULTRAKILL, Cult of the Lamb, Boomerang Fu, PvZ RH, Body Pay): main
++   * thread "[fexlock]" owner at MonoBackpatcherWrite (xtajit64.dll RVA 0x2044c), waiting on
++   * GetThreadCreationMutex (RVA 0x42d858) held by a worker that waits on CodeInvalidationMutex.
++   * Doing the faulting store outside the lock makes it an ordinary guest SMC write, handled the
++   * same way (and in the same lock order) as any other. A hit still stores to the writable alias
++   * under the lock; that store cannot fault. Off: env.MADEIRA_MONO_MISS_UNLOCKED = 0. */
++  static const bool IosMissUnlocked = [] {
++    const char* V = getenv("MADEIRA_MONO_MISS_UNLOCKED");
++    return !(V && V[0] == '0' && V[1] == 0);
++  }();
++  uint64_t IosMissDest = 0;
++#endif
+   {
+     auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
+ 
+@@ -3141,17 +3171,25 @@
+       Dest = RW;
+     }
+     ios_fex_mono_count_helper(RW ? 0 : 1);
++    if (!RW && IosMissUnlocked) {
++      IosMissDest = Dest; // stored below, once the lock is released
++    }
+ #endif
+ 
+-    if (Size == 8) {
+-      *reinterpret_cast<uint64_t*>(Dest) = Value;
+-    } else if (Size == 4) {
+-      *reinterpret_cast<uint32_t*>(Dest) = Value;
+-    } else {
+-      ERROR_AND_DIE_FMT("Unexpected write size for backpatcher: {}", Size);
++#ifdef FEX_IOS_HOST
++    if (!IosMissDest)
++#endif
++    {
++      Store(Dest, Value);
+     }
+   }
+ 
++#ifdef FEX_IOS_HOST
++  if (IosMissDest) {
++    Store(IosMissDest, Value);
++  }
++#endif
++
+   CTX->SyscallHandler->InvalidateGuestCodeRange(Thread, Address, Size);
+ }
+ 

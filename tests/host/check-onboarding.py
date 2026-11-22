@@ -50,6 +50,7 @@ def block(text, header):
 
 onboarding = (app / 'Onboarding.swift').read_text()
 library = (app / 'Library.swift').read_text()
+settings_pages = (app / 'SettingsPages.swift').read_text()   # One UI (Nov 10): the Settings pages hold the sheets
 content = (app / 'ContentView.swift').read_text()
 project = (root / 'app/Madeira.xcodeproj/project.pbxproj').read_text()
 docs = (root / 'docs/LIBRARY.md').read_text()
@@ -80,7 +81,8 @@ opener = block(model, 'private func open(reason: String, since: Int)')
 require('LibraryModel.shared.current == nil' in opener and 'wine_process_is_running() == 0' in opener and 'guard available' in opener,
         'setup never opens over a running session, or with nothing to set up')
 require('OnboardingRules.steps(signIn: SteamSignIn.isEnabled, dock: MadeiraDock.enabled, localDevVPN: offerLocalDevVPN,\n'
-        '                              wineMono: offerWineMono, vcRedist: offerVCRedist, since: since)' in model,
+        '                              wineMono: offerWineMono, vcRedist: offerVCRedist, since: since,\n'
+        '                              merged: MadeiraConfig.flag("MADEIRA_GET_GAME_PARTS"))' in model,
         'the pages follow the sign-in and Dock switches, whether LocalDevVPN, Wine Mono and the VC++ runtime are here, and the revision seen')
 require(block(model, 'private static func vcRedistOffered()').count('VCRedistModel.enabled') == 1
         and 'offerVCRedist = Self.vcRedistOffered()' in opener,
@@ -97,7 +99,9 @@ require('.fullScreenCover(isPresented: $onboarding.presented) { OnboardingView()
         'Library: setup is presented over the library')
 require('onboarding.presentIfNeeded()' in block(library, 'struct LibraryView: View'),
         'Library: setup is considered when the library appears')
-require(library.count('!onboarding.presented') >= 2, 'Library: controller commands do not act behind setup')
+# One UI (Nov 10): every controller command goes through PadHighlight.handle, which stops while setup is up.
+require('guard !OnboardingModel.shared.presented else { return }' in block((app / 'PadHighlight.swift').read_text(), '    func handle(_ command: String) {'),
+        'Library: controller commands do not act behind setup')
 require('if onboarding.available {' in settings_section and 'onboarding.rerun()' in settings_section,
         'Settings › Steam: Run setup again, hidden with MADEIRA_ONBOARDING=0')
 require('if onboarding.available {' in jit_settings_section and 'onboarding.rerun()' in jit_settings_section,
@@ -105,7 +109,7 @@ require('if onboarding.available {' in jit_settings_section and 'onboarding.reru
 
 # ------------------------------------------------------------------ static: skippable steps
 view = block(onboarding, 'struct OnboardingView: View')
-for page in ['private var signInPage', 'private var dockClientPage', 'private var wineMonoPage', 'private var vcRedistPage']:
+for page in ['private var signInPage', 'private var dockClientPage', 'private var wineMonoPage', 'private var vcRedistPage', 'private var gamePartsPage']:
     require('secondary("Set up later") { model.next() }' in block(view, page), f'{page.split()[-1]}: Set up later')
 require('secondary("Skip setup") { model.skip() }' in block(view, 'private var welcome'), 'welcome: visible Skip setup')
 jit_page = block(view, 'private var jitPage')
@@ -142,9 +146,9 @@ require('dock.prepareClient()' in block(view, 'private var dockClientPage'), "co
 
 # ------------------------------------------------------------------ static: sign-in and tokens
 require('SteamSignInView()' in view and 'open(.steamSignIn)' in settings_section
-        and 'case .steamSignIn: SteamSignInView()' in library, "sign-in through #45's sheet")
+        and 'case .steamSignIn: SteamSignInView()' in settings_pages, "sign-in through #45's sheet")
 require('signIn.signOut()' in settings_section, "sign-out through #45's model")
-require('open(.dock)' in settings_section and 'case .dock: MadeiraDockView(start: startDock)' in library,
+require('open(.dock)' in settings_section and 'case .dock: MadeiraDockView(start: startDock)' in settings_pages,
         "Settings opens Dock's sheet")
 for forbidden in ['SteamTokenStore', 'credentialsForDock', 'refreshToken', 'SecItem', 'kSec', 'accessToken']:
     require(forbidden not in onboarding, f'Onboarding.swift: no {forbidden} (tokens only via the sign-in store)')
@@ -297,8 +301,10 @@ import Foundation
         expect(!R.enabled, "MADEIRA_ONBOARDING=0 in the environment turns setup off")
         unsetenv("MADEIRA_ONBOARDING")
         try! "# notes\nenv.MADEIRA_ONBOARDING = 0\n".write(to: cfg, atomically: true, encoding: .utf8)
+        Thread.sleep(forTimeInterval: 1.1)   // config-stat-throttle: madeira.cfg is re-read at most once a second
         expect(!R.enabled, "env.MADEIRA_ONBOARDING = 0 in madeira.cfg turns setup off")
         try! "env.MADEIRA_ONBOARDING = 1\n".write(to: cfg, atomically: true, encoding: .utf8)
+        Thread.sleep(forTimeInterval: 1.1)   // config-stat-throttle: madeira.cfg is re-read at most once a second
         expect(R.enabled, "env.MADEIRA_ONBOARDING = 1 keeps it on")
         exit(failed == 0 ? 0 : 1)
     }

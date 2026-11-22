@@ -475,6 +475,16 @@ struct WheelAccumulator {
     }
 
     mutating func reset() { x = 0; y = 0 }
+
+    /// What is left of a slow wheel step (under one notch) becomes one notch
+    /// in its direction, when it is big enough not to be sensor noise.
+    mutating func flushRemainder(minimum: Double = 0.3) -> [(flags: UInt32, delta: Int32)] {
+        var out: [(flags: UInt32, delta: Int32)] = []
+        if abs(y) >= minimum { out.append((Self.wheel, y > 0 ? 120 : -120)) }
+        if abs(x) >= minimum { out.append((Self.hwheel, x > 0 ? 120 : -120)) }
+        x = 0; y = 0
+        return out
+    }
 }
 
 /// GCMouse's scroll pad reports the vertical wheel in its first value,
@@ -500,6 +510,22 @@ enum SynthesizedTouch {
 
     static func looksSynthesized(direct: Bool, majorRadius: Double, secondsSinceButton: Double) -> Bool {
         direct && (majorRadius <= fingerRadiusFloor || secondsSinceButton < buttonCoincidence)
+    }
+}
+
+/// iPadOS locks the pointer only for an app running in Full Screen Apps; in
+/// Windowed Apps or Stage Manager it refuses the request, the hidden iPad pointer
+/// wanders off the game's own arrow and reaches the screen edges, where iPadOS
+/// shows its status bar and Control Center. The player is told once per game,
+/// when a request has stood unanswered for `settle` seconds while the app is in
+/// front.
+enum LockRefusedNotice {
+    static let settle = 1.5
+    static let visibleFor = 10.0
+
+    static func shouldShow(enabled: Bool, requested: Bool, locked: Bool, active: Bool,
+                           shownThisGame: Bool) -> Bool {
+        enabled && requested && !locked && active && !shownThisGame
     }
 }
 
@@ -612,11 +638,15 @@ enum PointerRoute: String {
 enum PointerPolicy {
     /// - hiddenAbsolute: MADEIRA_POINTER_HIDDEN_ABSOLUTE; a direct game that hides
     ///   the Windows cursor to draw its own still follows the pointer's position.
+    /// - readsMotion: the program reads mouse motion, not the cursor's position
+    ///   (`MouseReader`): its cursor counts as hidden, unless hiddenAbsolute says
+    ///   it follows the pointer's position on purpose.
     static func cursorShown(desktop: Bool, directEnabled: Bool, reports: UInt32, shown: Bool,
                             routingEnabled: Bool = true, relative: Bool = false,
-                            hiddenAbsolute: Bool = false) -> Bool {
+                            hiddenAbsolute: Bool = false, readsMotion: Bool = false) -> Bool {
         if !routingEnabled { return desktop || (directEnabled && (shown || hiddenAbsolute)) }
         if relative { return false }
+        if readsMotion && !hiddenAbsolute { return false }
         if desktop { return reports == 0 || shown }
         return directEnabled && (shown || hiddenAbsolute)
     }
@@ -629,6 +659,45 @@ enum PointerPolicy {
                       absoluteAllowed: Bool) -> PointerRoute {
         guard focused else { return .blocked }
         return hover && !locked && cursorShown && absoluteAllowed ? .absolute : .relative
+    }
+}
+
+/// How the program in front reads the mouse, as the Wine server reports it
+/// (WINIOS_READER_* in WiniosCursor.h). A program that reads motion turns
+/// with the mouse (mouse-look) and must get relative moves: on an iPad whose
+/// pointer iPadOS does not lock (`actual=0` in the pointer lock line), the iOS
+/// pointer stops at the screen edge, and so did a program that followed its
+/// position, even with its Windows cursor still showing (Counter-Strike 2
+/// keeps its arrow in a match).
+enum MouseReader {
+    /// Raw mouse input without legacy messages, or capturing it (DirectInput
+    /// in exclusive mode).
+    static let rawCapture: UInt32 = 0x1
+    /// A low-level mouse hook. Wine's DirectInput 7 and older keeps one for
+    /// any acquired mouse, exclusive or not, so a game that points with its
+    /// Windows cursor in a menu has one too: it counts only for a game that
+    /// opts in (MADEIRA_POINTER_RAW_LOOK=1), like `raw`.
+    static let llHook: UInt32 = 0x2
+    /// Any raw mouse registration. SDL keeps one only while its relative
+    /// (mouse-look) mode is on, but other engines may keep one in their menus,
+    /// so it counts only for a game that opts in (MADEIRA_POINTER_RAW_LOOK=1).
+    static let raw: UInt32 = 0x4
+
+    /// - enabled: MADEIRA_POINTER_READER (and the mouse-routing fixes);
+    /// - rawLook: MADEIRA_POINTER_RAW_LOOK, the game's own config.
+    static func readsMotion(flags: UInt32, enabled: Bool, rawLook: Bool) -> Bool {
+        guard enabled else { return false }
+        if flags & rawCapture != 0 { return true }
+        return rawLook && flags & (raw | llHook) != 0
+    }
+
+    /// For the log line: "raw-capture+raw", or "cursor" when it reads none.
+    static func describe(_ flags: UInt32) -> String {
+        var parts: [String] = []
+        if flags & rawCapture != 0 { parts.append("raw-capture") }
+        if flags & llHook != 0 { parts.append("ll-hook") }
+        if flags & raw != 0 { parts.append("raw") }
+        return parts.isEmpty ? "cursor" : parts.joined(separator: "+")
     }
 }
 
@@ -661,6 +730,61 @@ enum AutoLock {
     }
 }
 
+/// A game's mouse options (Game details › Controls › Mouse). Read from the session's
+/// environment, which holds madeira.cfg's value with the game's own `env.` line exported
+/// over it, so the defaults here are today's behaviour and nothing changes unless the
+/// player sets one. Read per use: the app sets a game's lines for each launch.
+///
+///   env.MADEIRA_MOUSE_SPEED = 0.1...4          touch-pad, look-zone and pointer motion, 1 = as before
+///   env.MADEIRA_STICK_MOUSE_SPEED = 0.1...4    a controller stick that moves the mouse, 1 = as before
+///   env.MADEIRA_MOUSE_INVERT_Y = 1             look zone, stick and pointer relative motion go the other way up
+///   env.MADEIRA_MOUSE_SWAP_BUTTONS = 1         left and right swap for a real mouse and for touch clicks
+struct MouseTuning: Equatable {
+    static let speedRange = 0.1...4.0
+    var speed = 1.0
+    var stickSpeed = 1.0
+    var invertY = false
+    var swapButtons = false
+
+    init() {}
+
+    init(_ env: (String) -> String?) {
+        func speedValue(_ name: String) -> Double {
+            guard let s = env(name).flatMap({ Double($0.trimmingCharacters(in: .whitespaces)) }), s.isFinite else { return 1.0 }
+            return min(max(s, Self.speedRange.lowerBound), Self.speedRange.upperBound)
+        }
+        func flag(_ name: String) -> Bool {
+            env(name).map { $0.trimmingCharacters(in: .whitespaces) == "1" } ?? false
+        }
+        speed = speedValue("MADEIRA_MOUSE_SPEED")
+        stickSpeed = speedValue("MADEIRA_STICK_MOUSE_SPEED")
+        invertY = flag("MADEIRA_MOUSE_INVERT_Y")
+        swapButtons = flag("MADEIRA_MOUSE_SWAP_BUTTONS")
+    }
+
+    static var current: MouseTuning { MouseTuning { getenv($0).map { String(cString: $0) } } }
+
+    /// Multiplies a vertical motion term: -1 when Y is inverted.
+    var yFactor: Double { invertY ? -1 : 1 }
+
+    /// A pointer event's flags with the left and right button bits exchanged
+    /// (LEFTDOWN 0x2 / LEFTUP 0x4 with RIGHTDOWN 0x8 / RIGHTUP 0x10); anything else is kept.
+    func swapped(_ flags: UInt32) -> UInt32 {
+        guard swapButtons else { return flags }
+        let left = flags & 0x6, right = flags & 0x18
+        return (flags & ~0x1E) | (left << 2) | (right >> 2)
+    }
+
+    func swapped(_ b: MouseButton) -> MouseButton {
+        guard swapButtons else { return b }
+        switch b {
+        case .left: return .right
+        case .right: return .left
+        default: return b
+        }
+    }
+}
+
 // MARK: - Device glue
 
 final class HardwareInput: ObservableObject {
@@ -689,6 +813,21 @@ final class HardwareInput: ObservableObject {
     /// MADEIRA_POINTER_AUTOLOCK=0: the pointer locks only on request, not
     /// while the program hides its cursor (see `AutoLock`).
     static let autoLockEnabled = lockEnabled && flag("MADEIRA_POINTER_AUTOLOCK", defaultOn: true)
+    /// MADEIRA_POINTER_READER=0: how the program reads the mouse is ignored; a
+    /// program that shows its cursor follows the pointer's position even while
+    /// it reads raw or hooked mouse motion (see `MouseReader`).
+    static let readerEnabled = enabled && flag("MADEIRA_POINTER_READER", defaultOn: true)
+    /// MADEIRA_POINTER_LOCK_NOTICE=0: no notice when iPadOS refuses the pointer lock (see `LockRefusedNotice`).
+    /// MADEIRA_LOCK_RETRY=0: do not ask iPadOS again when it drops a pointer lock we still want.
+    static let lockRetryEnabled = lockEnabled && flag("MADEIRA_LOCK_RETRY", defaultOn: true)
+
+    /// MADEIRA_WHEEL_FLUSH=0: a scroll step smaller than one notch is not rounded up to a notch.
+    static let wheelFlushEnabled = flag("MADEIRA_WHEEL_FLUSH", defaultOn: true)
+
+    /// MADEIRA_LOCK_BUTTON=0: no "Mouse lock" row in the Session panel and no "Mouse unlocked" pop-up.
+    static let lockButtonEnabled = lockEnabled && flag("MADEIRA_LOCK_BUTTON", defaultOn: true)
+
+    static let lockNoticeEnabled = lockEnabled && flag("MADEIRA_POINTER_LOCK_NOTICE", defaultOn: true)
 
     /// MADEIRA_MOUSE_ROUTING=0 restores the pre-PR desktop cursor routing,
     /// button callbacks, surface touches and key-window-only pointer lock.
@@ -729,6 +868,28 @@ final class HardwareInput: ObservableObject {
         return String(cString: v) == "1"
     }
 
+    /// MADEIRA_POINTER_RAW_LOOK=1 (a game's own config): while the program has
+    /// raw mouse input registered at all, or a low-level mouse hook (DirectInput
+    /// 7 and older), it reads motion: relative moves, its
+    /// cursor is not drawn and the pointer locks as for a hidden cursor. For an
+    /// SDL game that turns its relative mode on for mouse-look but leaves its
+    /// Windows cursor showing (Counter-Strike 2). Read per use. Default off.
+    static var rawLook: Bool {
+        guard let v = getenv("MADEIRA_POINTER_RAW_LOOK") else { return false }
+        return String(cString: v) == "1"
+    }
+
+    /// MADEIRA_POINTER_LOCK_ON_START=1 (a game's own config): the pointer is
+    /// treated as relative from the start of the game, as if Relative mouse were
+    /// on, so it locks without the game first hiding its cursor. For a game that
+    /// reads mouse-look but never hides the Windows cursor and has no raw input
+    /// for MADEIRA_POINTER_RAW_LOOK to see. From upstream Madeira pull request
+    /// 625 by alantangok. Read per use. Default off.
+    static var lockOnStart: Bool {
+        guard let v = getenv("MADEIRA_POINTER_LOCK_ON_START") else { return false }
+        return String(cString: v) == "1"
+    }
+
     /// The desktop's live size in guest pixels (IOSDisplayShim): the session
     /// default until a program changes the display mode, which resizes it.
     private static func desktopSize() -> (w: Int, h: Int) {
@@ -750,6 +911,19 @@ final class HardwareInput: ObservableObject {
     /// iPhone: a mouse enumerated but nothing came out of it in 10 s. Raised
     /// once per session, dismissable, cleared the instant a delta lands.
     @Published private(set) var assistiveTouchHint = false
+    /// iPad: iPadOS refused the pointer lock (`LockRefusedNotice`). Raised once
+    /// per game, gone after a few seconds or as soon as the lock is granted.
+    @Published private(set) var lockRefusedHint = false
+    /// We want the pointer locked, the app is in front, and iPadOS still has not
+    /// locked it after the automatic retries. Drives the pop-up and the panel row.
+    @Published private(set) var lockDropped = false
+    func setLockDropped(_ on: Bool) {
+        guard Self.lockButtonEnabled, on != lockDropped else { return }
+        lockDropped = on
+        log("pointer lock dropped: \(on ? "shown to the player" : "cleared")")
+    }
+    private var lockRefusedShown = false
+    private var lockRefusedGeneration = 0
 
     /// Which path is carrying the mouse. Pointer lock is correct for `.gcmouse`
     /// and fatal for `.uikit` (`prefersPointerLocked` is exactly the switch
@@ -810,6 +984,10 @@ final class HardwareInput: ObservableObject {
 
     private var cursorState = winios_direct_cursor_state()
     private var cursorHiddenSince: CFTimeInterval = 0
+    /// Mouse-reader changes logged so far (the first 40 are).
+    private var readerLogCount = 0
+    /// The pointer left the game view and a motion reader kept the mouse (logged once).
+    private var readerKeptLogged = false
     private var lastReportAt: CFTimeInterval = 0
     /// The mouse (or the right-stick mouse) is being used; a finger on the game
     /// view clears it. The drawn cursor shows only while this is true.
@@ -839,6 +1017,10 @@ final class HardwareInput: ObservableObject {
     private let motionLock = NSLock()
     private var carry = MotionCarry()
     private var wheel = WheelAccumulator()
+    private var scrollSeq: UInt64 = 0
+    private var auxTraceCount = 0
+    private var scrollRawLogged = 0
+    private var lastNotchAt: CFTimeInterval = 0
     /// `currentRoute`, for the mouse queue.
     private var route: PointerRoute = .relative
     private var mouseInUseMirror = false
@@ -894,7 +1076,7 @@ final class HardwareInput: ObservableObject {
         log("enabled=\(Self.enabled ? 1 : 0) focus=\(Self.focusEnabled ? 1 : 0) "
             + "cursor=\(Self.directCursorEnabled ? 1 : 0) absolute=\(Self.absoluteEnabled ? 1 : 0) "
             + "lock=\(Self.lockEnabled ? 1 : 0) autolock=\(Self.autoLockEnabled ? 1 : 0) "
-            + "mouse-routing=\(Self.mouseRoutingEnabled ? 1 : 0)")
+            + "mouse-routing=\(Self.mouseRoutingEnabled ? 1 : 0) reader=\(Self.readerEnabled ? 1 : 0)")
         log("phone pointer: \(String(cString: madeira_phone_pointer_status())) lock-available=\(Self.pointerLockAvailable ? 1 : 0)")
         guard Self.enabled else { return }
         appActive = UIApplication.shared.applicationState == .active
@@ -937,6 +1119,7 @@ final class HardwareInput: ObservableObject {
         }
         nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             self?.appActive = true
+            if Self.lockRetryEnabled { PointerLock.appBecameActive() }
             self?.refreshFocus("app active")
         }
         // Not on memory warnings: games here run close to the memory limit and
@@ -1038,8 +1221,17 @@ final class HardwareInput: ObservableObject {
         // against a screen edge, while GCMouse deltas keep coming; following
         // hover there dropped mouse-look at every edge. Clicks decide instead.
         let over = hoverSeen && !Self.isPhone ? pointerOver : clickFocus.onGame
-        let mouse = base && (!Self.focusEnabled || pointerLocked || over || !gameButtons.isEmpty)
+        // iPad: a program that reads mouse motion keeps the mouse when the free
+        // pointer leaves the game view (a letterbox bar, the screen edge) while
+        // iPadOS refuses the lock; the hover exit blocked every delta there
+        // ("pointer route: blocked" at each edge, CS2 on an iPad Pro M5).
+        let mouse = base && (!Self.focusEnabled || pointerLocked || readsMotion || over || !gameButtons.isEmpty)
+        if mouse && readsMotion && !over && !pointerLocked && !readerKeptLogged {
+            readerKeptLogged = true
+            log("mouse kept off the game view: the program reads mouse motion (\(why))")
+        }
         baseFocused = base
+        if base && relockPending { relockPending = false; DispatchQueue.main.async { PointerLock.relockNow() } }
         updateButtonPolling(active: Self.mouseRoutingEnabled && appActive && mouseConnected)
         if keyboard != keyboardFocused {
             keyboardFocused = keyboard
@@ -1191,7 +1383,7 @@ final class HardwareInput: ObservableObject {
             // Post the modifier BEFORE the other key, even though Windows VK
             // sort order places e.g. A before LWIN.
             let wanted = keysPosted.down.union(deferredCommands.intersection(keys.wanted(focused: keyboardFocused)))
-            for command in keysPosted.update(wanted).down { winios_post_key(command, 1) }
+            for command in keysPosted.update(wanted).down { winios_post_key(postedKey(command), 1) }
             deferredCommands.removeAll()
         }
         if pressed, keyboardFocused, Self.pointerLockAvailable,
@@ -1207,8 +1399,14 @@ final class HardwareInput: ObservableObject {
 
     private func syncKeys() {
         let edges = keysPosted.update(keys.wanted(focused: keyboardFocused).subtracting(deferredCommands))
-        for vk in edges.up { winios_post_key(vk, 0) }
-        for vk in edges.down { winios_post_key(vk, 1) }
+        for vk in edges.up { winios_post_key(postedKey(vk), 0) }
+        for vk in edges.down { winios_post_key(postedKey(vk), 1) }
+    }
+
+    /// Command as Control on the Wine desktop, when the setting says so (DesktopKeys). The same mapping
+    /// posts a key's press and its release, so a held Command is never left down as Windows' key.
+    private func postedKey(_ vk: Int32) -> Int32 {
+        DesktopKeys.postedKey(vk, commandIsControl: InputSettings.shared.commandIsControl && LibraryModel.shared.activeEntry?.desktop == true)
     }
 
     /// Read only in response to an explicit paste gesture, never on a timer.
@@ -1311,7 +1509,7 @@ final class HardwareInput: ObservableObject {
         }
         m.scroll.valueChangedHandler = { [weak self] _, x, y in
             let wheel = GCMouseWheel.axes(Double(x), Double(y))
-            self?.scrolled(wheel.dx, wheel.dy)
+            self?.scrolled(wheel.dx, wheel.dy, flush: true)
         }
         noteMousePresent()
         if fresh {
@@ -1418,6 +1616,11 @@ final class HardwareInput: ObservableObject {
     }
 
     private func traceButton(_ source: String, _ detail: String) {
+        // X1/X2 (mouse 4/5): stamp every edge so the log shows how long iPadOS says they were held.
+        if detail.hasPrefix("b=3") || detail.hasPrefix("b=4"), auxTraceCount < 60 {
+            auxTraceCount += 1
+            log("aux button \(source) t=\(Int(CACurrentMediaTime() * 1000) % 100000)ms: \(detail)")
+        }
         rawButtonTraceCount += 1
         if rawButtonTraceCount <= 80 || (InputSettings.shared.diagnostics && rawButtonTraceCount % 100 == 0) {
             log("button \(source) #\(rawButtonTraceCount): \(detail)")
@@ -1469,9 +1672,10 @@ final class HardwareInput: ObservableObject {
     /// and the same carry. Callable from either queue.
     private func postMotion(_ dx: Double, _ dy: Double) {
         // One aligned Double read of a value only the slider writes.
-        let gain = InputSettings.shared.sensMouse
+        let tuning = MouseTuning.current
+        let gain = InputSettings.shared.sensMouse * tuning.speed
         motionLock.lock()
-        let d = carry.add(dx, dy, gain: gain)
+        let d = carry.add(dx, dy * tuning.yFactor, gain: gain)
         motionLock.unlock()
         postRelative(d.dx, d.dy)
     }
@@ -1628,17 +1832,44 @@ final class HardwareInput: ObservableObject {
     }
 
     private func syncButtons() {
-        let edges = buttonsPosted.update(gameButtons)
+        let tuning = MouseTuning.current
+        let edges = buttonsPosted.update(Set(gameButtons.map { tuning.swapped($0) }))
         for b in edges.up { let e = b.event(down: false); winios_pointer(0, 0, e.flags, e.data) }
         for b in edges.down { let e = b.event(down: true); winios_pointer(0, 0, e.flags, e.data) }
     }
 
     /// Reached from the mouse queue (GCMouse scroll) and from main (UIKit,
     /// which only scrolls a view the pointer is over).
-    private func scrolled(_ x: Double, _ y: Double) {
+    private func scrolled(_ x: Double, _ y: Double, flush: Bool = false) {
         motionLock.lock()
         let blocked = route == .blocked
         let notches = blocked ? [] : wheel.add(x, y)
+        tickWheel += notches.count
+        scrollSeq &+= 1
+        let seq = scrollSeq
+        let left = (wheel.x != 0 || wheel.y != 0)
+        let nowT = CACurrentMediaTime()
+        if !notches.isEmpty { lastNotchAt = nowT }
+        let quiet = nowT - lastNotchAt > 0.25
+        var logN = 0
+        if scrollRawLogged < 20 { scrollRawLogged += 1; logN = scrollRawLogged }
+        motionLock.unlock()
+        if logN > 0 { log("raw scroll #\(logN): x=\(x) y=\(y) -> \(notches.count) notch(es)") }
+        for n in notches { winios_pointer(0, 0, n.flags, UInt32(bitPattern: n.delta)) }
+        if !notches.isEmpty { bumpTicker() }
+        // A wheel step smaller than one notch used to wait for the next step,
+        // so one slow click did nothing. If nothing follows, send it now.
+        if Self.wheelFlushEnabled, flush, quiet, notches.isEmpty, left, !blocked {
+            mouseQueue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.flushScroll(ifSeq: seq)
+            }
+        }
+    }
+
+    private func flushScroll(ifSeq seq: UInt64) {
+        motionLock.lock()
+        guard scrollSeq == seq, route != .blocked else { motionLock.unlock(); return }
+        let notches = wheel.flushRemainder()
         tickWheel += notches.count
         motionLock.unlock()
         for n in notches { winios_pointer(0, 0, n.flags, UInt32(bitPattern: n.delta)) }
@@ -1647,11 +1878,18 @@ final class HardwareInput: ObservableObject {
 
     // MARK: - route, drawn cursor and automatic lock
 
+    /// The program reads mouse motion, whatever its cursor shows (`MouseReader`).
+    private var readsMotion: Bool {
+        MouseReader.readsMotion(flags: cursorState.reader,
+                                enabled: Self.readerEnabled && Self.mouseRoutingEnabled,
+                                rawLook: Self.rawLook)
+    }
+
     private var cursorShownForRoute: Bool {
         PointerPolicy.cursorShown(desktop: Self.desktopMode, directEnabled: Self.directCursorEnabled,
                                   reports: cursorState.reports, shown: cursorState.shown != 0,
-                                  routingEnabled: Self.mouseRoutingEnabled, relative: InputSettings.shared.relative,
-                                  hiddenAbsolute: Self.hiddenCursorAbsolute)
+                                  routingEnabled: Self.mouseRoutingEnabled, relative: InputSettings.shared.relative || Self.lockOnStart,
+                                  hiddenAbsolute: Self.hiddenCursorAbsolute, readsMotion: readsMotion)
     }
 
     private func updateRoute() {
@@ -1698,13 +1936,23 @@ final class HardwareInput: ObservableObject {
         let now = CACurrentMediaTime()
         lastReportAt = now
         if cursorState.image_serial != before.image_serial { DirectCursorOverlay.shared.loadImage() }
-        if before.reports == 0 || cursorState.shown != before.shown {
-            cursorHiddenSince = cursorState.shown != 0 ? 0 : now
+        let readerChanged = cursorState.reader != before.reader
+        if readerChanged {
+            readerLogCount += 1
+            if readerLogCount <= 40 {
+                log("program reads the mouse by: \(MouseReader.describe(cursorState.reader)) "
+                    + "(motion=\(readsMotion ? 1 : 0) rawLook=\(Self.rawLook ? 1 : 0))")
+            }
+        }
+        if before.reports == 0 || cursorState.shown != before.shown || readerChanged {
+            if before.reports == 0 || cursorState.shown != before.shown {
+                cursorHiddenSince = cursorState.shown != 0 ? 0 : now
+            }
             if cursorState.shown != before.shown {
                 autoLockSuppressed = false
                 log("program cursor \(cursorState.shown != 0 ? "shown" : "hidden")")
             }
-            refreshFocus("program cursor")
+            refreshFocus(readerChanged ? "mouse reader" : "program cursor")
         } else {
             updateAutoLock()
             renderCursor()
@@ -1713,7 +1961,9 @@ final class HardwareInput: ObservableObject {
 
     private func renderCursor() {
         guard directCursorLive else { return }
-        let visible = mouseInUse && mouseFocused && cursorState.shown != 0
+        // A program reading motion is turning, not pointing: its arrow (if it
+        // leaves one up) is not where anything happens.
+        let visible = mouseInUse && mouseFocused && cursorState.shown != 0 && !readsMotion
         let pos = lastAbsolute ?? (x: cursorState.x, y: cursorState.y)
         DirectCursorOverlay.shared.render(visible: visible, x: pos.x, y: pos.y)
     }
@@ -1728,9 +1978,12 @@ final class HardwareInput: ObservableObject {
         let now = CACurrentMediaTime()
         motionLock.lock(); let lastDelta = lastGCDeltaAt; motionLock.unlock()
         // Adapted from BCD dd2fe9c (2026-10-27): relative mode need not report a hidden cursor.
-        let relative = Self.mouseRoutingEnabled && InputSettings.shared.relative
-        let shown = !relative && cursorState.shown != 0
-        let hiddenFor = relative ? AutoLock.hiddenDelay
+        let relative = Self.mouseRoutingEnabled && (InputSettings.shared.relative || Self.lockOnStart)
+        // A program that reads mouse motion (`MouseReader`) is captured like one
+        // that hides its cursor, whatever its cursor shows.
+        let motion = relative || readsMotion
+        let shown = !motion && cursorState.shown != 0
+        let hiddenFor = motion ? AutoLock.hiddenDelay
             : (cursorState.reports == 0 || cursorHiddenSince == 0 ? 0 : now - cursorHiddenSince)
         let sinceReport = Self.mouseRoutingEnabled && (Self.desktopMode || relative)
             ? 0 : (lastReportAt == 0 ? .infinity : now - lastReportAt)
@@ -1742,7 +1995,8 @@ final class HardwareInput: ObservableObject {
             sinceMotion: lastDelta == 0 ? .infinity : now - lastDelta)
         switch action {
         case .lock where !autoLockSuppressed:
-            setPointerLocked(true, byUs: true, why: relative ? "relative pointer mode" : "the program hides its cursor")
+            setPointerLocked(true, byUs: true, why: relative ? "relative pointer mode"
+                             : readsMotion ? "the program reads mouse motion" : "the program hides its cursor")
         case .unlock:
             setPointerLocked(false, byUs: true, why: shown ? "the program shows its cursor"
                              : baseFocused ? "the program stopped reporting" : "focus lost")
@@ -1873,6 +2127,38 @@ final class HardwareInput: ObservableObject {
         log("assistive-touch hint dismissed")
     }
 
+    /// A new game starts: its own once-per-game notices may show again.
+    func gameSessionStarted() {
+        lockDropped = false
+        relockPending = false
+        PointerLock.resetRetries()
+        lockRefusedShown = false
+        lockRefusedHint = false
+    }
+
+    /// PointerLock: a request has stood for `LockRefusedNotice.settle` seconds.
+    func systemLockSettled(requested: Bool, locked: Bool, active: Bool) {
+        if locked { dismissLockRefusedHint("the lock was granted"); return }
+        guard !Self.isPhone else { return }   // iPhone has no lockable pointer (AssistiveTouch)
+        guard LockRefusedNotice.shouldShow(enabled: Self.lockNoticeEnabled, requested: requested, locked: locked,
+                                           active: active, shownThisGame: lockRefusedShown) else { return }
+        lockRefusedShown = true
+        lockRefusedHint = true
+        lockRefusedGeneration += 1
+        let generation = lockRefusedGeneration
+        log("pointer lock refused notice shown: iPadOS did not lock the pointer (it locks only in Full Screen Apps)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + LockRefusedNotice.visibleFor) { [weak self] in
+            guard let self, self.lockRefusedGeneration == generation else { return }
+            self.dismissLockRefusedHint("timed out")
+        }
+    }
+
+    func dismissLockRefusedHint(_ why: String = "dismissed") {
+        guard lockRefusedHint else { return }
+        lockRefusedHint = false
+        log("pointer lock refused notice hidden (\(why))")
+    }
+
     // MARK: - UIKit pointer: position (every path) and the indirect-pointer fallback
     //
     // Hover and pointer-drag positions drive the absolute route and pointer
@@ -1975,6 +2261,15 @@ final class HardwareInput: ObservableObject {
 
     /// The lock button and Ctrl+Alt+P. Releasing an automatic lock keeps it
     /// off until the program's cursor next changes visibility.
+    /// "Lock again": the lock we want already stands in `pointerLocked`; iPadOS dropped it.
+    func relockMouse() {
+        guard mouseConnected, pointerLocked else { return }
+        // With the Session panel open the program has no focus and no lock is wanted:
+        // do it when focus returns (the panel closes).
+        if baseFocused { PointerLock.relockNow() } else { relockPending = true }
+    }
+    private var relockPending = false
+
     func togglePointerLock(why: String = "toggle") {
         if pointerLocked {
             if lockedByUs { autoLockSuppressed = true }
@@ -2003,6 +2298,7 @@ final class HardwareInput: ObservableObject {
             want = false
         }
         guard want != pointerLocked else { return }
+        if !want { setLockDropped(false) }
         pointerLocked = want
         lockedByUs = want && byUs
         PointerLock.refresh()
@@ -2137,14 +2433,94 @@ enum PointerLock {
             if !observing {
                 observing = true
                 NotificationCenter.default.addObserver(forName: UIPointerLockState.didChangeNotification,
-                                                       object: nil, queue: .main) { _ in reportState("changed") }
+                                                       object: nil, queue: .main) { _ in
+                    reportState("changed")
+                    retryIfDropped("changed")
+                    if (MetalBackedView.keyboardTarget?.window?.windowScene ?? lastScene)?.pointerLockState?.isLocked == true {
+                        HardwareInput.shared.dismissLockRefusedHint("the lock was granted")
+                    }
+                }
             }
             for root in controllers {
                 if request { install(on: root) }
                 root.setNeedsUpdateOfPrefersPointerLocked()
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { reportState("request") }
+            if request {
+                DispatchQueue.main.asyncAfter(deadline: .now() + LockRefusedNotice.settle) { settle() }
+            }
         }
+    }
+
+    /// The request has had time to take. Only the lock's own answer counts:
+    /// iPadOS grants or refuses it, and a refusal is what the notice is for.
+    private static var retryCount = 0
+    private static var lockedSince: CFTimeInterval?
+    static func resetRetries() { retryCount = 0; lockedSince = nil }
+
+    /// iPadOS dropped a lock we still want (log: "requested=1 actual=0 ... active=true"
+    /// and nothing asked again, because `refresh` skips an unchanged request).
+    /// Ask again a few times, then leave it to the refused-lock notice.
+    static func retryIfDropped(_ why: String) {
+        guard HardwareInput.lockRetryEnabled, HardwareInput.mouseRoutingEnabled else { return }
+        guard let scene = MetalBackedView.keyboardTarget?.window?.windowScene ?? lastScene else { return }
+        if scene.pointerLockState?.isLocked == true {
+            HardwareInput.shared.setLockDropped(false)
+            // Count the tries as spent again only after the lock has held for a while.
+            if lockedSince == nil {
+                let stamp = CACurrentMediaTime()
+                lockedSince = stamp
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    if lockedSince == stamp, scene.pointerLockState?.isLocked == true { retryCount = 0 }
+                }
+            }
+            return
+        }
+        lockedSince = nil
+        if !HardwareInput.shared.pointerLocked { HardwareInput.shared.setLockDropped(false); return }
+        guard wanted else { return }   // panel open or app away: keep what we show
+        if scene.activationState == .foregroundActive, retryCount >= 4 {
+            HardwareInput.shared.setLockDropped(true)
+            return
+        }
+        guard scene.activationState == .foregroundActive else { return }
+        retryCount += 1
+        let n = retryCount
+        let delay = [0.3, 0.8, 1.6, 3.0][n - 1]
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard wanted, let scene = MetalBackedView.keyboardTarget?.window?.windowScene ?? lastScene,
+                  scene.activationState == .foregroundActive, scene.pointerLockState?.isLocked != true else { return }
+            for root in roots.compactMap(\.controller) where root.viewIfLoaded?.window?.windowScene === scene {
+                root.setNeedsUpdateOfPrefersPointerLocked()
+            }
+            fputs("[hwinput] pointer lock re-requested (\(why), try \(n))\n", stderr)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { retryIfDropped("retry") }
+        }
+    }
+
+    /// The player pressed "Lock again": forget the retry history and ask afresh.
+    static func relockNow() {
+        retryCount = 0
+        lastWanted = nil
+        for root in roots.compactMap(\.controller) { root.setNeedsUpdateOfPrefersPointerLocked() }
+        refresh()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { retryIfDropped("button") }
+    }
+
+    /// The app became active again: forget what was last asked so the next refresh asks afresh.
+    static func appBecameActive() {
+        retryCount = 0
+        lastWanted = nil
+        refresh()
+        // iPadOS may refuse quietly on return, with no change notification.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { retryIfDropped("app active") }
+    }
+
+    private static func settle() {
+        guard let scene = MetalBackedView.keyboardTarget?.window?.windowScene ?? lastScene else { return }
+        HardwareInput.shared.systemLockSettled(requested: wanted,
+                                               locked: scene.pointerLockState?.isLocked == true,
+                                               active: scene.activationState == .foregroundActive)
     }
 
     private static func install(on root: UIViewController) {
@@ -2181,6 +2557,13 @@ enum PointerLock {
     }
 }
 
+extension LockRefusedNotice {
+    /// Shown on the game (LibraryHUD) and in the developer layout's pointer row.
+    static var text: String {
+        L("Mouse leaving the game? In iPad Settings > Multitasking & Gestures, choose Full Screen Apps.")
+    }
+}
+
 /// Shared with the Wine driver and desktop compositor; use the same cfg
 /// precedence and startup snapshot as the Swift routing policy.
 @_cdecl("winios_mouse_routing_enabled")
@@ -2200,7 +2583,7 @@ private enum LegacyPointerLock {
     }
 
     private static func keyWindow() -> UIWindow? {
-        UIApplication.shared.connectedScenes
+        UIApplication.shared.phoneScenes
             .compactMap { $0 as? UIWindowScene }
             .flatMap { $0.windows }
             .first { $0.isKeyWindow }
@@ -2583,12 +2966,13 @@ final class PadStickMouse: ObservableObject {
         // Keyboard-and-mouse controller mode (PadKeyboardMouse) owns the stick:
         // moving the mouse here as well would double it.
         guard let p = profile, HardwareInput.shared.baseFocused, !GamepadInput.shared.keyboardMouseOn else { return }
+        let tuning = MouseTuning.current
         let f = StickVelocity.frame(x: Double(p.rightThumbstick.xAxis.value),
                                     y: Double(p.rightThumbstick.yAxis.value),
-                                    gain: InputSettings.shared.sensRel,
+                                    gain: InputSettings.shared.sensRel * tuning.stickSpeed,
                                     dt: l.targetTimestamp - l.timestamp)
         guard f.dx != 0 || f.dy != 0 else { return }
-        let d = carry.add(f.dx, f.dy, gain: 1)
+        let d = carry.add(f.dx, f.dy * tuning.yFactor, gain: 1)
         guard d.dx != 0 || d.dy != 0 else { return }
         HardwareInput.shared.stickMoved()
         HardwareInput.shared.postRelative(d.dx, d.dy)
@@ -2610,7 +2994,8 @@ struct HardwareInputSettings: View {
     @ObservedObject private var input = InputSettings.shared
 
     var body: some View {
-        if HardwareInput.enabled && (hw.assistiveTouchHint || open && (hw.mouseConnected || pad.controllerConnected)) {
+        if HardwareInput.enabled && (hw.assistiveTouchHint || hw.lockRefusedHint
+                                     || open && (hw.mouseConnected || pad.controllerConnected)) {
             VStack(alignment: .leading, spacing: 4) {
                 if open && hw.mouseConnected {
                     HStack(spacing: 8) {
@@ -2633,6 +3018,12 @@ struct HardwareInputSettings: View {
                     }
                 }
                 if hw.assistiveTouchHint { hint }
+                if hw.lockRefusedHint {
+                    Text(LockRefusedNotice.text)
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding(.horizontal, 8)
             .padding(.bottom, 4)
@@ -2680,6 +3071,56 @@ struct HardwareInputSettings: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Dismiss")
+        }
+    }
+}
+
+
+/// Session panel row: shows whether the mouse lock was lost and lets the player
+/// lock again. Own file so the settings-regroup tabs only add one call line.
+/// Hidden when no mouse is connected, the lock is unavailable, or MADEIRA_LOCK_BUTTON=0.
+struct MouseLockRow: View {
+    @ObservedObject private var hw = HardwareInput.shared
+
+    var body: some View {
+        if HardwareInput.lockButtonEnabled && HardwareInput.pointerLockAvailable && hw.mouseConnected && hw.mousePath == .gcmouse && hw.pointerLocked {
+            HStack {
+                Text(L("Mouse lock"))
+                if hw.lockDropped {
+                    Text(L("Lost")).font(.caption).foregroundColor(.red)
+                        .padding(.horizontal, 8).padding(.vertical, 2)
+                        .background(Color.red.opacity(0.15), in: Capsule())
+                } else if hw.pointerLocked {
+                    Text(L("On")).font(.caption).foregroundColor(.secondary)
+                }
+                Spacer()
+                Button(L("Lock again")) {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    HardwareInput.shared.relockMouse()
+                }
+            }
+        }
+    }
+}
+
+/// Pop-up on the game when the lock was lost and the automatic retries failed.
+/// One tap re-locks. Fades by itself when the lock comes back.
+struct MouseLockToast: View {
+    @ObservedObject private var hw = HardwareInput.shared
+
+    var body: some View {
+        if HardwareInput.lockButtonEnabled && hw.lockDropped && hw.mouseConnected {
+            Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                HardwareInput.shared.relockMouse()
+            } label: {
+                Label(L("Mouse unlocked · Tap to lock"), systemImage: "computermouse")
+                    .font(.callout)
+                    .padding(.horizontal, 16).padding(.vertical, 10)
+                    .background(.regularMaterial, in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .transition(.opacity)
         }
     }
 }

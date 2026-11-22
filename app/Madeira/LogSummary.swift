@@ -41,6 +41,10 @@ enum LogSummary {
         "steamerrorreporter.exe", "steamerrorreporter64.exe", "steamservice.exe",
         "vulkandriverquery.exe", "vulkandriverquery64.exe", "gldriverquery.exe",
         "gldriverquery64.exe", "crs-handler.exe", "rundll32.exe", "start.exe",
+        // (log-fixes) crash reporters and anti-cheat services: never the game (Sentry, Nov 9:
+        // 10 of 97 reports named one of these instead of the game).
+        "unitycrashhandler64.exe", "unitycrashhandler32.exe", "pnkbstra.exe", "pnkbstrb.exe",
+        "crashreportclient.exe", "crashpad_handler.exe", "werfault.exe",
     ]
 
     struct Process {
@@ -148,6 +152,7 @@ enum LogSummary {
 
         mutating func feed(_ raw: String) {
             let line = raw.hasSuffix("\r") ? String(raw.dropLast()) : raw
+            if line.contains("] [flight] ") { return }   // (flight-recorder) Wine's copied traces are no new facts (literal = FlightRecorder.tag, so check-help-report needs no LogTrail.swift)
             if let time = LogSummary.timestamp(line) {
                 if facts.firstTime == nil { facts.firstTime = time }
                 facts.lastTime = time

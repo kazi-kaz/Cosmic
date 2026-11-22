@@ -49,7 +49,7 @@ enum LoopbackProbe {
         var isLocalDevVPN: Bool { isVPN && address.hasPrefix("10.7.") }
     }
 
-    private static func target() -> sockaddr_in? {
+    private static func target(port: UInt16 = LoopbackProbe.port) -> sockaddr_in? {
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
@@ -100,8 +100,9 @@ enum LoopbackProbe {
     }
 
     /// Blocks for at most `timeout`; use `check(timeout:completion:)` from the main thread.
-    /// `requireVPN` is false only for host tests, whose listeners are on lo0.
-    static func check(timeout: TimeInterval = 0.4, requireVPN: Bool = true) -> Result {
+    /// `requireVPN` is false only for host tests, whose listeners are on lo0. `port` is lockdownd's
+    /// (62078) unless a caller asks about another port on the same address (the JIT port, 49152).
+    static func check(timeout: TimeInterval = 0.4, requireVPN: Bool = true, port: UInt16 = LoopbackProbe.port) -> Result {
         let start = CFAbsoluteTimeGetCurrent()
         func done(_ ok: Bool, _ detail: String) -> Result {
             Result(reachable: ok, milliseconds: (CFAbsoluteTimeGetCurrent() - start) * 1000, detail: detail)
@@ -111,7 +112,7 @@ enum LoopbackProbe {
         if requireVPN, !route.isLocalDevVPN {
             return done(false, "routed via \(route.interface) \(route.address): another VPN, not LocalDevVPN")
         }
-        guard var addr = target() else { return done(false, "bad address") }
+        guard var addr = target(port: port) else { return done(false, "bad address") }
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else { return done(false, "socket: \(String(cString: strerror(errno)))") }
         defer { close(fd) }

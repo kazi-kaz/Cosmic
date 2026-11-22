@@ -74,11 +74,14 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(environ);
 
+DWORD pid = 0;
 PEB *peb = NULL;
 WOW_PEB *wow_peb = NULL;
 USHORT *uctable = NULL, *lctable = NULL;
 SIZE_T startup_info_size = 0;
 BOOL is_prefix_bootstrap = FALSE;
+ULONG session_id = 0;
+ULONG64 mitigation_options[2] = { 0 };
 
 static const WCHAR bootstrapW[] = {'W','I','N','E','B','O','O','T','S','T','R','A','P','M','O','D','E'};
 
@@ -100,23 +103,27 @@ const WCHAR system_dir[] = {'\\','?','?','\\','C',':','\\','w','i','n','d','o','
 
 static CPTABLEINFO unix_cp = { CP_UTF8, 4, '?', 0xfffd, '?', '?' };
 
-/* NLS-EXTRA, opt-in: env.MADEIRA_NLS_EXTRA = 1 lets a code page table that is missing from nls/ be taken from
- * nls/extra/<name>.nls (Wine's own c_932, c_936, c_949, c_950, c_874, c_1250 ... c_1258, when the bundle carries them
- * there). Without the switch such a request fails as it always did (NtGetNlsSectionPtr returns
- * STATUS_OBJECT_NAME_NOT_FOUND, so GetCPInfo and MultiByteToWideChar fail for that code page). Many programs, the Steam
- * client among them, ask for these pages and cope without them, so the extra tables are offered only to a program whose
- * own config sets the switch; a program that dereferences the missing table is the case it is for. The variable is read
- * at every request, not cached. Log tag [nls-extra]. */
+/* NLS-EXTRA: a code page table that is missing from nls/ is taken from nls/extra/<name>.nls (Wine's own c_932, c_936,
+ * c_949, c_950, c_874, c_1250 ... c_1258, the OEM pages c_720 ... c_869, c_20866, c_10000). Default ON.
+ * env.MADEIRA_NLS_EXTRA = 0 turns it off (a request for a table missing from nls/ then fails as it always did:
+ * NtGetNlsSectionPtr returns STATUS_OBJECT_NAME_NOT_FOUND, so GetCPInfo and MultiByteToWideChar fail for that
+ * code page); 1 is the same as unset. The variable is read at every request, not cached. Log tag [nls-extra].
+ *
+ * dockhost-cjk-locale: this used to be opt-in. When the device language makes a code page without a table the
+ * system ANSI/OEM code page (936 on a Chinese iPad), ntdll's init asks for it, the missing table leaves
+ * AnsiCodePageData on its UTF-8 stub (ACP 65001, no table) and the 64-bit Dock helper dies ~1 s after spawn with
+ * 0xC0000417 (CRT invalid parameter). Windows always has these tables, so there is nothing to opt into. A table
+ * present in nls/ always wins; sort keys, case map and normalization never take this path. */
 static char *nls_extra_path( const char *dir, const char *name, char *path )
 {
     static unsigned int reports;
     const char *e = getenv( "MADEIRA_NLS_EXTRA" );
     char *extra;
 
-    if (!e || strcmp( e, "1" ) || !access( path, R_OK )) return path;
+    if ((e && !strcmp( e, "0" )) || !access( path, R_OK )) return path;
     if (asprintf( &extra, "%s/nls/extra/%s.nls", dir, name ) == -1) return path;
     if (access( extra, R_OK )) { free( extra ); return path; }
-    if (reports++ < 16) dprintf( 2, "[nls-extra] %s.nls comes from nls/extra (MADEIRA_NLS_EXTRA=1)\n", name );
+    if (reports++ < 16) dprintf( 2, "[nls-extra] %s.nls comes from nls/extra (MADEIRA_NLS_EXTRA=%s)\n", name, e ? e : "auto" );
     free( path );
     return extra;
 }
@@ -186,7 +193,7 @@ static NTSTATUS open_nls_data_file( const char *path, const WCHAR *sysdir, HANDL
     OBJECT_ATTRIBUTES attr;
     UNICODE_STRING valueW;
     WCHAR buffer[64];
-    char *p;
+    const char *p;
 
     wcscpy( buffer, system_dir );
     p = strrchr( path, '/' ) + 1;
@@ -194,11 +201,11 @@ static NTSTATUS open_nls_data_file( const char *path, const WCHAR *sysdir, HANDL
     init_unicode_string( &valueW, buffer );
     InitializeObjectAttributes( &attr, &valueW, 0, 0, NULL );
 
-    status = open_unix_file( file, path, GENERIC_READ, &attr, 0, FILE_SHARE_READ,
+    status = open_unix_file( file, path, GENERIC_READ | SYNCHRONIZE, &attr, 0, FILE_SHARE_READ,
                              FILE_OPEN, FILE_SYNCHRONOUS_IO_ALERT, NULL, 0 );
     if (status != STATUS_NO_SUCH_FILE) return status;
 
-    return NtOpenFile( file, GENERIC_READ, &attr, &io, FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_ALERT );
+    return NtOpenFile( file, GENERIC_READ | SYNCHRONIZE, &attr, &io, FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_ALERT );
 }
 
 static NTSTATUS get_nls_section_name( UINT type, UINT id, WCHAR name[32] )
@@ -387,6 +394,7 @@ static BOOL is_ignored_env_var( const char *var )
             STARTS_WITH( var, "SDL_AUDIO_DRIVER=" ) ||
             STARTS_WITH( var, "SDL_VIDEODRIVER=" ) ||
             STARTS_WITH( var, "SDL_VIDEO_DRIVER=" ) ||
+            STARTS_WITH( var, "WAYLAND_DISPLAY=" ) ||
             STARTS_WITH( var, "VK_" ));
 }
 
@@ -524,7 +532,7 @@ const WCHAR *ntdll_get_data_dir(void)
  */
 static void set_process_name( const char *name )
 {
-    char *p;
+    const char *p;
 
 #ifdef HAVE_SETPROCTITLE
     setproctitle("-%s", name );
@@ -532,7 +540,17 @@ static void set_process_name( const char *name )
     if ((p = strrchr( name, '\\' ))) name = p + 1;
     if ((p = strrchr( name, '/' ))) name = p + 1;
 #ifdef HAVE_SETPROGNAME
-    setprogname( name );
+    {
+        /* Madeira: setprogname() keeps the pointer, not a copy, and on iOS the
+         * name lives in the app's process for good. Here argv is the launching
+         * thread's (WineProcessBridge.m: a local exe_path buffer), gone once a
+         * game exits; the next system reader of getprogname() then crashed the
+         * app (LonaRPG: nwi_state_copy -> strdup on a dead stack after the
+         * game quit). Hand it a copy that lives as long as the process. */
+        static char progname[256];
+        snprintf( progname, sizeof(progname), "%s", name );
+        setprogname( progname );
+    }
 #endif
 #ifdef HAVE_PRCTL
 #ifndef PR_SET_NAME
@@ -879,7 +897,7 @@ void init_environment(void)
 /* check if a WINE_HOST_ prefixed variable already exists in the environment */
 static BOOL host_var_exists( const char *name )
 {
-    char *end = strchr( name, '=' );
+    const char *end = strchr( name, '=' );
 
     if (!end) return FALSE;
     for (char **e = environ; *e; e++)
@@ -1737,7 +1755,8 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
         's','y','s','t','e','m','3','2','\\','w','i','n','e','b','o','o','t','.','e','x','e','"',
         ' ','-','-','i','n','i','t',0};
     RTL_USER_PROCESS_PARAMETERS params = { sizeof(params), sizeof(params) };
-    PS_ATTRIBUTE_LIST ps_attr;
+    ULONG_PTR attr_buffer[offsetof(PS_ATTRIBUTE_LIST,Attributes[2]) / sizeof(ULONG_PTR)];
+    PS_ATTRIBUTE_LIST *ps_attr = (PS_ATTRIBUTE_LIST *)attr_buffer;
     PS_CREATE_INFO create_info;
     HANDLE process, thread, handles[2];
     UNICODE_STRING nameW;
@@ -1767,17 +1786,19 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
     init_unicode_string( &params.WindowTitle, appnameW + 4 );
     init_unicode_string( &nameW, appnameW );
 
-    ps_attr.TotalLength = sizeof(ps_attr);
-    ps_attr.Attributes[0].Attribute    = PS_ATTRIBUTE_IMAGE_NAME;
-    ps_attr.Attributes[0].Size         = sizeof(appnameW) - sizeof(WCHAR);
-    ps_attr.Attributes[0].ValuePtr     = (WCHAR *)appnameW;
-    ps_attr.Attributes[0].ReturnLength = NULL;
+    ps_attr->TotalLength = sizeof(attr_buffer);
+    ps_attr->Attributes[0].Attribute    = PS_ATTRIBUTE_IMAGE_NAME;
+    ps_attr->Attributes[0].Size         = sizeof(appnameW) - sizeof(WCHAR);
+    ps_attr->Attributes[0].ValuePtr     = (WCHAR *)appnameW;
+    ps_attr->Attributes[0].ReturnLength = NULL;
+    ps_attr->Attributes[1].Attribute    = PS_ATTRIBUTE_MACHINE_TYPE;
+    ps_attr->Attributes[1].Value        = native_machine;
 
     wine_server_fd_to_handle( 2, GENERIC_WRITE | SYNCHRONIZE, OBJ_INHERIT, &params.hStdError );
 
     status = NtCreateUserProcess( &process, &thread, PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS,
                                   NULL, NULL, 0, THREAD_CREATE_FLAGS_CREATE_SUSPENDED, &params,
-                                  &create_info, &ps_attr );
+                                  &create_info, ps_attr );
     NtClose( params.hStdError );
 
     if (status)
@@ -1814,16 +1835,8 @@ static inline void put_unicode_string( WCHAR *src, WCHAR **dst, UNICODE_STRING *
     copy_unicode_string( &src, dst, str, wcslen(src) * sizeof(WCHAR) );
 }
 
-static void copy_dos_path_string( WCHAR **src, WCHAR **dst, UNICODE_STRING *str,
-                                  UNICODE_STRING *nt_str, UINT len )
+static void copy_dos_path_string( WCHAR **src, WCHAR **dst, UNICODE_STRING *str, UINT len )
 {
-    /* copy the original string into nt_str */
-    nt_str->Buffer = malloc( len + sizeof(WCHAR) );
-    memcpy( nt_str->Buffer, *src, len );
-    nt_str->Buffer[len / sizeof(WCHAR)] = 0;
-    nt_str->Length = len;
-    nt_str->MaximumLength = len + sizeof(WCHAR);
-
     if (len > 5 * sizeof(WCHAR) && (*src)[5] == ':') /* skip the \??\ prefix */
     {
         *src += 4;
@@ -1879,27 +1892,41 @@ static inline void dup_unicode_string( const UNICODE_STRING *src, WCHAR **dst, U
 
 
 /*************************************************************************
- *		get_dword_option
+ *		get_binary_option
  */
-static ULONG get_dword_option( HANDLE key, const WCHAR *name, ULONG defval )
+static BOOL get_binary_option( HANDLE key, const WCHAR *name, void *data, ULONG max_size )
 {
     UNICODE_STRING str;
     ULONG size;
     WCHAR buffer[64];
     KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
 
+    memset( data, 0, max_size );
     init_unicode_string( &str, name );
     size = sizeof(buffer) - sizeof(WCHAR);
-    if (NtQueryValueKey( key, &str, KeyValuePartialInformation, buffer, size, &size )) return defval;
-    if (info->Type != REG_DWORD) return defval;
-    return *(ULONG *)info->Data;
+    if (NtQueryValueKey( key, &str, KeyValuePartialInformation, buffer, size, &size )) return FALSE;
+    if (info->Type != REG_DWORD && info->Type != REG_QWORD && info->Type != REG_BINARY) return FALSE;
+    memcpy( data, info->Data, min( max_size, info->DataLength ));
+    return TRUE;
 }
 
 
 /*************************************************************************
- *		load_global_options
+ *		get_dword_option
  */
-static void load_global_options( const UNICODE_STRING *image )
+static ULONG get_dword_option( HANDLE key, const WCHAR *name, ULONG defval )
+{
+    ULONG ret;
+
+    if (get_binary_option( key, name, &ret, sizeof(ret) )) return ret;
+    return defval;
+}
+
+
+/*************************************************************************
+ *		open_option_keys
+ */
+static void open_option_keys( const UNICODE_STRING *image, HANDLE *session_key, HANDLE *ifeo_key )
 {
     static const WCHAR optionsW[] = {'\\','R','e','g','i','s','t','r','y','\\',
         'M','a','c','h','i','n','e','\\','S','o','f','t','w','a','r','e','\\',
@@ -1910,29 +1937,17 @@ static void load_global_options( const UNICODE_STRING *image )
         'M','a','c','h','i','n','e','\\','S','y','s','t','e','m','\\',
         'C','u','r','r','e','n','t','C','o','n','t','r','o','l','S','e','t','\\',
         'C','o','n','t','r','o','l','\\','S','e','s','s','i','o','n',' ','M','a','n','a','g','e','r',0};
-    static const WCHAR globalflagW[] = {'G','l','o','b','a','l','F','l','a','g',0};
-    static const WCHAR critsectionW[] = {'C','r','i','t','i','c','a','l','S','e','c','t','i','o','n','T','i','m','e','o','u','t',0};
-    static const WCHAR heapreserveW[] = {'H','e','a','p','S','e','g','m','e','n','t','R','e','s','e','r','v','e',0};
-    static const WCHAR heapcommitW[] = {'H','e','a','p','S','e','g','m','e','n','t','C','o','m','m','i','t',0};
-    static const WCHAR heapdecommittotalW[] = {'H','e','a','p','D','e','C','o','m','m','i','t','T','o','t','a','l','F','r','e','e','T','h','r','e','s','h','o','l','d',0};
-    static const WCHAR heapdecommitblockW[] = {'H','e','a','p','D','e','C','o','m','m','i','t','F','r','e','e','B','l','o','c','k','T','h','r','e','s','h','o','l','d',0};
     OBJECT_ATTRIBUTES attr;
     UNICODE_STRING nameW;
     HANDLE key;
     ULONG i;
 
+    *session_key = *ifeo_key = 0;
+
     InitializeObjectAttributes( &attr, &nameW, OBJ_CASE_INSENSITIVE, 0, NULL );
     init_unicode_string( &nameW, sessionW );
-    if (!NtOpenKey( &key, KEY_QUERY_VALUE, &attr ))
-    {
-        peb->NtGlobalFlag = get_dword_option( key, globalflagW, 0 );
-        peb->CriticalSectionTimeout.QuadPart = get_dword_option( key, critsectionW, 30 * 24 * 60 * 60 ) * (ULONGLONG)-10000000;
-        peb->HeapSegmentReserve = get_dword_option( key, heapreserveW, 0x100000 );
-        peb->HeapSegmentCommit = get_dword_option( key, heapcommitW, 0x10000 );
-        peb->HeapDeCommitTotalFreeThreshold = get_dword_option( key, heapdecommittotalW, 0x10000 );
-        peb->HeapDeCommitFreeBlockThreshold = get_dword_option( key, heapdecommitblockW, 0x1000 );
-        NtClose( key );
-    }
+    NtOpenKey( session_key, KEY_QUERY_VALUE, &attr );
+
     init_unicode_string( &nameW, optionsW );
     if (!NtOpenKey( &key, KEY_QUERY_VALUE, &attr ))
     {
@@ -1940,15 +1955,80 @@ static void load_global_options( const UNICODE_STRING *image )
         for (i = image->Length / sizeof(WCHAR); i; i--) if (image->Buffer[i - 1] == '\\') break;
         nameW.Buffer = image->Buffer + i;
         nameW.Length = image->Length - i * sizeof(WCHAR);
-        if (!NtOpenKey( &key, KEY_QUERY_VALUE, &attr ))
-        {
-            peb->NtGlobalFlag = get_dword_option( key, globalflagW, peb->NtGlobalFlag );
-            NtClose( key );
-        }
-        NtClose( attr.RootDirectory );
+        NtOpenKey( ifeo_key, KEY_QUERY_VALUE, &attr );
+        NtClose( key );
     }
 }
 
+
+/*************************************************************************
+ *		load_mitigation_options
+ */
+static void load_mitigation_options( HANDLE session_key, HANDLE ifeo_key )
+{
+    static const WCHAR kernelW[] = {'k','e','r','n','e','l',0};
+    static const WCHAR mitigationW[] = {'M','i','t','i','g','a','t','i','o','n','O','p','t','i','o','n','s',0};
+    ULONG64 opts[2];
+
+    if (session_key)
+    {
+        OBJECT_ATTRIBUTES attr;
+        UNICODE_STRING nameW;
+        HANDLE key;
+
+        InitializeObjectAttributes( &attr, &nameW, OBJ_CASE_INSENSITIVE, session_key, NULL );
+        init_unicode_string( &nameW, kernelW );
+        if (!NtOpenKey( &key, KEY_QUERY_VALUE, &attr ))
+        {
+            get_binary_option( key, mitigationW, mitigation_options, sizeof(mitigation_options) );
+            NtClose( key );
+        }
+    }
+
+    if (ifeo_key && get_binary_option( ifeo_key, mitigationW, opts, sizeof(opts) ))
+    {
+        for (UINT i = 0; i < 2; i++)
+        {
+            for (ULONG64 mask = 0x7; mask; mask <<= 4)
+                if (opts[i] & mask) mitigation_options[i] &= ~mask;
+            mitigation_options[i] |= opts[i];
+        }
+    }
+}
+
+
+/*************************************************************************
+ *		load_global_options
+ */
+static void load_global_options( HANDLE session_key, HANDLE ifeo_key, BOOL debugged )
+{
+    static const WCHAR globalflagW[] = {'G','l','o','b','a','l','F','l','a','g',0};
+    static const WCHAR critsectionW[] = {'C','r','i','t','i','c','a','l','S','e','c','t','i','o','n','T','i','m','e','o','u','t',0};
+    static const WCHAR heapreserveW[] = {'H','e','a','p','S','e','g','m','e','n','t','R','e','s','e','r','v','e',0};
+    static const WCHAR heapcommitW[] = {'H','e','a','p','S','e','g','m','e','n','t','C','o','m','m','i','t',0};
+    static const WCHAR heapdecommittotalW[] = {'H','e','a','p','D','e','C','o','m','m','i','t','T','o','t','a','l','F','r','e','e','T','h','r','e','s','h','o','l','d',0};
+    static const WCHAR heapdecommitblockW[] = {'H','e','a','p','D','e','C','o','m','m','i','t','F','r','e','e','B','l','o','c','k','T','h','r','e','s','h','o','l','d',0};
+    /* ml1122: same reason as init_peb (ml111) -- fill the BOOTING thread's PEB;
+     * the file-scope global belongs to whichever pseudo-process booted first. */
+    PEB *peb = NtCurrentTeb()->Peb;
+
+    if (session_key)
+    {
+        peb->NtGlobalFlag = get_dword_option( session_key, globalflagW, 0 );
+        peb->CriticalSectionTimeout.QuadPart = get_dword_option( session_key, critsectionW, 30 * 24 * 60 * 60 ) * (ULONGLONG)-10000000;
+        peb->HeapSegmentReserve = get_dword_option( session_key, heapreserveW, 0x100000 );
+        peb->HeapSegmentCommit = get_dword_option( session_key, heapcommitW, 0x10000 );
+        peb->HeapDeCommitTotalFreeThreshold = get_dword_option( session_key, heapdecommittotalW, 0x10000 );
+        peb->HeapDeCommitFreeBlockThreshold = get_dword_option( session_key, heapdecommitblockW, 0x1000 );
+    }
+    if (debugged) peb->NtGlobalFlag |= FLG_HEAP_ENABLE_TAIL_CHECK | FLG_HEAP_ENABLE_FREE_CHECK | FLG_HEAP_VALIDATE_PARAMETERS;
+    if (ifeo_key) peb->NtGlobalFlag = get_dword_option( ifeo_key, globalflagW, peb->NtGlobalFlag );
+}
+
+
+#ifdef WINE_IOS
+static void ios_fatal_startup_error( const char *err, ... ) __attribute__((noreturn, format(printf,1,2)));
+#endif
 
 /*************************************************************************
  *		build_wow64_parameters
@@ -1975,7 +2055,18 @@ static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
 
     status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&wow64_params, limit_2g - 1, &size,
                                       MEM_COMMIT, PAGE_READWRITE );
+#ifdef WINE_IOS
+    /* #590: the block has to fit below the 32-bit process's 2 GB line. The
+     * assert other builds keep would end the whole app here (pseudo-processes
+     * are threads of one task), and without assertions the NULL block would be
+     * written to. End only this pseudo-process, naming the status, as a 32-bit
+     * main image that cannot be mapped does. */
+    if (status)
+        ios_fatal_startup_error( "the 32-bit process parameters (%lu bytes) could not be allocated "
+                                 "below 2 GB: status %x\n", (unsigned long)size, (unsigned)status );
+#else
     assert( !status );
+#endif
 
     wow64_params->AllocationSize  = size;
     wow64_params->Size            = size;
@@ -2045,6 +2136,7 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
     }
     peb->ImageBaseAddress           = module;
     peb->ProcessParameters          = params;
+    peb->NumberOfProcessors         = madeira_peb_cpu_count ? madeira_peb_cpu_count : cpu_count;  /* ml1122 */
     peb->OSMajorVersion             = 10;
     peb->OSMinorVersion             = 0;
     peb->OSBuildNumber              = 19045;
@@ -2052,19 +2144,31 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
     peb->ImageSubSystem             = main_image_info.SubSystemType;
     peb->ImageSubSystemMajorVersion = main_image_info.MajorSubsystemVersion;
     peb->ImageSubSystemMinorVersion = main_image_info.MinorSubsystemVersion;
+    /* ml1122: Wine 11.22 parks the session id in a global until its (late) first PEB
+     * exists. Madeira's PEB exists before the server answers, and server_ios.c writes
+     * it straight into the booting process's PEB, so only fill a still-empty field. */
+    if (!peb->SessionId) peb->SessionId = session_id;
 
 #ifdef _WIN64
+    /* ml1122: Wine 11.22 moved this block into virtual_alloc_first_teb(), which runs
+     * after the main image is loaded. Madeira keeps the 11.4 order (the first TEB pair
+     * exists before the image is mapped), so the 32-bit half is still switched on here,
+     * once the image's machine is known. ios_set_thread_id() is the 11.4 set_thread_id()
+     * (upstream dropped it), kept in virtual_ios.c. */
     if (!is_machine_64bit( main_image_info.Machine ))
     {
+        extern void ios_set_thread_id( TEB *teb, DWORD pid, DWORD tid );
         NtCurrentTeb()->WowTebOffset = teb_offset;
         NtCurrentTeb()->Tib.ExceptionList = (void *)((char *)NtCurrentTeb() + teb_offset);
         wow_peb = (PEB32 *)((char *)peb + page_size);
-        set_thread_id( NtCurrentTeb(), GetCurrentProcessId(), GetCurrentThreadId() );
+        ios_set_thread_id( NtCurrentTeb(), GetCurrentProcessId(), GetCurrentThreadId() );
     }
 #endif
 
-    virtual_set_large_address_space();
-    load_global_options( &params->ImagePathName );
+    {
+        extern void virtual_set_large_address_space(void);   /* virtual_ios.c; no longer in unix_private.h */
+        virtual_set_large_address_space();
+    }
 
     if (wow_peb)
     {
@@ -2109,8 +2213,8 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
  * while pthread_exit() ends only this process's boot thread.  Not a
  * replacement for NtTerminateProcess — that needs a live wineserver process
  * and process parameters, neither of which is guaranteed this early.
+ * Declared above build_wow64_parameters, which uses it too.
  */
-static void ios_fatal_startup_error( const char *err, ... ) __attribute__((noreturn, format(printf,1,2)));
 static void ios_fatal_startup_error( const char *err, ... )
 {
     char buf[512];
@@ -2143,10 +2247,12 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
 #endif
     WCHAR *env = get_initial_environment( &env_pos, &env_size );
     WCHAR *curdir = get_initial_directory();
+    HANDLE session_key, ifeo_key;
     UNICODE_STRING nt_name;
     NTSTATUS status;
+    struct thread_data *data = get_thread_data();
 
-    if (NtCurrentTeb64()) NtCurrentTeb64()->TlsSlots[WOW64_TLS_FILESYSREDIR] = TRUE;
+    data->filesys_redir = TRUE;
 
     /* store the initial PATH value */
     path = get_env_var( env, env_pos, pathW, 4 );
@@ -2190,6 +2296,11 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     os_log(OS_LOG_DEFAULT, "[Wine] build_initial_params: get_full_path(%s)...", main_argv[1] ? main_argv[1] : "(null)");
 #endif
     get_full_path( main_argv[1], curdir, &nt_name );
+    open_option_keys( &nt_name, &session_key, &ifeo_key );
+    /* ml1122: upstream's load_mitigation_options() is not called: it fills the
+     * process-global mitigation_options[], which only steers upstream's new ASLR
+     * allocator. Madeira keeps its own allocator (virtual_ios.c) and shares this
+     * unix lib between all pseudo-processes, so the global would be last-writer-wins. */
 #ifdef WINE_IOS
     os_log(OS_LOG_DEFAULT, "[Wine] build_initial_params: load_main_exe...");
 #endif
@@ -2285,8 +2396,13 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     else
     {
         rebuild_argv();
-        if (NtCurrentTeb64()) NtCurrentTeb64()->TlsSlots[WOW64_TLS_FILESYSREDIR] = FALSE;
+        data->filesys_redir = FALSE;
     }
+
+    /* ml1122: no virtual_alloc_first_teb() here. Upstream 11.22 creates the first
+     * TEB/PEB at this point; Madeira creates them before the main image is loaded
+     * (virtual_alloc_first_thread_data, virtual_ios.c) because the iOS boot path
+     * and every pseudo-process child needs NtCurrentTeb()->Peb while loading. */
 
     main_wargv = build_wargv( get_dos_path( nt_name.Buffer ));
     cmdline = build_command_line( main_wargv );
@@ -2311,7 +2427,8 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     params->Size            = size;
     params->Flags           = PROCESS_PARAMS_FLAG_NORMALIZED;
     params->wShowWindow     = 1; /* SW_SHOWNORMAL */
-    params->ProcessGroupId  = GetCurrentProcessId();
+    params->ProcessGroupId  = GetCurrentProcessId();  /* ml1122: per pseudo-process, not the global pid */
+    if (!ifeo_key) params->Flags |= PROCESS_PARAMS_IMAGE_KEY_MISSING;
 
     params->CurrentDirectory.DosPath.Buffer = (WCHAR *)(params + 1);
     wcscpy( params->CurrentDirectory.DosPath.Buffer, dos_curdir );
@@ -2332,7 +2449,10 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     free( env );
 
     get_initial_console( params );
+    load_global_options( session_key, ifeo_key, FALSE );
 
+    if (session_key) NtClose( session_key );
+    if (ifeo_key) NtClose( ifeo_key );
     return params;
 }
 
@@ -2351,16 +2471,19 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
  * Fix: rename our copy and update the only caller (loader_ios.c). Leave
  * win32u/window.c's definition untouched so init_user finds the right one.
  */
+extern void madeira_kusd_fill_if_empty(void);   /* [kusd-fill] */
 void unix_init_startup_info(void)
 {
     WCHAR *src, *dst, *env;
-    void *module = NULL;
     unsigned int status;
     SIZE_T size, curdir_size, info_size, env_size, env_pos;
     RTL_USER_PROCESS_PARAMETERS *params = NULL;
     struct startup_info_data *info;
     UNICODE_STRING nt_name;
+    HANDLE session_key, ifeo_key;
+    void *module = NULL;
     USHORT machine;
+    BOOL debugged;
 
 #ifdef WINE_IOS
     os_log(OS_LOG_DEFAULT, "[Wine] init_startup_info: startup_info_size=%lu", (unsigned long)startup_info_size);
@@ -2381,6 +2504,7 @@ void unix_init_startup_info(void)
         return;
     }
 
+    madeira_kusd_fill_if_empty();   /* [kusd-fill], virtual_ios.c */
     info = malloc( startup_info_size );
 
     SERVER_START_REQ( get_startup_info )
@@ -2388,6 +2512,7 @@ void unix_init_startup_info(void)
         wine_server_set_reply( req, info, startup_info_size );
         status = wine_server_call( req );
         machine = reply->machine;
+        debugged = reply->debugged;
         info_size = reply->info_size;
         env_size = (wine_server_reply_size( reply ) - info_size) / sizeof(WCHAR);
     }
@@ -2402,10 +2527,24 @@ void unix_init_startup_info(void)
     env[env_pos++] = 0;
 
     curdir_size = max( MAX_PATH * sizeof(WCHAR), info->curdir_len + sizeof(WCHAR) );
+
+    /* ml1122 (Wine 11.22): the image path now arrives as an NT name at the head of
+     * the startup info. Keep a NUL-terminated private copy: the main image is still
+     * loaded at the END of this function (Madeira order, see below), after info is
+     * freed. Upstream loads it here and then creates the first TEB; Madeira's first
+     * TEB/PEB already exist (virtual_alloc_first_thread_data), so neither happens here. */
+    nt_name.Length = info->imagepath_len;
+    nt_name.MaximumLength = info->imagepath_len + sizeof(WCHAR);
+    nt_name.Buffer = malloc( nt_name.MaximumLength );
+    memcpy( nt_name.Buffer, info + 1, info->imagepath_len );
+    nt_name.Buffer[info->imagepath_len / sizeof(WCHAR)] = 0;
+    open_option_keys( &nt_name, &session_key, &ifeo_key );
+    /* load_mitigation_options() deliberately not called, see build_initial_params */
+
     size = (sizeof(*params)
+            + info->imagepath_len + sizeof(WCHAR)
             + curdir_size
             + info->dllpath_len + sizeof(WCHAR)
-            + info->imagepath_len + sizeof(WCHAR)
             + info->cmdline_len + sizeof(WCHAR)
             + info->title_len + sizeof(WCHAR)
             + info->desktop_len + sizeof(WCHAR)
@@ -2443,9 +2582,12 @@ void unix_init_startup_info(void)
     params->dwFlags         = info->flags;
     params->wShowWindow     = info->show;
     params->ProcessGroupId  = info->process_group_id;
+    if (!ifeo_key && !debugged) params->Flags |= PROCESS_PARAMS_IMAGE_KEY_MISSING;
 
     src = (WCHAR *)(info + 1);
     dst = (WCHAR *)(params + 1);
+
+    copy_dos_path_string( &src, &dst, &params->ImagePathName, info->imagepath_len );
 
     /* curdir is special */
     copy_unicode_string( &src, &dst, &params->CurrentDirectory.DosPath, info->curdir_len );
@@ -2453,7 +2595,6 @@ void unix_init_startup_info(void)
     dst = (WCHAR *)((char *)params->CurrentDirectory.DosPath.Buffer + curdir_size);
 
     if (info->dllpath_len) copy_unicode_string( &src, &dst, &params->DllPath, info->dllpath_len );
-    copy_dos_path_string( &src, &dst, &params->ImagePathName, &nt_name, info->imagepath_len );
     copy_unicode_string( &src, &dst, &params->CommandLine, info->cmdline_len );
     copy_unicode_string( &src, &dst, &params->WindowTitle, info->title_len );
     copy_unicode_string( &src, &dst, &params->Desktop, info->desktop_len );
@@ -2488,7 +2629,11 @@ void unix_init_startup_info(void)
     rebuild_argv();
     main_wargv = build_wargv( params->ImagePathName.Buffer );
     free( nt_name.Buffer );
+    load_global_options( session_key, ifeo_key, debugged );
     init_peb( params, module );
+
+    if (session_key) NtClose( session_key );
+    if (ifeo_key) NtClose( ifeo_key );
 }
 
 
@@ -2551,9 +2696,9 @@ void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
     info->process_group_id = params->ProcessGroupId;
 
     ptr = info + 1;
+    info->imagepath_len = append_string( &ptr, params, nt_image );
     info->curdir_len = append_string( &ptr, params, &params->CurrentDirectory.DosPath );
     info->dllpath_len = append_string( &ptr, params, &params->DllPath );
-    info->imagepath_len = append_string( &ptr, params, nt_image );
     info->cmdline_len = append_string( &ptr, params, &params->CommandLine );
     info->title_len = append_string( &ptr, params, &params->WindowTitle );
     info->desktop_len = append_string( &ptr, params, &params->Desktop );
@@ -2898,8 +3043,9 @@ void WINAPI RtlInitUnicodeString( UNICODE_STRING *str, const WCHAR *data )
  */
 ULONG WINAPI RtlNtStatusToDosError( NTSTATUS status )
 {
-    NtCurrentTeb()->LastStatusValue = status;
+    TEB *teb = NtCurrentTeb();
 
+    if (teb) teb->LastStatusValue = status;
     if (!status || (status & 0x20000000)) return status;
     if ((status & 0xf0000000) == 0xd0000000) status &= ~0x10000000;
 
@@ -2915,7 +3061,17 @@ ULONG WINAPI RtlNtStatusToDosError( NTSTATUS status )
  */
 DWORD WINAPI RtlGetLastWin32Error(void)
 {
-    return NtCurrentTeb()->LastErrorValue;
+    TEB *teb = NtCurrentTeb();
+
+    if (teb)
+    {
+#ifdef _WIN64
+        WOW_TEB *wow_teb = get_wow_teb( teb );
+        if (wow_teb) return wow_teb->LastErrorValue;
+#endif
+        return teb->LastErrorValue;
+    }
+    else return 0;
 }
 
 /**********************************************************************
@@ -2924,9 +3080,41 @@ DWORD WINAPI RtlGetLastWin32Error(void)
 void WINAPI RtlSetLastWin32Error( DWORD err )
 {
     TEB *teb = NtCurrentTeb();
+
+    if (teb)
+    {
 #ifdef _WIN64
-    WOW_TEB *wow_teb = get_wow_teb( teb );
-    if (wow_teb) wow_teb->LastErrorValue = err;
+        WOW_TEB *wow_teb = get_wow_teb( teb );
+        if (wow_teb) wow_teb->LastErrorValue = err;
 #endif
-    teb->LastErrorValue = err;
+        teb->LastErrorValue = err;
+    }
+}
+
+/**********************************************************************
+ *      RtlGetCurrentPeb  (ntdll.so)
+ */
+PEB * WINAPI RtlGetCurrentPeb(void)
+{
+    /* ml1122: pseudo-processes share this unix lib; answer for the calling thread */
+    if (NtCurrentTeb() && NtCurrentTeb()->Peb) return NtCurrentTeb()->Peb;
+    return peb;
+}
+
+/**********************************************************************
+ *      PsGetCurrentProcessId  (ntdll.so)
+ */
+HANDLE WINAPI PsGetCurrentProcessId(void)
+{
+    /* ml1122: pseudo-processes share this unix lib; answer for the calling thread */
+    if (NtCurrentTeb()) return NtCurrentTeb()->ClientId.UniqueProcess;
+    return ULongToHandle( pid );
+}
+
+/**********************************************************************
+ *      PsGetCurrentThreadId  (ntdll.so)
+ */
+HANDLE WINAPI PsGetCurrentThreadId(void)
+{
+    return ULongToHandle( get_thread_data()->tid );
 }

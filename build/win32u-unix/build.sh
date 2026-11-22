@@ -164,6 +164,7 @@ fi
 
 echo ""
 echo "=== Building libwin32u_unix.a ==="
+rm -f "$OBJ_DIR/libwin32u_unix.a"  # madeira-wsl: fresh archive
 ar rcs "$OBJ_DIR/libwin32u_unix.a" "$OBJ_DIR"/*.o
 
 # Merge the static freetype so the app link needs no project changes.

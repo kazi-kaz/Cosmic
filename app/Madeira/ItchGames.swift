@@ -55,6 +55,8 @@ struct ItchGamesSection: View {
     @ObservedObject private var library = LibraryModel.shared
     @AppStorage("madeiraLibraryHideItch") private var hidden = false
     @AppStorage("madeiraItchShowUninstalled") private var showUninstalled = true
+    /// (new-look) The store's page lists games to install first; the installed ones fold away under them (closed at first).
+    @AppStorage("madeiraNewLookItchShowInstalled") private var showInstalled = false
     /// In the zoomable grid the section sits in a collection view cell: the grid's page attaches ItchSheets (LibraryGridPage.swift).
     var inGrid = false
     @ObservedObject private var sheets = LibraryStoreSheets.shared
@@ -63,6 +65,10 @@ struct ItchGamesSection: View {
         let items = ItchGamesRules.items(itch, search: search)
         let mine = items.filter { $0.installed != nil || itch.downloads[$0.id] != nil }
         let others = items.filter { $0.installed == nil && itch.downloads[$0.id] == nil }
+        // (new-look) Games to install come first (the Library tab already has the installed ones): what is
+        // downloading stays on top, the installed games go under Not installed in a group that starts closed.
+        let top = mine.filter { itch.downloads[$0.id] != nil }
+        let folded = mine.filter { itch.downloads[$0.id] == nil }
         let collapsible = SteamGamesSection.collapsible
         VStack(alignment: .leading, spacing: 14) {
             LibrarySectionHeader(title: "itch.io", count: mine.count, collapsed: collapsible ? $hidden : nil) {
@@ -83,10 +89,11 @@ struct ItchGamesSection: View {
                         }.padding(14)
                             .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
                     }.buttonStyle(.plain)
+                        .padItem("signin:itch", cornerRadius: 16) { sheets.itchSignIn = true }
                 }
-                if !mine.isEmpty {
-                    LibraryCells(items: mine, layout: layout, width: width) { item, list, dense in cell(item, list: list, dense: dense) }
-                } else if itch.signedIn && !itch.refreshing && others.isEmpty && search.isEmpty {
+                if !top.isEmpty {
+                    LibraryCells(items: top, layout: layout, width: width) { item, list, dense in cell(item, list: list, dense: dense) }
+                } else if itch.signedIn && !itch.refreshing && others.isEmpty && folded.isEmpty && search.isEmpty {
                     Text(itch.libraryUpdated == nil ? "Pull down to load your itch.io library."
                          : "No Windows games yet. Games you buy or claim on itch.io show here, and so do the games in your itch.io collections. For a free game, use Find a game.")
                         .foregroundStyle(.secondary)
@@ -105,10 +112,11 @@ struct ItchGamesSection: View {
                         }.padding(14)
                             .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
                     }.buttonStyle(.plain)
+                        .padItem("itch-find", cornerRadius: 16) { sheets.itchFind = true }
                 }
                 if itch.signedIn && !others.isEmpty {
                     Button {
-                        withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.2)) { showUninstalled.toggle() }
+                        var instant = Transaction(); instant.disablesAnimations = true; withTransaction(instant) { showUninstalled.toggle() }   // at once (Cameron, Nov 7)
                     } label: {
                         HStack {
                             Text("Not installed").font(.headline)
@@ -119,8 +127,17 @@ struct ItchGamesSection: View {
                         }.contentShape(Rectangle()).frame(minHeight: 44)
                     }.buttonStyle(.plain)
                         .accessibilityValue(showUninstalled ? "Shown" : "Hidden")
+                        .padItem("itch-not-installed", cornerRadius: 16) { showUninstalled.toggle() }
                     if showUninstalled {
                         LibraryCells(items: others, layout: layout, width: width) { item, list, dense in cell(item, list: list, dense: dense) }
+                    }
+                }
+                if !folded.isEmpty {
+                    // Nothing to install or download: the installed games just show, with a plain title.
+                    let only = top.isEmpty && !(itch.signedIn && !others.isEmpty)
+                    NewLookInstalledHeader(id: "itch-installed", count: folded.count, open: only ? nil : $showInstalled)
+                    if only || showInstalled {
+                        LibraryCells(items: folded, layout: layout, width: width) { item, list, dense in cell(item, list: list, dense: dense) }
                     }
                 }
             }
@@ -136,7 +153,7 @@ struct ItchGamesSection: View {
                 sheets.itchGame = .init(id: item.id)
             }
         } label: { ItchGameCell(item: item, list: list, dense: dense) }
-            .libraryCardButtonStyle(grid: !list)
+            .libraryCardButtonStyle(grid: !list, pad: "itch:\(item.id)")
     }
 }
 
@@ -185,6 +202,9 @@ struct ItchGameArtwork: View {
     var body: some View {
         if let entry = library.entries.first(where: { $0.itchGameID == item.id }), entry.coverFile != nil {
             LibraryArtwork(entry: entry)
+        } else if LibraryCachedArtwork.enabled {
+            // Downsampled, kept in memory and on disk (LibraryCoverCache.swift).
+            LibraryCachedArtwork(source: .store("itch", "\(item.id)", item.cover))
         } else {
             GeometryReader { geometry in
                 ZStack {
@@ -346,6 +366,7 @@ struct ItchGameSheet: View {
                             VStack(alignment: .leading, spacing: 12) {
                                 Text(item.title).font(.title2.bold())
                                 primaryAction(item)
+                                    .padSheet { primaryPress(item)?() }
                             }
                         }.padding(.vertical, 24)
                     }
@@ -415,7 +436,7 @@ struct ItchGameSheet: View {
             case .paused:
                 Button { itch.install(gameID) } label: { steamActionLabel("Resume", symbol: "arrow.down.circle.fill") }.buttonStyle(.borderedProminent)
             case .failed:
-                Button { itch.install(gameID) } label: { steamActionLabel("Try again", symbol: "arrow.clockwise") }.buttonStyle(.borderedProminent)
+                Button { itch.install(gameID) } label: { steamActionLabel("Try Again", symbol: "arrow.clockwise") }.buttonStyle(.borderedProminent)
             }
         } else if let installed = item.installed {
             Button {
@@ -432,6 +453,25 @@ struct ItchGameSheet: View {
                 steamActionLabel(itch.hasPartialDownload(gameID) ? "Resume download" : "Install", symbol: "arrow.down.circle.fill")
             }.buttonStyle(.borderedProminent).disabled(!itch.signedIn)
         }
+    }
+
+    /// What A on a controller does on this sheet (PadHighlight.swift): the same as the button above.
+    private func primaryPress(_ item: ItchItem) -> (() -> Void)? {
+        if let download = itch.downloads[gameID] {
+            switch download.state {
+            case .active, .queued:
+                return { itch.pause(gameID) }
+            case .paused:
+                return { itch.install(gameID) }
+            case .failed:
+                return { itch.install(gameID) }
+            }
+        } else if let installed = item.installed {
+            return { let entry = LibraryModel.shared.itchEntry(installed); dismiss(); open(entry) }
+        } else if item.owned != nil {
+            return itch.signedIn ? { itch.install(gameID) } : nil
+        }
+        return nil
     }
 }
 

@@ -22,6 +22,7 @@
 
 import Foundation
 import SwiftUI
+import CryptoKit   // dotnet10-installer: SHA-512 of the downloads
 
 // MARK: - Pin
 
@@ -437,7 +438,7 @@ struct VCRedistSettingsSection: View {
             }
             if !redist.busy {
                 Button { redist.install() } label: {
-                    Label(redist.complete ? "Install again" : (redist.error == nil ? "Download and install" : "Try again"),
+                    Label(redist.complete ? "Install again" : (redist.error == nil ? "Download and install" : "Try Again"),
                           systemImage: "arrow.down.circle")
                 }
                 if !redist.installed.isEmpty {
@@ -455,5 +456,457 @@ struct VCRedistSettingsSection: View {
             Text("Games go back to Wine's own C++ runtime (and the copy bundled with this build, if any) at their next start.")
         }
         .onAppear { redist.refresh() }
+    }
+}
+
+// MARK: - XAudio2 2.7 (DirectX June 2010)
+
+// Older games (Dead Rising 2006, for one) load Microsoft's XAudio2 2.7 and get no sound, or
+// load for ever, on Wine's own. Settings › Runtimes offers it. Nothing is bundled: the app
+// downloads the DirectX June 2010 redistributable from Microsoft, checks its size and SHA-256,
+// opens its cabinets (the same CabinetReader.c as above), and keeps xaudio2_7.dll (and xapofx1_5.dll) byte for byte in Documents/xaudio2 (x64) and
+// Documents/xaudio2-32 (x86). At every session start the bridge links them into system32 and
+// syswow64 and adds xaudio2_7=n,b (and xapofx1_5) to WINEDLLOVERRIDES unless the game
+// sets its own. Log tag: [xaudio2].
+
+enum XAudio2Pin {
+    static let url = URL(string: "https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe")!
+    static let fileName = "directx_Jun2010_redist.exe"
+    static let sha256 = "053f76dcbb28802e23341b6a787e3b0791c0fa5c8d4d011b1044172dbf89c73b"
+    static let bytes: Int64 = 100_275_120
+    static var megabytes: Int { Int((Double(bytes) / 1_048_576).rounded()) }
+    static let required = "xaudio2_7.dll"
+    static let companions = ["xapofx1_5.dll"]
+    /// The package carries every DirectX release back to 2007; this is the newest XAudio cabinet pair (2.7, 9.29.1962.0).
+    static let cabinets = ["x64": "jun2010_xaudio_x64.cab", "x86": "jun2010_xaudio_x86.cab"]
+    static var names: [String] { [required] + companions }
+}
+
+enum XAudio2Installer {
+    static func folder(_ arch: String) -> URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(arch == "x86" ? "xaudio2-32" : "xaudio2", isDirectory: true)
+    }
+
+    /// Which architecture a cabinet of the package belongs to ("Jun2010_XAudio_x64.cab" -> "x64");
+    /// nil for every other cabinet (the package holds the XAudio cabinets of every release).
+    static func arch(ofCabinet name: String) -> String? {
+        let lower = name.lowercased()
+        return XAudio2Pin.cabinets.first { $0.value == lower }?.key
+    }
+
+    /// Checks one DLL against its name and architecture (PE machine, a signature directory).
+    static func check(_ data: Data, name: String, arch: String) throws {
+        guard let facts = VCRedistInstaller.peFacts(data) else { throw VCRedistError.message("\(name) in the package is not a Windows DLL.") }
+        guard facts.machine == (arch == "x86" ? 0x14c : 0x8664) else { throw VCRedistError.message("\(name) in the package is for another architecture.") }
+        guard facts.signed else { throw VCRedistError.message("\(name) in the package carries no signature.") }
+    }
+
+    /// Both architectures' DLLs. Every cabinet of the executable is opened; the payloads that
+    /// are XAudio cabinets of an architecture are opened; the wanted names are taken (first
+    /// copy of each). Throws unless xaudio2_7.dll was found for both architectures.
+    static func extract(installer: URL, progress: (Double) -> Void = { _ in }) throws -> [String: [String: Data]] {
+        let exe = try Data(contentsOf: installer, options: .alwaysMapped)
+        guard exe.count > 0x40, exe[exe.startIndex] == 0x4D, exe[exe.startIndex + 1] == 0x5A else {
+            throw VCRedistError.message("\(XAudio2Pin.fileName) is not a Windows program.")
+        }
+        var found: [String: [String: Data]] = ["x64": [:], "x86": [:]]
+        func complete() -> Bool { found.values.allSatisfy { $0[XAudio2Pin.required] != nil } }
+        try exe.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            let marker = Data("MSCF".utf8)
+            var from = 0
+            while !complete(), from < raw.count {
+                guard let hit = exe.range(of: marker, in: exe.startIndex.advanced(by: from)..<exe.endIndex) else { break }
+                let at = exe.distance(from: exe.startIndex, to: hit.lowerBound)
+                var handle: OpaquePointer?
+                guard madeira_cab_open(base + at, raw.count - at, &handle) == Int32(MADEIRA_CAB_OK), let outer = handle else {
+                    from = at + 1
+                    continue
+                }
+                defer { madeira_cab_close(outer) }
+                let length = Int(madeira_cab_length(outer))
+                for index in 0..<madeira_cab_file_count(outer) where !complete() {
+                    guard let outerName = madeira_cab_file_name(outer, index),
+                          let arch = arch(ofCabinet: String(cString: outerName)) else { continue }
+                    let size = Int(madeira_cab_file_size(outer, index))
+                    guard size >= 36, size <= 64 << 20 else { continue }
+                    var payload = Data(count: size)
+                    let rc = payload.withUnsafeMutableBytes { madeira_cab_extract(outer, index, $0.baseAddress, $0.count) }
+                    guard rc == Int32(MADEIRA_CAB_OK) else {
+                        throw VCRedistError.message("\(XAudio2Pin.fileName) is damaged (\(String(cString: madeira_cab_strerror(rc)))).")
+                    }
+                    guard payload.starts(with: marker) else { continue }
+                    try payload.withUnsafeBytes { (inner: UnsafeRawBufferPointer) in
+                        var innerHandle: OpaquePointer?
+                        guard madeira_cab_open(inner.baseAddress, inner.count, &innerHandle) == Int32(MADEIRA_CAB_OK), let cab = innerHandle else { return }
+                        defer { madeira_cab_close(cab) }
+                        for entry in 0..<madeira_cab_file_count(cab) {
+                            guard let stored = madeira_cab_file_name(cab, entry) else { continue }
+                            let name = String(cString: stored).lowercased()
+                            guard XAudio2Pin.names.contains(name), found[arch]?[name] == nil else { continue }
+                            let bytes = Int(madeira_cab_file_size(cab, entry))
+                            guard bytes > 0, bytes <= 16 << 20 else { throw VCRedistError.message("\(name) in the package has an impossible size.") }
+                            var dll = Data(count: bytes)
+                            let rc = dll.withUnsafeMutableBytes { madeira_cab_extract(cab, entry, $0.baseAddress, $0.count) }
+                            guard rc == Int32(MADEIRA_CAB_OK) else {
+                                throw VCRedistError.message("\(name) could not be unpacked (\(String(cString: madeira_cab_strerror(rc)))).")
+                            }
+                            try check(dll, name: name, arch: arch)
+                            found[arch]?[name] = dll
+                            progress(Double(found.values.reduce(0) { $0 + $1.count }) / Double(XAudio2Pin.names.count * 2))
+                        }
+                    }
+                }
+                from = at + max(length, 1)
+            }
+        }
+        for arch in ["x64", "x86"] where found[arch]?[XAudio2Pin.required] == nil {
+            throw VCRedistError.message("\(XAudio2Pin.fileName) did not hold \(XAudio2Pin.required) for \(arch). Microsoft may have changed the package.")
+        }
+        return found
+    }
+
+    /// Whether a folder holds xaudio2_7.dll as a PE file of the architecture.
+    static func installed(_ arch: String) -> Bool {
+        guard let data = try? Data(contentsOf: folder(arch).appendingPathComponent(XAudio2Pin.required), options: .alwaysMapped),
+              let facts = VCRedistInstaller.peFacts(data) else { return false }
+        return facts.machine == (arch == "x86" ? 0x14c : 0x8664)
+    }
+}
+
+@MainActor final class XAudio2Model: ObservableObject {
+    static let shared = XAudio2Model()
+
+    enum Phase: Equatable { case idle, downloading(Double), installing }
+
+    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var complete = false
+    @Published var error: String?
+
+    private var observations: [NSKeyValueObservation] = []
+    private init() { refresh() }
+
+    var busy: Bool { phase != .idle }
+    var status: String {
+        switch phase {
+        case .downloading(let f): return "Downloading… \(Int((f * 100).rounded()))%"
+        case .installing: return "Unpacking and checking…"
+        case .idle: return complete ? "Installed" : "Not installed"
+        }
+    }
+
+    private func log(_ line: String) { LogStore.shared.log("[xaudio2] " + line) }
+
+    func refresh() { complete = XAudio2Installer.installed("x64") && XAudio2Installer.installed("x86") }
+
+    func install() {
+        guard !busy else { return }
+        guard wine_process_is_running() == 0, wineserver_is_running() == 0, LibraryModel.shared.current == nil else {
+            error = "A session is running. Try again when it has ended."; return
+        }
+        error = nil
+        phase = .downloading(0)
+        log("install: XAudio2 2.7 from Microsoft's DirectX June 2010 package, \(XAudio2Pin.megabytes) MB")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let file = try await self.download()
+                self.phase = .installing
+                let files = try await Task.detached(priority: .userInitiated) { try XAudio2Installer.extract(installer: file) }.value
+                for (arch, dlls) in files {
+                    try VCRedistInstaller.install(dlls, into: XAudio2Installer.folder(arch))
+                    self.log("\(arch): \(dlls.keys.sorted().joined(separator: ", ")) placed in \(XAudio2Installer.folder(arch).lastPathComponent)")
+                }
+                try? FileManager.default.removeItem(at: file)
+                self.refresh()
+                self.phase = .idle
+                if self.complete { self.log("installed; the next session links them") }
+                else { self.fail("The DLLs were placed, but reading them back failed. Export the log.") }
+            } catch {
+                self.fail(error.localizedDescription)
+            }
+        }
+    }
+
+    private func download() async throws -> URL {
+        let kept = FileManager.default.temporaryDirectory.appendingPathComponent("madeira-" + XAudio2Pin.fileName)
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: kept.path), (attrs[.size] as? Int64) == XAudio2Pin.bytes,
+           (try? WineMonoInstaller.sha256(of: kept)) == XAudio2Pin.sha256 {
+            log("already downloaded and verified")
+            return kept
+        }
+        let temp: URL = try await withCheckedThrowingContinuation { continuation in
+            let task = URLSession.shared.downloadTask(with: XAudio2Pin.url) { temp, response, failure in
+                if let failure { continuation.resume(throwing: failure); return }
+                guard let temp, let http = response as? HTTPURLResponse else {
+                    continuation.resume(throwing: VCRedistError.message("No response from Microsoft's download server.")); return
+                }
+                guard http.statusCode == 200 else {
+                    continuation.resume(throwing: VCRedistError.message("Microsoft's download server answered \(http.statusCode).")); return
+                }
+                guard response?.url?.scheme == "https" else {
+                    continuation.resume(throwing: VCRedistError.message("The package was served from an unexpected address.")); return
+                }
+                try? FileManager.default.removeItem(at: kept)
+                do { try FileManager.default.moveItem(at: temp, to: kept); continuation.resume(returning: kept) }
+                catch { continuation.resume(throwing: error) }
+            }
+            observations.append(task.observe(\.countOfBytesReceived) { task, _ in
+                let received = min(task.countOfBytesReceived, XAudio2Pin.bytes)
+                Task { @MainActor in self.phase = .downloading(Double(received) / Double(XAudio2Pin.bytes)) }
+            })
+            task.resume()
+        }
+        observations.removeAll()
+        let attrs = try FileManager.default.attributesOfItem(atPath: temp.path)
+        guard (attrs[.size] as? Int64) == XAudio2Pin.bytes, try WineMonoInstaller.sha256(of: temp) == XAudio2Pin.sha256 else {
+            try? FileManager.default.removeItem(at: temp)
+            throw VCRedistError.message("The download does not match its pinned size and SHA-256. Nothing was installed.")
+        }
+        log("\(XAudio2Pin.bytes) bytes, SHA-256 verified")
+        return temp
+    }
+
+    /// Removes both folders. The next session goes back to Wine's own XAudio2.
+    func remove() {
+        guard !busy, wine_process_is_running() == 0, wineserver_is_running() == 0 else { return }
+        for arch in ["x64", "x86"] { try? FileManager.default.removeItem(at: XAudio2Installer.folder(arch)) }
+        refresh()
+        error = nil
+        log("removed")
+    }
+
+    private func fail(_ message: String) {
+        phase = .idle
+        error = message
+        log("failed: " + message)
+    }
+}
+
+struct XAudio2SettingsSection: View {
+    @ObservedObject private var model = XAudio2Model.shared
+    @State private var confirmRemove = false
+
+    var body: some View {
+        Section {
+            LabeledContent("XAudio2 2.7 (June 2010)", value: model.status)
+            if case .downloading(let f) = model.phase { ProgressView(value: f) }
+            if model.phase == .installing { ProgressView() }
+            if let error = model.error { Text(error).font(.caption).foregroundStyle(.red) }
+            if !model.busy {
+                Button { model.install() } label: {
+                    Label(model.complete ? "Install again" : (model.error == nil ? "Download and install" : "Try Again"),
+                          systemImage: "arrow.down.circle")
+                }
+                if model.complete { Button("Remove XAudio2", role: .destructive) { confirmRemove = true } }
+            }
+        } header: {
+            Text("DirectX audio (XAudio2)")
+        } footer: {
+            Text("Some older games (Dead Rising 2006, for one) need Microsoft's XAudio2 2.7 and get no sound or load for ever without it. Madeira downloads Microsoft's DirectX June 2010 package (about \(XAudio2Pin.megabytes) MB), takes out only the XAudio2 files on this device, and uses them for every game. Nothing restarts: the next game start uses them. Microsoft's licence terms for the package apply to the files.")
+        }
+        .confirmationDialog("Remove XAudio2 2.7?", isPresented: $confirmRemove, titleVisibility: .visible) {
+            Button("Remove", role: .destructive) { model.remove() }
+        } message: {
+            Text("Games go back to Wine's own XAudio2 at their next start.")
+        }
+        .onAppear { model.refresh() }
+    }
+}
+
+// MARK: - .NET 10 runtime (Settings › Runtimes)
+
+/// Microsoft's .NET 10 Desktop Runtime for x64 games built with .NET 10 (Emuera and other
+/// WinForms/WPF tools whose launcher says "You must install .NET Desktop Runtime"). Madeira
+/// downloads Microsoft's two official zips (base runtime + Windows Desktop runtime), checks
+/// size and SHA-512 against the pins, and unpacks them into the Wine prefix at
+/// C:\Program Files\dotnet\x64 (the folder the app launcher searches by default on ARM
+/// Windows; no registry entry needed). Nothing is bundled. Log tag: [dotnet10].
+/// env.MADEIRA_DOTNET10 = 0 hides the feature.
+enum DotNet10Pin {
+    static let version = "10.0.9"
+    static let host = "builds.dotnet.microsoft.com"
+    struct Package: Sendable {
+        let title: String, url: URL, sha512: String, bytes: Int64
+        var fileName: String { url.lastPathComponent }
+    }
+    static let runtime = Package(
+        title: ".NET Runtime 10.0.9 x64",
+        url: URL(string: "https://builds.dotnet.microsoft.com/dotnet/Runtime/10.0.9/dotnet-runtime-10.0.9-win-x64.zip")!,
+        sha512: "f690e9d14a93f38482cc5d3fd825efa9b422385f907587cbe3b53f5265f8a116e97a5ef0d906b8a905b5e164b20874468f461a437a9fcd9554073d36174be70f",
+        bytes: 36_831_955)
+    static let desktop = Package(
+        title: ".NET Windows Desktop Runtime 10.0.9 x64",
+        url: URL(string: "https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/10.0.9/windowsdesktop-runtime-10.0.9-win-x64.zip")!,
+        sha512: "d87a22592f9bd231721dfff5ea01d45d9da67ace9caf690c5b3c6be0d66bdb86034bada364b36ec74f0abcd6b308856bff3736e6ba6c770fdfa2fde46bf042bb",
+        bytes: 39_132_437)
+    static let packages = [runtime, desktop]
+    static var totalMegabytes: Int { Int((Double(packages.reduce(0) { $0 + $1.bytes }) / 1_048_576).rounded()) }
+}
+
+@MainActor final class DotNet10Model: ObservableObject {
+    static let shared = DotNet10Model()
+    static var enabled: Bool { MadeiraConfig.flag("MADEIRA_DOTNET10") }
+    enum Phase: Equatable { case idle, downloading(Double), installing }
+
+    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var installed = false
+    @Published var error: String?
+    private var observations: [NSKeyValueObservation] = []
+    private init() {}
+
+    var busy: Bool { phase != .idle }
+    /// C:\Program Files\dotnet\x64 in the prefix.
+    static var folder: URL { MadeiraDock.drive.appendingPathComponent("Program Files/dotnet/x64", isDirectory: true) }
+    var status: String {
+        switch phase {
+        case .downloading(let f): return "Downloading… \(Int((f * 100).rounded()))%"
+        case .installing: return "Unpacking…"
+        case .idle: return installed ? "Installed (\(DotNet10Pin.version))" : "Not installed"
+        }
+    }
+    private func log(_ line: String) { LogStore.shared.log("[dotnet10] " + line) }
+
+    func refresh() {
+        let fm = FileManager.default, base = Self.folder
+        installed = fm.fileExists(atPath: base.appendingPathComponent("dotnet.exe").path)
+            && fm.fileExists(atPath: base.appendingPathComponent("host/fxr/\(DotNet10Pin.version)").path)
+            && fm.fileExists(atPath: base.appendingPathComponent("shared/Microsoft.NETCore.App/\(DotNet10Pin.version)").path)
+            && fm.fileExists(atPath: base.appendingPathComponent("shared/Microsoft.WindowsDesktop.App/\(DotNet10Pin.version)").path)
+    }
+
+    func install() {
+        guard !busy else { return }
+        guard wine_process_is_running() == 0, wineserver_is_running() == 0, LibraryModel.shared.current == nil else {
+            error = "A session is running. Try again when it has ended."; return
+        }
+        error = nil
+        phase = .downloading(0)
+        let total = Double(DotNet10Pin.packages.reduce(0) { $0 + $1.bytes })
+        log("install: .NET \(DotNet10Pin.version) x64, \(DotNet10Pin.totalMegabytes) MB from Microsoft")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                var files: [URL] = []
+                var done: Int64 = 0
+                for package in DotNet10Pin.packages {
+                    let base = done
+                    files.append(try await self.download(package) { received in
+                        self.phase = .downloading(Double(base + received) / total)
+                    })
+                    done += package.bytes
+                }
+                self.phase = .installing
+                let target = Self.folder
+                try await Task.detached(priority: .userInitiated) {
+                    let fm = FileManager.default
+                    let scratch = fm.temporaryDirectory.appendingPathComponent("madeira-dotnet10", isDirectory: true)
+                    try? fm.removeItem(at: scratch)
+                    try fm.createDirectory(at: scratch, withIntermediateDirectories: true)
+                    defer { try? fm.removeItem(at: scratch) }
+                    let base = scratch.appendingPathComponent("runtime", isDirectory: true)
+                    let desktop = scratch.appendingPathComponent("desktop", isDirectory: true)
+                    guard try ItchArchive.unpackAny(files[0], to: base) != nil, try ItchArchive.unpackAny(files[1], to: desktop) != nil else {
+                        throw VCRedistError.message("A .NET download was not a zip file.")
+                    }
+                    // The desktop zip holds only shared/Microsoft.WindowsDesktop.App/<version>.
+                    let shared = base.appendingPathComponent("shared", isDirectory: true)
+                    try fm.createDirectory(at: shared, withIntermediateDirectories: true)
+                    try fm.moveItem(at: desktop.appendingPathComponent("shared/Microsoft.WindowsDesktop.App", isDirectory: true),
+                                    to: shared.appendingPathComponent("Microsoft.WindowsDesktop.App", isDirectory: true))
+                    try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    let retired = target.deletingLastPathComponent().appendingPathComponent("x64.old", isDirectory: true)
+                    try? fm.removeItem(at: retired)
+                    let had = fm.fileExists(atPath: target.path)
+                    if had { try fm.moveItem(at: target, to: retired) }
+                    do { try fm.moveItem(at: base, to: target) }
+                    catch { if had { try? fm.moveItem(at: retired, to: target) }; throw error }
+                    try? fm.removeItem(at: retired)
+                }.value
+                for file in files { try? FileManager.default.removeItem(at: file) }
+                self.refresh()
+                self.phase = .idle
+                if self.installed { self.log("installed in \(Self.folder.path)") }
+                else { self.fail("The files were placed, but reading them back failed. Export the log.") }
+            } catch { self.fail(error.localizedDescription) }
+        }
+    }
+
+    private func download(_ package: DotNet10Pin.Package, progress: @escaping @MainActor (Int64) -> Void) async throws -> URL {
+        let kept = FileManager.default.temporaryDirectory.appendingPathComponent("madeira-" + package.fileName)
+        func sha512(_ file: URL) throws -> String {
+            let handle = try FileHandle(forReadingFrom: file)
+            defer { try? handle.close() }
+            var hasher = SHA512()
+            while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty { hasher.update(data: chunk) }
+            return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        }
+        let temp: URL = try await withCheckedThrowingContinuation { continuation in
+            let task = URLSession.shared.downloadTask(with: package.url) { temp, response, failure in
+                if let failure { continuation.resume(throwing: failure); return }
+                guard let temp, let http = response as? HTTPURLResponse else {
+                    continuation.resume(throwing: VCRedistError.message("No response from Microsoft's download server.")); return
+                }
+                guard http.statusCode == 200 else {
+                    continuation.resume(throwing: VCRedistError.message("Microsoft's download server answered \(http.statusCode) for \(package.fileName).")); return
+                }
+                guard response?.url?.scheme == "https", let host = response?.url?.host, host == DotNet10Pin.host || host.hasSuffix(".microsoft.com") else {
+                    continuation.resume(throwing: VCRedistError.message("\(package.fileName) was served from an unexpected address.")); return
+                }
+                try? FileManager.default.removeItem(at: kept)
+                do { try FileManager.default.moveItem(at: temp, to: kept); continuation.resume(returning: kept) }
+                catch { continuation.resume(throwing: error) }
+            }
+            observations.append(task.observe(\.countOfBytesReceived) { task, _ in
+                let received = task.countOfBytesReceived
+                Task { @MainActor in progress(min(received, package.bytes)) }
+            })
+            task.resume()
+        }
+        observations.removeAll()
+        let size = (try FileManager.default.attributesOfItem(atPath: temp.path)[.size] as? Int64) ?? 0
+        guard size == package.bytes, try sha512(temp) == package.sha512 else {
+            try? FileManager.default.removeItem(at: temp)
+            throw VCRedistError.message("\(package.fileName) does not match its pinned size and SHA-512. Nothing was installed.")
+        }
+        log("\(package.fileName): \(size) bytes, SHA-512 verified")
+        return temp
+    }
+
+    func remove() {
+        guard !busy, wine_process_is_running() == 0, wineserver_is_running() == 0 else { return }
+        try? FileManager.default.removeItem(at: Self.folder)
+        refresh(); error = nil; log("removed")
+    }
+
+    private func fail(_ message: String) { phase = .idle; error = message; log("failed: " + message) }
+}
+
+struct DotNet10SettingsSection: View {
+    @ObservedObject private var model = DotNet10Model.shared
+    @State private var confirmRemove = false
+    var body: some View {
+        Section {
+            LabeledContent(".NET 10 Desktop Runtime", value: model.status)
+            if case .downloading(let f) = model.phase { ProgressView(value: f) }
+            if model.phase == .installing { ProgressView() }
+            if let error = model.error { Text(error).font(.caption).foregroundStyle(.red) }
+            if !model.busy {
+                Button { model.install() } label: {
+                    Label(model.installed ? "Install again" : (model.error == nil ? "Download and install" : "Try Again"),
+                          systemImage: "arrow.down.circle")
+                }
+                if model.installed { Button("Remove the runtime", role: .destructive) { confirmRemove = true } }
+            }
+        } header: {
+            Text(".NET 10")
+        } footer: {
+            Text("Some games and tools are .NET 10 programs and stop with \"You must install .NET Desktop Runtime\". Madeira downloads Microsoft's own .NET \(DotNet10Pin.version) zips (about \(DotNet10Pin.totalMegabytes) MB), checks them, and unpacks them into the Windows folder Program Files\\dotnet on this device. Nothing restarts: the next game start finds it. Microsoft's licence terms for .NET apply.")
+        }
+        .confirmationDialog("Remove .NET 10?", isPresented: $confirmRemove, titleVisibility: .visible) {
+            Button("Remove", role: .destructive) { model.remove() }
+        } message: { Text(".NET 10 programs will stop with the missing-runtime message again.") }
+        .onAppear { model.refresh() }
     }
 }

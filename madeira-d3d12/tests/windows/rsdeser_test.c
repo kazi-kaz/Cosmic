@@ -28,7 +28,7 @@
 
 /* What the extracted regions expect from the rest of the runtime. The bounds
  * must match the runtime's (MAD_ROOT_PARAM_MAX / MAD_ROOT_RANGE_SANE). */
-#define MAD_ROOT_PARAM_MAX 32
+#define MAD_ROOT_PARAM_MAX 64   /* d3d12-root-params-64 */
 #define MAD_ROOT_RANGE_SANE 8192
 static int g_quiet;
 static void d3d12_log(const char *fmt, ...) {

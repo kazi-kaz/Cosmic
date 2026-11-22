@@ -46,7 +46,7 @@ enum OnboardingRules {
 
     enum Step: String, CaseIterable {
         case welcome, localDevVPN = "localdevvpn", jit, signIn = "sign-in", dockClient = "dock-client",
-             wineMono = "wine-mono", vcRedist = "vc-redist", done
+             wineMono = "wine-mono", vcRedist = "vc-redist", gameParts = "game-parts", done
 
         /// The revision whose setup first had this page.
         var introduced: Int {
@@ -54,6 +54,7 @@ enum OnboardingRules {
             case .localDevVPN: return 2
             case .wineMono: return 3
             case .vcRedist: return 4
+            case .gameParts: return 3
             default: return 1
             }
         }
@@ -66,8 +67,10 @@ enum OnboardingRules {
     /// Wine Mono only when this device has none (`wineMono`), the Visual C++ runtime only
     /// when the prefix does not have it yet (`vcRedist`). With `since` (the revision this
     /// device last saw, after an update) only the pages added after it are offered.
+    /// With `merged` (env.MADEIRA_GET_GAME_PARTS, on by default) the Wine Mono and Visual C++ pages
+    /// are one page, `.gameParts`, placed where the first of them was; 0 keeps the two separate pages.
     static func steps(signIn: Bool, dock: Bool, localDevVPN: Bool = false, wineMono: Bool = false,
-                      vcRedist: Bool = false, since: Int = 0) -> [Step] {
+                      vcRedist: Bool = false, since: Int = 0, merged: Bool = false) -> [Step] {
         var list: [Step] = [.welcome]
         if localDevVPN { list.append(.localDevVPN) }
         list.append(.jit)
@@ -76,13 +79,17 @@ enum OnboardingRules {
         if wineMono { list.append(.wineMono) }
         if vcRedist { list.append(.vcRedist) }
         list.append(.done)
-        return since > 0 ? list.filter { $0 == .welcome || $0 == .done || $0.introduced > since } : list
+        let shown = since > 0 ? list.filter { $0 == .welcome || $0 == .done || $0.introduced > since } : list
+        guard merged, let first = shown.firstIndex(where: { $0 == .wineMono || $0 == .vcRedist }) else { return shown }
+        var out = shown.filter { $0 != .wineMono && $0 != .vcRedist }
+        out.insert(.gameParts, at: first)
+        return out
     }
 
     /// Whether there is anything to set up between the welcome and done pages.
     static func hasSetup(_ steps: [Step]) -> Bool {
         steps.contains(.jit) || steps.contains(.signIn) || steps.contains(.dockClient) || steps.contains(.wineMono)
-            || steps.contains(.vcRedist)
+            || steps.contains(.vcRedist) || steps.contains(.gameParts)
     }
 
     /// Whether setup opens by itself when the library appears.
@@ -133,7 +140,8 @@ enum OnboardingRules {
     var steps: [Step] { steps(since: since) }
     private func steps(since: Int) -> [Step] {
         OnboardingRules.steps(signIn: SteamSignIn.isEnabled, dock: MadeiraDock.enabled, localDevVPN: offerLocalDevVPN,
-                              wineMono: offerWineMono, vcRedist: offerVCRedist, since: since)
+                              wineMono: offerWineMono, vcRedist: offerVCRedist, since: since,
+                              merged: MadeiraConfig.flag("MADEIRA_GET_GAME_PARTS"))
     }
     private static func vcRedistOffered() -> Bool {
         guard VCRedistModel.enabled else { return false }
@@ -212,12 +220,20 @@ struct OnboardingView: View {
     @ObservedObject private var mono = WineMonoModel.shared
     @ObservedObject private var redist = VCRedistModel.shared
     @State private var showSignIn = false
+    /// Get Game Parts: which parts the Download button fetches, and the Details text.
+    @State private var wantVC = true
+    @State private var wantNet = true
+    @State private var showPartDetails = false
     @State private var importingPairingFile = false
     @State private var pairingImportError: String?
     @State private var jitPath: JITSetupPath?
     /// Asked again whenever Madeira comes back to the front (from the App Store, say).
     @State private var localDevVPNInstalled = LocalDevVPN.isInstalled
     @Environment(\.scenePhase) private var scenePhase
+    /// iOS Reduce Motion: steps change with a quick fade (they changed instantly before) and their parts fade, not grow
+    /// (env.MADEIRA_REDUCE_MOTION = 0 restores the current animations).
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private var fadeOnly: Bool { reduceMotion && MadeiraConfig.flag("MADEIRA_REDUCE_MOTION") }
 
     enum JITSetupPath: String {
         case onDevice = "in-app", pairingFile = "pairing-file", stikDebug = "stikdebug"
@@ -243,12 +259,14 @@ struct OnboardingView: View {
                     case .dockClient: dockClientPage
                     case .wineMono: wineMonoPage
                     case .vcRedist: vcRedistPage
+                    case .gameParts: gamePartsPage
                     case .done: donePage
                     }
                 }
                 .padding(24).frame(maxWidth: 560, alignment: .leading).frame(maxWidth: .infinity)
-                .animation(.default, value: jitPath)
-                .animation(.default, value: pairing.phase)
+                .animation(fadeOnly ? .easeInOut(duration: 0.15) : .default, value: jitPath)
+                .animation(fadeOnly ? .easeInOut(duration: 0.15) : .default, value: pairing.phase)
+                .animation(fadeOnly ? .easeInOut(duration: 0.15) : nil, value: model.step)
             }
             .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
         }
@@ -331,13 +349,17 @@ struct OnboardingView: View {
                 Text("A few optional steps get you ready:").foregroundStyle(.secondary)
             }
             let pages = model.steps
-            let offered: [LocalizedStringKey] =
-                (pages.contains(.localDevVPN) ? ["Install LocalDevVPN, which Madeira enables JIT through."] : [])
-                + (pages.contains(.jit) ? ["Choose how Madeira enables JIT."] : [])
-                + (pages.contains(.signIn) ? ["Sign in to Steam in Madeira."] : [])
-                + (pages.contains(.dockClient) ? ["Download Valve's Steam client components for Madeira Dock."] : [])
-                + (pages.contains(.wineMono) ? ["Download Wine Mono, for games built on .NET Framework."] : [])
-                + (pages.contains(.vcRedist) ? ["Install Microsoft's Visual C++ runtime, which many games need."] : [])
+            let offered: [LocalizedStringKey] = {
+                var o: [LocalizedStringKey] = []
+                if pages.contains(.localDevVPN) { o.append("Install LocalDevVPN, which Madeira enables JIT through.") }
+                if pages.contains(.jit) { o.append("Choose how Madeira enables JIT.") }
+                if pages.contains(.signIn) { o.append("Sign in to Steam in Madeira.") }
+                if pages.contains(.dockClient) { o.append("Download Valve's Steam client components for Madeira Dock.") }
+                if pages.contains(.wineMono) { o.append("Download Wine Mono, for games built on .NET Framework.") }
+                if pages.contains(.vcRedist) { o.append("Install Microsoft's Visual C++ runtime, which many games need.") }
+                if pages.contains(.gameParts) { o.append("Get Game Parts: the Microsoft parts most Windows games need to start.") }
+                return o
+            }()
             ForEach(offered.indices, id: \.self) { index in point(index + 1, offered[index]) }
             primary("Get started", symbol: "arrow.right") { model.next() }.padding(.top, 8)
             secondary("Skip setup") { model.skip() }
@@ -631,7 +653,7 @@ struct OnboardingView: View {
                     if let error = dock.error {
                         Label(error, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
                     }
-                    primary(dock.error == nil ? "Download components" : "Try again", symbol: "arrow.down.circle.fill") {
+                    primary(dock.error == nil ? "Download components" : "Try Again", symbol: "arrow.down.circle.fill") {
                         LogStore.shared.log("[onboarding] components download")
                         dock.prepareClient()
                     }
@@ -665,7 +687,7 @@ struct OnboardingView: View {
                     if let error = mono.error {
                         Label(error, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
                     }
-                    primary(mono.error == nil ? "Download Wine Mono" : "Try again", symbol: "arrow.down.circle.fill") {
+                    primary(mono.error == nil ? "Download Wine Mono" : "Try Again", symbol: "arrow.down.circle.fill") {
                         LogStore.shared.log("[onboarding] Wine Mono download")
                         mono.install()
                     }
@@ -700,7 +722,7 @@ struct OnboardingView: View {
                     if let error = redist.error {
                         Label(error, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
                     }
-                    primary(redist.error == nil ? "Download and install" : "Try again", symbol: "arrow.down.circle.fill") {
+                    primary(redist.error == nil ? "Download and install" : "Try Again", symbol: "arrow.down.circle.fill") {
                         LogStore.shared.log("[onboarding] Visual C++ runtime install")
                         redist.install()
                     }
@@ -708,6 +730,85 @@ struct OnboardingView: View {
                 secondary("Set up later") { model.next() }
             }
         }
+    }
+
+    /// Get Game Parts (env.MADEIRA_GET_GAME_PARTS = 0 keeps the two pages below): Visual C++ and
+    /// Wine Mono on one screen. The downloads, sums and installs are the models' own (VCRedistModel,
+    /// WineMonoModel), unchanged; only the screen is merged.
+    private var gamePartsPage: some View {
+        let vcShown = VCRedistModel.enabled
+        let vcNeeded = vcShown && !redist.complete
+        let netNeeded = !mono.installed
+        let monoBusy = mono.phase != .idle
+        let busy = redist.busy || monoBusy
+        let wanted = (wantVC && vcNeeded) || (wantNet && netNeeded)
+        return VStack(alignment: .leading, spacing: 18) {
+            header("Get Game Parts", symbol: "shippingbox")
+            Text("Most Windows games need a few Microsoft parts to start. Madeira downloads them for you.")
+            VStack(spacing: 0) {
+                if vcShown {
+                    partRow("Visual C++ (most games)", done: !vcNeeded, on: wantVC) { wantVC.toggle() }
+                }
+                if vcShown { Divider() }
+                partRow(".NET (some games)", done: !netNeeded, on: wantNet) { wantNet.toggle() }
+            }
+            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
+            if case .downloading(let f) = redist.phase { gamePartProgress(f, redist.status) }
+            if case .installing(let f) = redist.phase { gamePartProgress(f, redist.status) }
+            if case .downloading(let f) = mono.phase { gamePartProgress(f, mono.status) }
+            if case .installing(let f) = mono.phase { gamePartProgress(f, mono.status) }
+            if let error = redist.error {
+                Label(error, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
+            }
+            if let error = mono.error {
+                Label(error, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
+            }
+            if !busy {
+                if wanted {
+                    primary(redist.error == nil && mono.error == nil ? "Download" : "Try Again", symbol: "arrow.down.circle.fill") {
+                        LogStore.shared.log("[onboarding] Get Game Parts download vc=\(wantVC && vcNeeded) net=\(wantNet && netNeeded)")
+                        if wantVC && vcNeeded { redist.install() }
+                        if wantNet && netNeeded { mono.install() }
+                    }
+                } else {
+                    primary("Continue", symbol: "arrow.right") { model.next() }
+                }
+            }
+            // Also while a download runs: the setup sheet cannot be swiped away, and downloads continue off the page.
+            if busy || wanted { secondary("Set up later") { model.next() } }
+            Button(showPartDetails ? "Hide Details" : "Details") { showPartDetails.toggle() }
+                .frame(minHeight: 44)
+            if showPartDetails {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Visual C++: many Windows games are built with Microsoft Visual C++ and need its 2015-2022 runtime. Madeira downloads Microsoft's own installers (about \(VCRedistPin.totalMegabytes) MB), checks them against pinned SHA-256 sums and takes the runtime out of them on this device. No Windows session runs for this.")
+                    Text(".NET: some games are built on Microsoft's .NET Framework. Madeira runs them on Wine Mono, the Wine project's open-source .NET runtime, downloaded from WineHQ: about 42 MB, about 130 MB once installed.")
+                    Text("Both can also be added or removed later in Settings.")
+                }
+                .font(.footnote).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func gamePartProgress(_ fraction: Double, _ status: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ProgressView(value: fraction)
+            Text(status).font(.subheadline).foregroundStyle(.secondary).monospacedDigit()
+        }
+    }
+
+    private func partRow(_ title: String, done: Bool, on: Bool, toggle: @escaping () -> Void) -> some View {
+        Button(action: toggle) {
+            HStack(spacing: 12) {
+                Image(systemName: done ? "checkmark.circle.fill" : (on ? "checkmark.square.fill" : "square"))
+                    .font(.title3).foregroundStyle(done ? Color.green : Color.accentColor)
+                Text(LocalizedStringKey(title)).foregroundStyle(Color.primary)
+                Spacer(minLength: 0)
+                if done { Text("Installed").font(.footnote).foregroundStyle(.secondary) }
+            }
+            .padding(.horizontal, 14).frame(minHeight: 44).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).disabled(done)
+        .accessibilityValue(done ? "Installed" : (on ? "Selected" : "Not selected"))
     }
 
     private var donePage: some View {
@@ -722,8 +823,11 @@ struct OnboardingView: View {
             if model.steps.contains(.wineMono) {
                 Text("Settings › .NET Framework downloads or removes Wine Mono.")
             }
-            if model.steps.contains(.vcRedist) {
+            if model.steps.contains(.vcRedist) || model.steps.contains(.gameParts) {
                 Text("Settings › Visual C++ runtimes installs Microsoft's runtime again, or removes it.")
+            }
+            if model.steps.contains(.gameParts) {
+                Text("Settings › .NET Framework downloads or removes Wine Mono.")
             }
             Text("You can run this setup again from Settings › JIT or Settings › Steam.").foregroundStyle(.secondary)
             primary("Go to your library", symbol: "square.grid.2x2.fill") { model.finish() }
@@ -746,6 +850,8 @@ struct SteamSettingsSection: View {
     @ObservedObject private var onboarding = OnboardingModel.shared
     @ObservedObject private var cloud = SteamCloudSetting.shared
     @State private var confirmSignOut = false
+    /// Settings › Steam › Status (SteamOnlineStatus), shown while signed in.
+    @State private var status = SteamOnlineStatus.current
     /// Settings › Steam › Game language (SteamLanguage); "" follows the device.
     @State private var language = SteamLanguage.chosen ?? ""
     /// Settings › Steam › Downloads from PCs on this network (SteamLANSetting).
@@ -761,6 +867,10 @@ struct SteamSettingsSection: View {
             if let name = signIn.accountName {
                 LabeledContent("Signed in as", value: name)
                 Button("Sign out of Steam", role: .destructive) { confirmSignOut = true }
+                Picker("Status", selection: $status) {
+                    ForEach(SteamOnlineStatus.allCases) { Text($0.title).tag($0) }
+                }
+                .onChange(of: status) { _, value in SteamOnlineStatus.current = value }
             } else {
                 Button { open(.steamSignIn) } label: { Label("Sign in to Steam", systemImage: "person.crop.circle.badge.plus") }
             }
@@ -802,7 +912,10 @@ struct SteamSettingsSection: View {
         } header: {
             Text("Steam")
         } footer: {
-            Text("Game language: the language Steam downloads install, and the one Steam tells the game to use. A game without it gets English. Installed games keep their language until you choose Download in their page.\n\nDownloads from PCs on this network: a game's download comes first from a PC on the same network whose Steam has it installed and up to date, through Steam's local network game transfers (Steam on the PC: same account, Settings › Downloads › Game file transfer over local network on, no download or game running). Anything the PC does not have comes from Steam's servers. Madeira finds the PC through Steam and shows up in the account's devices as \"Madeira\". PC address: only when the PC is not found; its IP address on this network.\n\nMadeira keeps a Steam sign-in token in this device's Keychain, for this device only. Signing out removes it.")
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Status: what Steam friends see while a game runs through Madeira Dock. Offline, the default, leaves Friends off, as before: no friends list or invites in the game. Online, Away or Invisible signs in to Friends for the game the way desktop Steam's Friends window does, with the same status messages to Steam, and the Madeira menu then has a Friends page where the status can also be changed.")
+                Text("Game language: the language Steam downloads install, and the one Steam tells the game to use. A game without it gets English. Installed games keep their language until you choose Download in their page.\n\nDownloads from PCs on this network: a game's download comes first from a PC on the same network whose Steam has it installed and up to date, through Steam's local network game transfers (Steam on the PC: same account, Settings › Downloads › Game file transfer over local network on, no download or game running). Anything the PC does not have comes from Steam's servers. Madeira finds the PC through Steam and shows up in the account's devices as \"Madeira\". PC address: only when the PC is not found; its IP address on this network.\n\nMadeira keeps a Steam sign-in token in this device's Keychain, for this device only. Signing out removes it.")
+            }
         }
         .confirmationDialog("Sign out of Steam?", isPresented: $confirmSignOut, titleVisibility: .visible) {
             Button("Sign out", role: .destructive) { signIn.signOut() }

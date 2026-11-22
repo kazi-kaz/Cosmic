@@ -103,7 +103,7 @@ extern kern_return_t vm_protect(mach_port_t target_task, vm_address_t address,
 #undef host_page_size
 #endif
 
-#if defined(HAVE_LINUX_USERFAULTFD_H) && defined(HAVE_LINUX_FS_H)
+#if defined(HAVE_LINUX_USERFAULTFD_H) && defined(HAVE_LINUX_FS_H) && !defined(__ANDROID__)
 # include <linux/userfaultfd.h>
 # include <linux/fs.h>
 #if defined(UFFD_FEATURE_WP_ASYNC) && defined(PM_SCAN_WP_MATCHING)
@@ -147,8 +147,14 @@ WINE_DECLARE_DEBUG_CHANNEL(virtual_ranges);
 /* 512: desktop mode holds the session's full aarch64 image set PLUS every
  * pseudo-process child's x64/EC set in one table. 64 overflowed at exactly
  * the 65th image (Thumper under desktop, 2026-07-06): concrt140 copied but
- * never registered → raw-VA DllMain call → unfixable exec-fault loop. */
-#define IOS_JIT_MAX_MAPPINGS 512
+ * never registered → raw-VA DllMain call → unfixable exec-fault loop.
+ * 2048: StarCraft via Battle.net peaked near 700 live images (device log
+ * 46ebf8e1, Wave 38: "mapping table FULL (512 slots)" 218 times over 191
+ * distinct images) -- COMCTL32/SETUPAPI/POWRPROF/uxtheme were copied into the
+ * pool but never registered, then exec-faulted at their PE VAs. Lookups scan
+ * only up to ios_jit_mapping_count (the highest slot ever used), so the larger
+ * table costs BSS, not lookup time. */
+#define IOS_JIT_MAX_MAPPINGS 2048
 #define IOS_JIT_MAX_CODE_RANGES 96
 struct ios_jit_mapping {
     void *pe_base;      /* Original PE image base address (unix mapping) */
@@ -188,7 +194,7 @@ struct ios_jit_mapping {
     unsigned char  is_fex;          /* copy of FEX's ARM64EC module (xtajit64.dll) */
 };
 static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];
-static int ios_jit_mapping_count = 0;
+static int ios_jit_mapping_count = 0;   /* high-water slot index + 1: every scan stops here */
 
 /* JIT pool head bump allocator. Owned by mprotect_exec's PE-image copy path
  * (was a function-local static there); file-scope so the S1 per-child
@@ -1668,6 +1674,10 @@ static unsigned          ios_jumbo_seq;
 static unsigned long long ios_jumbo_last_ms;
 static size_t            ios_jumbo_granted;      /* bytes actually handed out */
 static unsigned          ios_jumbo_ok, ios_jumbo_fail;
+/* For signal_arm64_ios.c's [brp-contain]: how many jumbo (>= 1 GB) reserves of this
+ * session failed. A refused PartitionAlloc reserve is the usual reason chrome_elf.dll
+ * stops on its own int3 (BeamNG.drive, 2026-11-01). */
+unsigned ios_jumbo_fail_count(void) { return ios_jumbo_fail; }
 
 static unsigned long long ios_now_ms( void )
 {
@@ -4050,6 +4060,240 @@ static int ios_pool_recycle_code_range( size_t want )
     return transferred;
 }
 
+/* pool-tail-for-head: a free FEX code-buffer carve goes to the head when the head would otherwise fail.
+ *
+ * Wave 33, Battle.net + StarCraft: five "tail BIG" 128 MB grants (one per launcher/helper process)
+ * plus the 16 MB ones took the tail to 0x294b4000 of the 0x374a8000 pool (74.7 %, the tail's 3/4
+ * ceiling), the head had 0x94000 left, and every later image copy (POWRPROF.dll: "Required library
+ * 'POWRPROF.dll' does not exist") and anon RWX page (ClientSdk's 1.5 MB) failed EXHAUSTED -- while
+ * the exits of the dead helpers had left their code buffers FREE (retired) in ios_tail_carves. The
+ * head allocators only read the head freelist; a free carve was only ever offered to another FEX
+ * code buffer, so the space was idle. This is the reverse of ios_pool_take_freed_for_tail (ml1039):
+ * before an image copy or an anon RWX page fails, hand the smallest free carve that fits to the
+ * head freelist and let the normal allocator split it (remainder stays on the freelist).
+ *
+ * Eligibility is exactly what a later FEX reuse of the carve needs: free, retired ones only after the
+ * image reuse grace, mapped readable+executable throughout (ios_pool_recycle_range_ready), and a strict
+ * scan finds no thread's PC inside (ios_tail_carve_scan). Region C carves (below the pool span) are
+ * not taken. Lock order carve -> pool, as ios_pool_recycle_code_range.
+ *
+ * tail_resv: it is NOT lowered when the carve goes to the freelist. The counter is a plain byte count
+ * from the pool top; a carve in the middle cannot lower it without leaving a hole, and with pool-split a
+ * carve's grant can include spans it skipped over the holes (they became free carves of their own), so a
+ * decrease by the carve size would hand those out twice. The head gets the carve through the freelist,
+ * which does not look at tail_resv. Only in the one safe case -- an unsplit pool and the carve is the
+ * lowest one (its offset == pool - tail_resv), the counter is lowered by compare-and-swap and the bump
+ * cursor simply regains the space; no freelist entry then, or the bump would hand it out a second time.
+ *
+ * MADEIRA_POOL_TAIL_FOR_HEAD=0 turns it off. Logs [pool-tail-for-head] #n (cap 32). */
+static int ios_tail_for_head_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_POOL_TAIL_FOR_HEAD" );
+        on = !(e && e[0] == '0' && !e[1]);
+    }
+    return on;
+}
+
+/* The smallest free carve in carves[0..n) that is ready for reuse, inside the pool span (not region C),
+ * page aligned and at least `want` bytes, that is not one of skip[0..nskip) (offsets already tried and
+ * refused this call). Returns its index or ~0u. Pure: no locks, no globals. */
+static unsigned ios_pool_pick_carve_for_head( const struct ios_tail_carve *carves, unsigned n, time_t now,
+                                              size_t want, size_t pool_size, const size_t *skip, unsigned nskip )
+{
+    unsigned i, k, best = ~0u;
+
+    for (i = 0; i < n; i++)
+    {
+        const struct ios_tail_carve *c = &carves[i];
+
+        if (!want || !ios_tail_carve_ready( c, now ) || c->size < want || (c->size & 0x3fff) || (c->off & 0x3fff)) continue;
+        if (c->off >= pool_size || c->size > pool_size - c->off) continue;   /* region C wraps; never taken */
+        for (k = 0; k < nskip; k++) if (skip[k] == c->off) break;
+        if (k < nskip) continue;
+        if (best == ~0u || c->size < carves[best].size) best = i;
+    }
+    return best;
+}
+
+/* The carve table once, at the first failure of a head allocation: where the tail's bytes are. */
+static void ios_tail_carve_census_once( const char *who, size_t want )
+{
+    static int done;
+    unsigned i, live = 0, freen = 0, retired = 0, in_grace = 0, low = 0, big_live = 0, total;
+    size_t live_b = 0, free_b = 0, retired_b = 0, largest_free = 0, grace_b = 0;
+    time_t now = time( NULL );
+
+    if (__sync_lock_test_and_set( &done, 1 )) return;
+    pthread_mutex_lock( &ios_tail_carve_lock );
+    total = ios_tail_carve_n;
+    for (i = 0; i < ios_tail_carve_n; i++)
+    {
+        const struct ios_tail_carve *c = &ios_tail_carves[i];
+
+        if (ios_tail_carve_in_low( c->off )) low++;
+        if (!c->free)
+        {
+            live++;
+            live_b += c->size;
+            if (c->size > 0x1000000) big_live++;
+            continue;
+        }
+        freen++;
+        free_b += c->size;
+        if (c->size > largest_free) largest_free = c->size;
+        if (c->retired)
+        {
+            retired++;
+            retired_b += c->size;
+            if (now - c->freed_at < IOS_POOL_REUSE_GRACE_SEC) { in_grace++; grace_b += c->size; }
+        }
+    }
+    pthread_mutex_unlock( &ios_tail_carve_lock );
+    dprintf( 2, "[pool-tail-for-head] census at the first head failure (%s, want=0x%lx): carves=%u/%d live=%u 0x%lx "
+                "(%u over 16MB) free=%u 0x%lx (retired by an exited process %u 0x%lx, of those still in grace %u 0x%lx) "
+                "largest_free=0x%lx region-C=%u tail_resv=0x%lx head=0x%lx/0x%lx freelist=%d\n",
+             who, (unsigned long)want, total, IOS_TAIL_CARVE_MAX, live, (unsigned long)live_b, big_live, freen,
+             (unsigned long)free_b, retired, (unsigned long)retired_b, in_grace, (unsigned long)grace_b,
+             (unsigned long)largest_free, low, (unsigned long)ios_jit_tail_reserved, (unsigned long)jit_pool_offset,
+             (unsigned long)ios_jit_pool_size_global, ios_pool_free_count );
+}
+
+/* Returns 1 when a carve of at least `want` bytes now belongs to the head (freelist, or the bump cursor's
+ * own space after a tail_resv decrease), 0 when none could be taken. The caller retries its allocation. */
+static int ios_pool_tail_for_head( size_t want, const char *who )
+{
+    static int taken_n;
+    size_t skip[8];
+    unsigned nskip = 0, attempt;
+    time_t now = time( NULL );
+    int done = 0;
+
+    if (!ios_tail_for_head_enabled() || !ios_jit_rx_base_global || !ios_jit_rw_base_global ||
+        !ios_jit_pool_size_global || !want || (want & 0x3fff) || ios_wow_base()) return 0;
+
+    for (attempt = 0; attempt < 8 && !done; attempt++)
+    {
+        unsigned best;
+        size_t off = 0, size = 0, tail_now;
+        time_t freed_at = 0;
+        int retired = 0, lowered = 0;
+
+        pthread_mutex_lock( &ios_tail_carve_lock );
+        best = ios_pool_pick_carve_for_head( ios_tail_carves, ios_tail_carve_n, now, want,
+                                             ios_jit_pool_size_global, skip, nskip );
+        if (best == ~0u)
+        {
+            pthread_mutex_unlock( &ios_tail_carve_lock );
+            break;
+        }
+        off = ios_tail_carves[best].off;
+        size = ios_tail_carves[best].size;
+        freed_at = ios_tail_carves[best].freed_at;
+        retired = ios_tail_carves[best].retired;
+        if (!ios_pool_recycle_range_ready( off, size ) ||
+            ios_tail_carve_scan( (char *)ios_jit_rx_base_global + off, size, 1 ))
+        {
+            skip[nskip++] = off;       /* not executable throughout, or a thread runs in it: try the next one */
+            pthread_mutex_unlock( &ios_tail_carve_lock );
+            continue;
+        }
+        tail_now = ios_jit_tail_reserved;
+        if (ios_jit_hole_end <= ios_jit_hole_off && tail_now <= ios_jit_pool_size_global &&
+            off == ios_jit_pool_size_global - tail_now && size <= tail_now &&
+            __sync_bool_compare_and_swap( &ios_jit_tail_reserved, tail_now, tail_now - size ))
+        {
+            ios_tail_carves[best] = ios_tail_carves[--ios_tail_carve_n];   /* lowest carve of an unsplit pool */
+            lowered = 1;
+            done = 1;
+        }
+        else
+        {
+            size_t live_off;
+            void *live_peb;
+
+            pthread_mutex_lock( &ios_pool_lock );
+            if (ios_pool_free_count < IOS_POOL_FREE_MAX &&
+                !ios_pool_live_overlap( (uintptr_t)ios_jit_rw_base_global + off, size, &live_off, &live_peb ) &&
+                ios_pool_free_put( ios_pool_freelist, &ios_pool_free_count, IOS_POOL_FREE_MAX,
+                                   off, size, freed_at, ios_pool_range_clean ))
+            {
+                ios_tail_carves[best] = ios_tail_carves[--ios_tail_carve_n];
+                done = 1;
+            }
+            else skip[nskip++] = off;
+            pthread_mutex_unlock( &ios_pool_lock );
+        }
+        pthread_mutex_unlock( &ios_tail_carve_lock );
+        if (done && __sync_add_and_fetch( &taken_n, 1 ) <= 32)
+            dprintf( 2, "[pool-tail-for-head] #%d took carve off=0x%lx size=0x%lx for want=0x%lx (%s; %s; "
+                        "tail_resv now 0x%lx)\n", taken_n, (unsigned long)off, (unsigned long)size,
+                     (unsigned long)want, who, lowered ? "tail_resv lowered, the bump cursor regains it"
+                     : retired ? "freed by an exited process, to the head freelist" : "FEX-released, to the head freelist",
+                     (unsigned long)ios_jit_tail_reserved );
+    }
+    if (!done)
+    {
+        static int none_n;
+        if (__sync_add_and_fetch( &none_n, 1 ) <= 16)
+            dprintf( 2, "[pool-tail-for-head] none for want=0x%lx (%s): no free carve of that size that is past its "
+                        "grace, executable throughout and not run in (tried %u)\n", (unsigned long)want, who, nskip );
+    }
+    return done;
+}
+
+/* Optional bound on FEX code buffers over 16 MB that are live at once (MADEIRA_POOL_BIG_MAX=<1..16>, unset or 0: no
+ * bound, the old behaviour). ios_pool_code_cap() grants a 128 MB buffer to ANY process while 128 MB of room remain,
+ * so Battle.net's launcher, helpers and agent each held one: five of them are 640 MB of the 886 MB pool. With the
+ * bound, a fresh grant over 16 MB is refused while that many are live (FEX's own ladder then halves to 16 MB);
+ * free carves are reused first as before and are not counted. */
+static int ios_pool_big_max(void)
+{
+    static int max = -1;
+    if (max < 0)
+    {
+        const char *e = getenv( "MADEIRA_POOL_BIG_MAX" );
+
+        max = 0;
+        if (e && *e >= '0' && *e <= '9')
+        {
+            char *end;
+            unsigned long v = strtoul( e, &end, 10 );
+            if (!*end && v >= 1 && v <= 16) max = (int)v;
+        }
+    }
+    return max;
+}
+
+static int ios_pool_big_live_at_limit(void)
+{
+    unsigned i, live = 0;
+    int max = ios_pool_big_max();
+
+    if (max <= 0) return 0;
+    pthread_mutex_lock( &ios_tail_carve_lock );
+    for (i = 0; i < ios_tail_carve_n; i++)
+        if (!ios_tail_carves[i].free && ios_tail_carves[i].size > 0x1000000 &&
+            !ios_tail_carve_in_low( ios_tail_carves[i].off )) live++;
+    pthread_mutex_unlock( &ios_tail_carve_lock );
+    return live >= (unsigned)max;
+}
+
+/* 1: a fresh buffer of this size is refused by the bound (the caller returns STATUS_NO_MEMORY; FEX halves down). */
+static int ios_pool_big_refuse( size_t alloc_size )
+{
+    static int refused_n;
+
+    if (alloc_size <= 0x1000000 || !ios_pool_big_live_at_limit()) return 0;
+    if (__sync_add_and_fetch( &refused_n, 1 ) <= 16)
+        dprintf(2, "[pool-tail-for-head] BIG bound: refusing a fresh 0x%lx buffer, MADEIRA_POOL_BIG_MAX=%d are live "
+                "(tail_resv=0x%lx) so FEX halves down\n", (unsigned long)alloc_size, ios_pool_big_max(),
+                (unsigned long)ios_jit_tail_reserved);
+    return 1;
+}
+
 /* iOS-Madeira ml613: WHICH TAIL CARVE DOES THIS HOST PC LIVE IN, AND IS IT FREE?
  *
  * ml612's crash faulted at host pc 0x15361d6d0, which is +0x496d0 into the 16MB
@@ -4168,8 +4412,11 @@ void *ios_jit_teb_trampoline = NULL;  /* RX address of slot 0 trampoline (offset
 /* Each fallback to slot 0 overwrites another thread's saved TEB. The page
  * is already reserved in full; slots above 255 require no new mapping or
  * pool budget. Keep lifetime-monotonic allocation; never recycle a slot
- * whose trampoline may still be referenced. */
-#define IOS_JIT_MAX_SLOTS (0x4000 / IOS_JIT_TRAMPOLINE_SIZE)
+ * whose trampoline may still be referenced.
+ * The page's last 64 bytes are not TEB slots: they hold the shared
+ * RtlPcToFileHeader trampoline ([pc2fh-slot], IOS_JIT_PC2FH_SLOT_OFF). */
+#define IOS_JIT_PC2FH_SLOT_OFF (0x4000 - 64)
+#define IOS_JIT_MAX_SLOTS (IOS_JIT_PC2FH_SLOT_OFF / IOS_JIT_TRAMPOLINE_SIZE)
 static volatile int32_t ios_jit_next_slot = 0;  /* Next slot to allocate */
 
 /* Allocate a per-thread trampoline slot. Returns slot index (0-based). */
@@ -4338,6 +4585,32 @@ static unsigned char ios_image_is_fex( const void *pe_base, size_t size )
     return !strcasecmp( name, "libarm64ecfex.dll" ) || !strcasecmp( name, "xtajit64.dll" );
 }
 
+/* [jit-map] 1 when ios_jit_add_mapping would find a slot for an image at
+ * [pe_base, pe_base+size): the table is not at its high-water limit, or a
+ * tombstone exists, or an overlapping (stale) entry would be purged to make
+ * one. Asked BEFORE the pool copy is made, so a full table fails the image load
+ * cleanly with no copy to throw away (before: the copy was made, the mapping
+ * was refused, and the module's PE VA exec-faulted; the loader's retries each
+ * copied the image into the pool again). Logs the same FULL line as the
+ * defensive check inside ios_jit_add_mapping. */
+static int ios_jit_mapping_has_room(void *pe_base, size_t size)
+{
+    int i;
+    uintptr_t nb = (uintptr_t)pe_base;
+
+    if (ios_jit_mapping_count < IOS_JIT_MAX_MAPPINGS) return 1;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t eb = (uintptr_t)ios_jit_mappings[i].pe_base;
+        if (!eb) return 1;                                  /* tombstone: reusable */
+        if (eb < nb + size && nb < eb + ios_jit_mappings[i].size) return 1;  /* purged on add */
+    }
+    dprintf(2, "[jit-pool] mapping table FULL (%d slots) — image pe_base=%p+0x%lx: no pool copy made, "
+            "the load fails with STATUS_NO_MEMORY — bump IOS_JIT_MAX_MAPPINGS!\n",
+            IOS_JIT_MAX_MAPPINGS, pe_base, (unsigned long)size);
+    return 0;
+}
+
 void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
 {
     ios_alias_cb_t own_cb;
@@ -4423,6 +4696,18 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
         __sync_synchronize();
         ios_jit_mappings[slot].pe_base = pe_base;
         if (slot == ios_jit_mapping_count) ios_jit_mapping_count++;
+        {
+            /* [jit-map] high-water: once per new 128-entry step of LIVE entries */
+            static int hw_step;
+            int live = 0, k;
+            for (k = 0; k < ios_jit_mapping_count; k++)
+                if (ios_jit_mappings[k].pe_base) live++;
+            if (live / 128 > hw_step)
+            {
+                hw_step = live / 128;
+                dprintf(2, "[jit-map] high-water %d/%d\n", live, IOS_JIT_MAX_MAPPINGS);
+            }
+        }
     }
 
     /* If xtajit64 has already registered its alias-mapping push callback
@@ -6430,6 +6715,91 @@ static int ios_iat_skip_exec_dest( void )
     return cached;
 }
 
+/* [pc2fh-slot] Madeira-owned bytes in a pool copy's padding.
+ *
+ * A patch that lives past a section's VirtualSize, on that section's last
+ * executable page, is still inside the image's alias range. The protect sync
+ * (NtProtectVirtualMemory below) copies everything outside .text from the PE
+ * image into the pool copy, so a guest protect of that page puts the image's
+ * padding back over the patch. re9.exe: VirtualProtect(RWX) on ntdll's last
+ * .text page to hook it ([exec-req] #4/#5, "Add SMC interval
+ * 71FFD56000 - 71FFD58000"), the sync copied the image's 0xcc padding over
+ * the RtlPcToFileHeader trampoline, and the next call died with c000001D on
+ * the trampoline's first word.
+ *
+ * The RtlPcToFileHeader trampoline normally lives in the pool's reserved
+ * first page, which aliases no image. Only when that slot is out of BL reach
+ * does it go back to the padding, and then it is entered here: the PE -> pool
+ * copies step around it. An entry counts only while the instruction that
+ * branches to it still does, so a pool range that a reclaimed copy gave back
+ * and another image now uses is copied as usual. */
+#define IOS_OWNED_SLACK_MAX 64
+static struct
+{
+    char *rw;                    /* RW alias of the owned bytes */
+    unsigned int len;
+    const uint32_t *site_rw;     /* RW alias of the instruction that branches there */
+    uint32_t site_insn;          /* what that instruction is while the bytes are in use */
+} ios_owned_slack[IOS_OWNED_SLACK_MAX];
+static int ios_owned_slack_count;
+
+static void ios_owned_slack_add( char *rw, unsigned int len, const uint32_t *site_rw, uint32_t site_insn )
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    int i, n;
+
+    pthread_mutex_lock( &lock );
+    n = ios_owned_slack_count;
+    for (i = 0; i < n; i++) if (ios_owned_slack[i].rw == rw) break;
+    if (i == n && n < IOS_OWNED_SLACK_MAX)
+    {
+        ios_owned_slack[n].rw = rw;
+        ios_owned_slack[n].len = len;
+        ios_owned_slack[n].site_rw = site_rw;
+        ios_owned_slack[n].site_insn = site_insn;
+        __atomic_store_n( &ios_owned_slack_count, n + 1, __ATOMIC_RELEASE );
+    }
+    pthread_mutex_unlock( &lock );
+    if (i == n && n >= IOS_OWNED_SLACK_MAX)
+        dprintf( 2, "[pc2fh-slot] owned-padding table full -- %p is not kept out of the protect sync\n", rw );
+}
+
+/* memcpy( dst, src, n ) into a pool copy, leaving every live owned range alone. */
+static void ios_copy_keep_owned( char *dst, const char *src, size_t n )
+{
+    int i, count = __atomic_load_n( &ios_owned_slack_count, __ATOMIC_ACQUIRE );
+    uintptr_t d = (uintptr_t)dst;
+    size_t done = 0;
+
+    if (!count) { memcpy( dst, src, n ); return; }
+    while (done < n)
+    {
+        size_t cut = n, resume = n;
+
+        for (i = 0; i < count; i++)
+        {
+            uintptr_t lo = (uintptr_t)ios_owned_slack[i].rw, hi = lo + ios_owned_slack[i].len;
+            if (hi <= d + done || lo >= d + n) continue;
+            if (__atomic_load_n( ios_owned_slack[i].site_rw, __ATOMIC_ACQUIRE ) != ios_owned_slack[i].site_insn)
+                continue;
+            if ((lo > d + done ? lo - d : done) < cut)
+            {
+                cut = lo > d + done ? lo - d : done;
+                resume = hi - d < n ? hi - d : n;
+            }
+        }
+        if (cut > done) memcpy( dst + done, src + done, cut - done );
+        if (cut >= n) break;
+        {
+            static unsigned said;
+            if (__atomic_fetch_add( &said, 1, __ATOMIC_RELAXED ) < 16)
+                dprintf( 2, "[pc2fh-slot] protect sync left %lu Madeira-owned byte(s) at pool rw %p as they are\n",
+                         (unsigned long)(resume - cut), dst + cut );
+        }
+        done = resume;
+    }
+}
+
 void ios_jit_sync_write(void *addr, size_t size)
 {
     int i, fallback = -1;
@@ -6456,7 +6826,7 @@ void ios_jit_sync_write(void *addr, size_t size)
         uintptr_t pool_offset = (uintptr_t)ios_jit_mappings[fallback].jit_base
                               - (uintptr_t)ios_jit_rx_base_global;
         char *jit_rw_dest = (char *)ios_jit_rw_base_global + pool_offset + off;
-        memcpy(jit_rw_dest, addr, size);
+        ios_copy_keep_owned( jit_rw_dest, addr, size );
     }
 }
 
@@ -6568,10 +6938,40 @@ static int ios_sync_ntdll_data_patch( const void *image, size_t image_size,
  * The PE ntdll is a prebuilt binary, so the pool copy of RtlPcToFileHeader is
  * patched in place: its third instruction, `mov x20, x0` (right after the
  * prologue saved x19-x21 and x30), becomes a BL to a six-instruction
- * trampoline in the padding after ntdll's .text that maps x0 through
- * ios_jit_reverse_translate_addr (identity for anything outside the pool),
- * performs the displaced `mov x20, x0` and returns. Every instruction is
- * checked first; any mismatch leaves the function alone. Idempotent. */
+ * trampoline that maps x0 through ios_jit_reverse_translate_addr (identity
+ * for anything outside the pool), performs the displaced `mov x20, x0` and
+ * returns. Every instruction is checked first; any mismatch leaves the
+ * function alone. Idempotent.
+ *
+ * [pc2fh-slot] Where the trampoline lives. It is the same for every ntdll
+ * copy, so one copy of it sits in the last 64 bytes of the pool's reserved
+ * first page (IOS_JIT_PC2FH_SLOT_OFF), which is no image's alias: no guest
+ * protect, write or SMC on an image reaches it. A copy that is out of BL
+ * reach of that slot (+-128 MB) puts it in the padding after ntdll's .text,
+ * as before, and enters it in the owned-padding table so the protect sync
+ * leaves it alone (see ios_copy_keep_owned). MADEIRA_PC2FH_OWN_SLOT=0 (env,
+ * or `env.MADEIRA_PC2FH_OWN_SLOT = 0` in a game's settings) goes back to the
+ * old behaviour: padding only, not kept out of the sync. */
+static int ios_pc2fh_own_slot_wanted( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_PC2FH_OWN_SLOT" );
+        cached = (e && e[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+/* The BL at `from` that reaches `to`; 0 when it is out of reach. */
+static int ios_pc2fh_bl( const char *from, const char *to, uint32_t *insn )
+{
+    int64_t delta = (int64_t)((intptr_t)to - (intptr_t)from);
+    if (delta & 3 || delta >= (1ll << 27) || delta < -(1ll << 27)) return 0;
+    *insn = 0x94000000u | ((uint32_t)(delta >> 2) & 0x03ffffffu);
+    return 1;
+}
+
 int ios_patch_rtl_pc_to_file_header( void *module, const void *export_addr )
 {
     static const unsigned char ffs[10] = { 0x48,0x8b,0xc4,0x48,0x89,0x58,0x20,0x55,0x5d,0xe9 };
@@ -6580,11 +6980,13 @@ int ios_patch_rtl_pc_to_file_header( void *module, const void *export_addr )
     uintptr_t base = (uintptr_t)module, body_pe, rx_lo = (uintptr_t)ios_jit_rx_base_global;
     uint32_t e_lfanew, nsec, optsz, size_of_image, body_rva, sec_va = 0, sec_vs = 0, gap_end = 0, tramp_rva, i;
     const unsigned char *sh;
-    char *base_rx, *body_rx, *tramp_rx, *body_rw, *tramp_rw;
-    uint32_t *tw, bl, want_tramp[6] = { 0xa9bf7be1, 0x580000b0, 0xd63f0200, 0xa8c17be1, 0xaa0003f4, 0xd65f03c0 };
+    char *base_rx, *body_rx, *tramp_rx, *body_rw, *tramp_rw, *own_rx, *own_rw;
+    uint32_t *tw, bl, own_bl = 0, slack_bl = 0, slack_lo, slack_hi;
+    uint32_t want_tramp[6] = { 0xa9bf7be1, 0x580000b0, 0xd63f0200, 0xa8c17be1, 0xaa0003f4, 0xd65f03c0 };
+    unsigned char code[32];
+    const char *where;
     int32_t rel;
-    int64_t delta;
-    int found = 0;
+    int found = 0, own_wanted = ios_pc2fh_own_slot_wanted(), own_ok, slack_ok;
 
     if (!module || !export_addr || !rx_lo || !ios_jit_rw_base_global) return -1;
     /* the export is an x64 fast-forward thunk: mov rax,rsp; mov [rax+20h],rbx; push rbp; pop rbp; jmp body */
@@ -6612,7 +7014,7 @@ int ios_patch_rtl_pc_to_file_header( void *module, const void *export_addr )
         memcpy( &va, sh + 40 * i + 12, 4 );
         if (va > sec_va && va < gap_end) gap_end = va;
     }
-    /* The trampoline goes in the tail of the section's LAST PAGE, past its
+    /* The padding place is the tail of the section's LAST PAGE, past its
      * VirtualSize and before the next section: the only padding the pool copy
      * maps executable (whole 16 KB pages), and no section's virtual range, so
      * nothing in the image refers to it. It is not zero on the device (the
@@ -6624,49 +7026,100 @@ int ios_patch_rtl_pc_to_file_header( void *module, const void *export_addr )
         uint32_t lo = ((sec_va + sec_vs + 15u) & ~15u) + 16u;
         uint32_t hi = (sec_va + sec_vs + 0x3fffu) & ~0x3fffu;
         if (hi > gap_end) hi = gap_end;
-        if (lo + 48 > hi) { dprintf( 2, "[pc2fh] no room after .text in its last page (%08x..%08x) -- not patched\n", lo, hi ); return -1; }
+        slack_lo = lo; slack_hi = hi;
+        slack_ok = lo + 48 <= hi;
         tramp_rva = lo;
     }
 
     base_rx = ios_jit_translate_addr( module );
     if ((uintptr_t)base_rx == base || (uintptr_t)base_rx < rx_lo || (uintptr_t)base_rx - rx_lo >= ios_jit_pool_size_global) return -1;
-    body_rx = base_rx + body_rva; tramp_rx = base_rx + tramp_rva;
+    body_rx = base_rx + body_rva;
     body_rw = (char *)ios_jit_rw_base_global + ((uintptr_t)body_rx - rx_lo);
-    tramp_rw = (char *)ios_jit_rw_base_global + ((uintptr_t)tramp_rx - rx_lo);
     tw = (uint32_t *)body_rx;
-    delta = (int64_t)((intptr_t)tramp_rx - (intptr_t)(body_rx + 8));
-    if (delta & 3 || delta >= (1ll << 27) || delta < -(1ll << 27)) return -1;
-    bl = 0x94000000u | ((uint32_t)(delta >> 2) & 0x03ffffffu);
-    if (tw[2] == bl) return 0;   /* this copy is already patched */
+    own_rx = (char *)ios_jit_rx_base_global + IOS_JIT_PC2FH_SLOT_OFF;
+    own_rw = (char *)ios_jit_rw_base_global + IOS_JIT_PC2FH_SLOT_OFF;
+    own_ok = own_wanted && ios_pc2fh_bl( body_rx + 8, own_rx, &own_bl );
+    slack_ok = slack_ok && ios_pc2fh_bl( body_rx + 8, base_rx + tramp_rva, &slack_bl );
+    if ((own_ok && tw[2] == own_bl) || (slack_ok && tw[2] == slack_bl)) return 0;   /* this copy is already patched */
     if (tw[0] != 0xa9be53f3 || tw[1] != 0xa9017bf5 || tw[2] != 0xaa0003f4)
     {
         dprintf( 2, "[pc2fh] RtlPcToFileHeader at %p starts %08x %08x %08x, not the expected prologue -- not patched\n",
                  body_rx, tw[0], tw[1], tw[2] );
         return -1;
     }
-    /* The pool copy's bytes there must be what the image has (or zero): anything
-     * else means another patch already lives there. */
-    {
-        const unsigned char *pr = (const unsigned char *)tramp_rx, *ir = img + tramp_rva;
-        int zero = 1;
-        for (i = 0; i < 48; i++) if (pr[i]) { zero = 0; break; }
-        if (!zero && memcmp( pr, ir, 48 ))
-        {
-            dprintf( 2, "[pc2fh] padding at %p differs from the image -- in use, not patched\n", tramp_rx );
-            return -1;
-        }
-    }
 
-    memcpy( tramp_rw, want_tramp, sizeof(want_tramp) );
+    memcpy( code, want_tramp, sizeof(want_tramp) );
     {
         uint64_t fn = (uint64_t)(uintptr_t)ios_jit_reverse_translate_addr;
-        memcpy( tramp_rw + 24, &fn, 8 );   /* ldr x16 literal at +24 (8-aligned: tramp_rva is 16-aligned) */
+        memcpy( code + 24, &fn, 8 );   /* ldr x16 literal at +24 (both places are 16-aligned) */
     }
-    sys_icache_invalidate( tramp_rx, 32 );
+
+    /* The shared slot holds nothing yet (the first copy patched) or this very
+     * trampoline; anything else and the padding is used instead. */
+    if (own_ok && memcmp( own_rx, code, sizeof(code) ))
+    {
+        for (i = 0; i < 64; i++) if (own_rx[i]) break;
+        if (i < 64)
+        {
+            dprintf( 2, "[pc2fh-slot] shared slot %p is not empty -- trampoline goes in ntdll's padding\n", own_rx );
+            own_ok = 0;
+        }
+        else
+        {
+            memcpy( own_rw, code, sizeof(code) );
+            sys_icache_invalidate( own_rx, sizeof(code) );
+        }
+    }
+    if (own_ok)
+    {
+        tramp_rx = own_rx;
+        bl = own_bl;
+        where = "the pool's reserved first page, no image's alias";
+    }
+    else
+    {
+        if (!slack_ok)
+        {
+            dprintf( 2, "[pc2fh] no room after .text in its last page (%08x..%08x) and no shared slot -- not patched\n",
+                     slack_lo, slack_hi );
+            return -1;
+        }
+        tramp_rx = base_rx + tramp_rva;
+        tramp_rw = (char *)ios_jit_rw_base_global + ((uintptr_t)tramp_rx - rx_lo);
+        bl = slack_bl;
+        /* The pool copy's bytes there must be what the image has (or zero): anything
+         * else means another patch already lives there. */
+        {
+            const unsigned char *pr = (const unsigned char *)tramp_rx, *ir = img + tramp_rva;
+            int zero = 1;
+            for (i = 0; i < 48; i++) if (pr[i]) { zero = 0; break; }
+            if (!zero && memcmp( pr, ir, 48 ))
+            {
+                dprintf( 2, "[pc2fh] padding at %p differs from the image -- in use, not patched\n", tramp_rx );
+                return -1;
+            }
+        }
+        memcpy( tramp_rw, code, sizeof(code) );
+        sys_icache_invalidate( tramp_rx, sizeof(code) );
+        if (own_wanted)
+        {
+            ios_owned_slack_add( tramp_rw, sizeof(code), (const uint32_t *)(body_rw + 8), bl );
+            where = "ntdll's padding after .text (shared slot out of BL reach), kept out of the protect sync";
+        }
+        else where = "ntdll's padding after .text (MADEIRA_PC2FH_OWN_SLOT=0: not kept out of the protect sync)";
+    }
     __atomic_store_n( (uint32_t *)(body_rw + 8), bl, __ATOMIC_RELEASE );
     sys_icache_invalidate( body_rx + 8, 4 );
+    /* A protect sync between writing the padding and the BL above did not see
+     * the entry as live yet; put the trampoline back if it got there first. */
+    if (!own_ok && own_wanted && memcmp( tramp_rx, code, sizeof(code) ))
+    {
+        memcpy( tramp_rw, code, sizeof(code) );
+        sys_icache_invalidate( tramp_rx, sizeof(code) );
+    }
     dprintf( 2, "[pc2fh] RtlPcToFileHeader %p (pool %p) now maps JIT-pool aliases to their image; trampoline %p\n",
              (void *)body_pe, body_rx, tramp_rx );
+    dprintf( 2, "[pc2fh-slot] trampoline %p for the ntdll copy at %p is in %s\n", tramp_rx, base_rx, where );
     return 1;
 }
 
@@ -7982,6 +8435,7 @@ static const BYTE VIRTUAL_Win32Flags[16] =
 
 static struct wine_rb_tree views_tree;
 static pthread_mutex_t virtual_mutex;
+pthread_key_t thread_data_key = 0;
 
 static const UINT page_shift = 12;
 static const UINT_PTR page_mask = 0xfff;
@@ -8229,7 +8683,23 @@ static int ios_sc_layout_mode = -1;
  * it moves the floor down to the end of libcef.dll's smaller pools. */
 static int ios_sc2_rdr2;
 
-static inline ULONG_PTR ios_usable_va_floor_get(void)
+/* ios26-small-map: a device whose address map ends at or below 0x7000000000 (iOS 26 without the
+ * extended-virtual-addressing entitlement: TASK_VM_INFO.max_address 0xfc0000000, 63 GB) has no
+ * [0x7000000000, 0x8000000000) guest band at all; Wine puts its TEBs, PEB and furniture in the low
+ * part of the map (0x13ffe0000, 0x3fffe0000, 0xfbffe0000 in iOS 26 logs). Set once in virtual_init,
+ * right after host_addr_space_limit, and read lock-free by the signal path (ios_fault_is_foreign).
+ * On a 512 GB map nothing changes: the band stays [0x7000000000, 0x8000000000) and the floor is the
+ * one below. env.MADEIRA_SMALL_MAP_FIX = 0 keeps the 512 GB numbers on every map. */
+#define IOS_SMALL_MAP_FLOOR   0x400000000ULL   /* 16 GB: above the image, malloc zones, shared cache, JIT RW alias */
+#define IOS_TINY_MAP_FLOOR    0x200000000ULL   /* 8 GB on a map that ends below 32 GB (iPad8,11: 0x458000000), as ios_wow_band's tiny-map branch */
+static ULONG_PTR ios_small_map_floor = IOS_SMALL_MAP_FLOOR;   /* set with ios_small_map in virtual_init */
+#define IOS_SMALL_MAP_ADDR_LO 0x100000000ULL   /* 4 GB: lowest guest data address (TEBs at 0x13ffe0000) */
+int ios_small_map;
+uintptr_t ios_guest_band_lo = 0x7000000000ULL, ios_guest_band_hi = 0x8000000000ULL;      /* fault addresses */
+uintptr_t ios_guest_band_pc_lo = 0x7000000000ULL;                                         /* fault pcs */
+
+/* The floor as on a 512 GB map (ios_wow_band uses it to detect a small map). */
+static inline ULONG_PTR ios_usable_va_floor_big(void)
 {
     size_t sz = ios_jit_pool_size_global;
     if (ios_sc_layout_mode == 2 && ios_sc2_rdr2) return (ULONG_PTR)0x7010000000ULL;   /* IOS_SC2_RDR2_FLOOR */
@@ -8242,6 +8712,12 @@ static inline ULONG_PTR ios_usable_va_floor_get(void)
         if (end > (ULONG_PTR)0x7000000000ULL + sz && end < (ULONG_PTR)0x7400000000ULL) return end;
     }
     return (ULONG_PTR)0x7000000000ULL + (ULONG_PTR)(sz ? sz : (896ULL << 20));
+}
+static inline ULONG_PTR ios_usable_va_floor_get(void)
+{
+    /* ios26-small-map: 0x7000000000 + pool is past the end of a 63 GB map */
+    if (ios_small_map) return ios_small_map_floor;
+    return ios_usable_va_floor_big();
 }
 #define ios_usable_va_floor (ios_usable_va_floor_get())
 
@@ -8495,6 +8971,9 @@ static int ios_storm_gate( unsigned long *n )
  * map_free_area call. virtual_mutex is held throughout, so a plain global is
  * safe. Proves or refutes the grind above in one run. */
 static unsigned int ios_va_scan_tries;
+/* Of those tries, the granules below the address map's floor: counted, no
+ * longer attempted (see ios_va_map_floor). Reported as below-floor=. */
+static unsigned int ios_va_scan_below_floor;
 /* ml211: how many times the scan JUMPED over a foreign Mach region instead of
  * crawling a granule at a time. Reported next to tries= so the two are directly
  * comparable: before this, placing 1MB cost ~8000 tries and 0 skips. */
@@ -8555,11 +9034,14 @@ static int   ios_scan_fail_errno;
  * problem is placement, if it is tiny the window is genuinely full. */
 static void ios_furniture_census( void )
 {
-    const mach_vm_address_t LO = 0x7000000000ULL, HI = 0x73ffff0000ULL;
+    mach_vm_address_t LO = 0x7000000000ULL, HI = 0x73ffff0000ULL;
     struct { unsigned long long base, size; unsigned prot; } top[16];
     unsigned ntop = 0, nregions = 0, k;
-    unsigned long long mapped = 0, biggest_gap = 0, gap_at = 0, prev_end = LO;
-    mach_vm_address_t a = LO;
+    unsigned long long mapped = 0, biggest_gap = 0, gap_at = 0, prev_end;
+    mach_vm_address_t a;
+
+    if (ios_small_map) { LO = ios_small_map_floor; HI = ios_guest_band_hi; }   /* small-map-end: the map's own furniture range */
+    prev_end = LO; a = LO;
 
     for (;;)
     {
@@ -10618,18 +11100,50 @@ static struct ios_wow_window *ios_wow_slot_at_base( ULONG_PTR base )
  * ios_jit_current_peb() cannot resolve the PEB.  `owner` is the owning
  * process's own boot thread, so the fallback can only resolve to that
  * process's window. */
+/* x64-child-no-window: set on the booting thread of a 64-bit child (machine 0x8664, no guest window).
+ * Such a thread has no TEB/PEB yet when virtual_alloc_teb() runs, so slot_current's owner fallback
+ * could match a recycled pthread_t of a live 32-bit parent's window and put the child's TEB and PEB
+ * inside it (the child then booted as WoW64: wow64.dll, ILL in ntdll, exit 0xC00000FD).
+ * MADEIRA_X64_CHILD_NO_WINDOW=0 leaves the flag unset (old behaviour). */
+static __thread int ios_x64_child_thread;
+
+void ios_x64_child_no_window_mark( int on )
+{
+    const char *e = getenv( "MADEIRA_X64_CHILD_NO_WINDOW" );
+
+    if (e && e[0] == '0') on = 0;
+    ios_x64_child_thread = on;
+}
+
 static struct ios_wow_window *ios_wow_slot_current(void)
 {
     struct ios_wow_window *slot;
     unsigned i, n = ios_wow_window_count;
+    void *cur;
 
     if (!n) return NULL;   /* no window in this session: nothing to resolve */
-    if ((slot = ios_wow_slot_for_peb( ios_jit_current_peb() ))) return slot;
+    cur = ios_jit_current_peb();
+    if ((slot = ios_wow_slot_for_peb( cur ))) return slot;
     for (i = 0; i < n; i++)
         if (ios_wow_windows[i].base && !ios_wow_windows[i].leaked &&
             !ios_wow_windows[i].dead &&
             pthread_equal( ios_wow_windows[i].owner, pthread_self() ))
+        {
+            /* x64-child-no-window: a slot already bound to a live peb that is not this thread's own
+             * process is a recycled owner thread, not ours (the boot gap has no peb to compare, and
+             * an unbound slot has none to compare against, so both still resolve). */
+            if (ios_wow_windows[i].peb && cur && ios_wow_windows[i].peb != cur) continue;
+            if (ios_x64_child_thread)
+            {
+                static int outside_logged;
+                if (outside_logged++ < 16)
+                    dprintf( 2, "[wow-window] x64-child-outside: 64-bit child thread matched B=%p (slot %d, "
+                                "peb=%p) by a recycled owner thread; no window for its allocations\n",
+                             (void *)ios_wow_windows[i].base, (int)i, ios_wow_windows[i].peb );
+                return NULL;
+            }
             return &ios_wow_windows[i];
+        }
     return NULL;
 }
 
@@ -10660,6 +11174,23 @@ int ios_wow_in_window( const void *addr )
 {
     ULONG_PTR base = ios_wow_base();
     return base && (ULONG_PTR)addr >= base && (ULONG_PTR)addr < base + IOS_WOW_WINDOW_SIZE;
+}
+
+/* wow-image-anywindow: is addr inside ANY live 32-bit guest window, whichever process the
+ * calling thread belongs to? ios_wow_in_window() answers for the caller's own window only.
+ * Lock-free read of the slot table: a slot's base is written once, before the window is
+ * used, and dead/leaked only ever go from 0 to 1. */
+int ios_wow_in_any_window( const void *addr )
+{
+    unsigned i, n = ios_wow_window_count;
+
+    for (i = 0; i < n; i++)
+    {
+        ULONG_PTR base = ios_wow_windows[i].base;
+        if (!base || ios_wow_windows[i].dead || ios_wow_windows[i].leaked) continue;
+        if ((ULONG_PTR)addr >= base && (ULONG_PTR)addr < base + IOS_WOW_WINDOW_SIZE) return 1;
+    }
+    return 0;
 }
 
 ULONG ios_wow_guest_addr( const void *host )
@@ -11253,7 +11784,7 @@ static void ios_wow_band( ULONG_PTR *floor, ULONG_PTR *ceil )
     static int announced;
     ULONG_PTR kern_max = ios_wow_map_end();
 
-    *floor = ios_usable_va_floor;
+    *floor = ios_usable_va_floor_big();   /* ios26-small-map: its small-map test below needs the 512 GB floor */
     *ceil  = ios_furniture_ceiling ? ios_furniture_ceiling : (ULONG_PTR)user_space_limit;
     if (*ceil > IOS_WOW_CEF_POOLS_START) *ceil = IOS_WOW_CEF_POOLS_START;
 
@@ -12155,10 +12686,32 @@ static NTSTATUS ios_wow_window_reserve_once(void)
     ios_wow_reclaim_dead_windows();
 
     pthread_mutex_lock( &ios_wow_mutex );
-    if (ios_wow_slot_current())
+    if ((slot = ios_wow_slot_current()))
     {
-        pthread_mutex_unlock( &ios_wow_mutex );
-        return STATUS_SUCCESS;   /* already have one */
+        /* wow-child-window: the owner fallback of ios_wow_slot_current() matches on the pthread_t that
+         * reserved the window. A slot that is already BOUND to a process has its owner thread long
+         * gone, and pthread_t values are recycled, so a new 32-bit child booting on a recycled thread
+         * used to be handed its (live) parent's window here ("already have one"): the child ran in
+         * the parent's window and its KUSER_SHARED_DATA / ntdll maps failed (Battle.net helpers).
+         * Only an unbound slot, or the window of the PEB this thread already runs as, is "ours".
+         * MADEIRA_WOW_CHILD_WINDOW=0 turns this off. */
+        int ours = !slot->peb || ios_wow_slot_for_peb( ios_jit_current_peb() ) == slot;
+        const char *cw = getenv( "MADEIRA_WOW_CHILD_WINDOW" );
+
+        if (ours || (cw && cw[0] == '0'))
+        {
+            pthread_mutex_unlock( &ios_wow_mutex );
+            return STATUS_SUCCESS;   /* already have one */
+        }
+        {
+            static int own_logged;
+            if (own_logged++ < 16)
+                dprintf( 2, "[wow-window] child-own-slot: this thread matched B=%p (slot %d, bound to live peb=%p) "
+                            "by a recycled owner thread; reserving its own window\n",
+                         (void *)slot->base, (int)(slot - ios_wow_windows), slot->peb );
+            memset( &slot->owner, 0, sizeof(slot->owner) );   /* so slot_current never resolves to it by thread again */
+            slot = NULL;
+        }
     }
     for (i = 0; i < IOS_WOW_MAX_WINDOWS; i++)
     {
@@ -12429,6 +12982,7 @@ void ios_wow_session_arm(void) { }
 ULONG_PTR ios_wow_base_for_peb( void *peb_id ) { return 0; }
 ULONG_PTR ios_wow_base(void) { return 0; }
 int ios_wow_in_window( const void *addr ) { return 0; }
+int ios_wow_in_any_window( const void *addr ) { return 0; }
 ULONG ios_wow_guest_addr( const void *host ) { return PtrToUlong( host ); }
 void ios_wow_translate_limits( ULONG_PTR *l, ULONG_PTR *h ) { }
 NTSTATUS ios_wow_window_reserve(void) { return STATUS_NOT_SUPPORTED; }
@@ -12517,7 +13071,7 @@ void *get_builtin_so_handle( void *module )
 static NTSTATUS get_unixlib_funcs( void *so_handle, BOOL wow, const void **funcs, NTSTATUS (**entry)(void) )
 {
     *funcs = dlsym( so_handle, wow ? "__wine_unix_call_wow64_funcs" : "__wine_unix_call_funcs" );
-    *entry = dlsym( so_handle, "__wine_unix_lib_init" );
+    if (!*funcs) *entry = dlsym( so_handle, "__wine_unix_lib_init" );
     return *funcs || *entry ? STATUS_SUCCESS : STATUS_ENTRYPOINT_NOT_FOUND;
 }
 
@@ -12579,11 +13133,11 @@ extern const void *audio_null_ios_unix_call_funcs[];
 /* iOS-Madeira 2026-07-05 (Steam S0): network + crypto unix tables,
  * compiled from wine/dlls/<dll>/ sources into libntdll_unix.a with
  * -D__wine_unix_call_funcs=<dll>_unix_call_funcs (build/ntdll-unix/
- * build.sh compile_unixlib). The GnuTLS-backed ones (bcrypt, secur32,
+ * build.sh compile_unixlib). The GnuTLS-backed ones (secur32,
  * crypt32) resolve libgnutls statically via build/crypto-unix/
  * gnutls_symtab_ios.c instead of dlopen. */
 extern const void *ws2_32_unix_call_funcs[];
-extern const void *bcrypt_unix_call_funcs[];
+/* Wine 11.22: bcrypt is Windows-side code on libs/symcrypt now; it has no unix table */
 extern const void *secur32_unix_call_funcs[];
 extern const void *crypt32_unix_call_funcs[];
 
@@ -12652,7 +13206,6 @@ extern NTSTATUS win32u_unix_lib_init(void);
  * a 32-bit caller. */
 extern const void *dxmt_winemetal_unix_call_wow64_funcs[];
 extern const void *ws2_32_unix_call_wow64_funcs[];
-extern const void *bcrypt_unix_call_wow64_funcs[];
 extern const void *secur32_unix_call_wow64_funcs[];
 extern const void *crypt32_unix_call_wow64_funcs[];
 extern const void *dwrite_unix_call_wow64_funcs[];
@@ -12915,10 +13468,6 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             libname = "ws2_32";
             funcs64 = (const void *)ws2_32_unix_call_funcs;
             funcs_wow64 = (const void *)ws2_32_unix_call_wow64_funcs;
-        } else if (match && strstr(match, "bcrypt")) {
-            libname = "bcrypt";
-            funcs64 = (const void *)bcrypt_unix_call_funcs;
-            funcs_wow64 = (const void *)bcrypt_unix_call_wow64_funcs;
         } else if (match && strstr(match, "secur32")) {
             libname = "secur32";
             funcs64 = (const void *)secur32_unix_call_funcs;
@@ -14275,11 +14824,81 @@ static inline int ios_in_layerkit( unsigned long long a, size_t size )
     return ios_layerkit_enforce && ios_layerkit_hi && a + size > ios_layerkit_lo && a < ios_layerkit_hi;
 }
 
+/* The lowest address the kernel maps for this task (TASK_VM_INFO.min_address),
+ * or 0 when it does not say.
+ *
+ * iOS extends __PAGEZERO by the ASLR slide instead of moving it, so the address
+ * map starts at the app image (address-map=[0x104e60000,0xfc0000000) on the iPad
+ * this was measured on) and a fixed mapping anywhere below is refused with
+ * KERN_INVALID_ADDRESS. Mach reports that range as a free hole, so
+ * ios_skip_occupied has nothing to jump over and a bottom-up scan whose window
+ * starts at 0x10000 crawled it one granule at a time: 66,845 refused mach_vm_map
+ * calls and as many mach_vm_region queries to place ONE 4 KB view, all under
+ * virtual_mutex ("[va-scan] SLOW window=0x10000..0x400000000 size=0x1000 ...
+ * tries=66845 ... firstfail=0x10000 errno=12 FREE hole, next region 0x104e60000").
+ *
+ * Madeira Dock takes a process snapshot once a second while a game runs, and
+ * Wine's toolhelp maps and unmaps such a view for every Process32Next: 14 of
+ * these scans a second kept Dock's main thread at ~85% of a core holding the
+ * lock every other thread needs for a read, an ioctl or an allocation. Terraria
+ * (2026-11-13, iPad14,8) drew a few frames and stalled, about once a second:
+ * frame times of hundreds of ms beside 1.3 ms of GPU time. */
+static uintptr_t ios_va_map_floor(void)
+{
+    static uintptr_t floor = 1;      /* 1 = not asked yet */
+
+    if (floor == 1)
+    {
+        /* 0: the free-area scan tries every granule below the address map's
+         * floor again (tens of thousands of refused mappings per placement)
+         * instead of jumping to the floor. Default on. */
+        const char *e = getenv( "MADEIRA_VA_SCAN_FLOOR" );
+        task_vm_info_data_t vmi;
+        mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+        uintptr_t lo = 0;
+
+        if (!(e && e[0] == '0') &&
+            task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) == KERN_SUCCESS &&
+            vmi.min_address < vmi.max_address)
+            lo = (uintptr_t)vmi.min_address;
+        floor = lo;
+        dprintf( 2, "[va-scan] floor=%p: the free-area scan starts no lower (MADEIRA_VA_SCAN_FLOOR=0 "
+                    "tries every granule below it again)\n", (void *)lo );
+    }
+    return floor;
+}
+
 static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
                                 void *start, size_t size, int unix_prot )
 {
     while (start && base <= start && (char*)start + size <= (char*)end)
     {
+        /* Nothing below the address map's floor can be mapped -- see
+         * ios_va_map_floor. Bottom-up, resume at the floor; top-down, everything
+         * still ahead is lower, so the scan is over. The granules not tried are
+         * counted and described as the refusals they would have been, so the
+         * [va-scan] line and the pressure latch decide exactly as before; only
+         * the system calls go. A fixed-address attempt (step 0) is left alone. */
+        if (step)
+        {
+            uintptr_t floor = ios_va_map_floor(), a = (uintptr_t)start;
+
+            if (a < floor)
+            {
+                uintptr_t g = (uintptr_t)(step < 0 ? -step : step);
+                uintptr_t up = (floor - a + g - 1) / g;                  /* steps to the first address at or above the floor */
+                uintptr_t fit = ((uintptr_t)end - size - a) / g + 1;     /* addresses the window still holds going up */
+                uintptr_t n = step < 0 ? (a - (uintptr_t)base) / g + 1 : (up < fit ? up : fit);
+
+                ios_va_scan_tries += (unsigned int)n;
+                ios_va_scan_below_floor += (unsigned int)n;
+                if (!ios_scan_fail_addr) { ios_scan_fail_addr = start; ios_scan_fail_errno = ENOMEM; }
+                errno = ENOMEM;
+                if (step < 0) break;
+                start = (void *)(a + up * g);
+                continue;
+            }
+        }
         /* ml253 ROOT-CAUSE FIX: never allocate inside the JIT pool.
          *
          * Wine's scanner walks straight through the pool -- measured, marching upward in
@@ -15365,7 +15984,7 @@ static void ios_jit_purge_window( ULONG_PTR base, ULONG_PTR size )
  */
 static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned guard_owned )
 {
-    struct ntdll_thread_data *thread_data, *next_thread_data;
+    struct thread_data *thread_data, *next_thread_data;
     struct file_view *batch[256];
     unsigned stale_tebs = 0;
     unsigned deleted = 0, straddlers = 0;
@@ -15374,18 +15993,19 @@ static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned gua
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
-    /* teb_list is threaded THROUGH THE TEBs themselves (the entry is a field of
-     * the ntdll_thread_data inside each TEB), and this process's TEBs are inside
-     * the window.  Unlink them before the memory goes: nothing removes them
-     * otherwise — virtual_free_teb() is the only remover and a pseudo-process's
+    /* Wine 11.22: teb_list is threaded through the per-thread data blocks (struct
+     * thread_data, kernel stack + signal stack + this entry), each pointing at its
+     * TEB; before 11.22 the entry was inside the TEB itself.  This process's TEBs
+     * are inside the window.  Unlink them before the memory goes: nothing removes them
+     * otherwise — virtual_free_thread_data() is the only remover and a pseudo-process's
      * boot TEB is never freed — so the very next walker of teb_list
      * (virtual_clear_tls_index, for one) would step into PROT_NONE.
      * The criterion is the TEB's ADDRESS, not its PEB: what makes an entry
      * unusable is that its storage is about to be replaced. */
     LIST_FOR_EACH_ENTRY_SAFE( thread_data, next_thread_data, &teb_list,
-                              struct ntdll_thread_data, entry )
+                              struct thread_data, entry )
     {
-        TEB *t = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+        TEB *t = thread_data->teb;
 
         if ((ULONG_PTR)t < base || (ULONG_PTR)t >= base + IOS_WOW_WINDOW_SIZE) continue;
         list_remove( &thread_data->entry );
@@ -15710,12 +16330,84 @@ static NTSTATUS get_vprot_flags( DWORD protect, unsigned int *vprot, BOOL image 
  * "?" on any malformed/absent header. `image_base` must be the READABLE
  * mapped PE (RVA==offset). Not thread-safe on the returned pointer's contents,
  * but names live in the image's read-only .rdata so they're stable. */
+/* [stale-image] -- reads of a PE view that another thread (or this one) has just unmapped.
+ *
+ * Wave 21, StarCraft from Battle.net, 19:07 log: tid 047c, inside mprotect_exec's image copy path, read the export
+ * directory of the view its own NtUnmapViewOfSection had just removed (ClientSdk.dll self-remap) with plain loads. The
+ * load faulted; the Mach exception thread then waited for virtual_mutex in ios_vm_fault_lock and the freeze followed.
+ * A read of a view that may be gone goes through mach_vm_read_overwrite (it returns an error, it never faults), and the
+ * copy paths probe the first and last page of the source before they take a pool range.
+ * env.MADEIRA_SAFE_IMAGE_READ = 0 turns all of this off (default on). */
+static int ios_safe_image_read_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_SAFE_IMAGE_READ" );
+        cached = !(e && e[0] == '0');
+    }
+    return cached;
+}
+
+/* Can the first and the last byte of [base, base+size) be read? Always TRUE when the switch is off. */
+static int ios_image_view_readable( const void *base, size_t size )
+{
+    unsigned char c;
+
+    if (!ios_safe_image_read_enabled()) return 1;
+    if (!base || !size) return 0;
+    return ios_safe_read( (uintptr_t)base, &c, 1 ) && ios_safe_read( (uintptr_t)base + size - 1, &c, 1 );
+}
+
+/* First 8 lines only. dprintf, never a Wine log macro: the caller may run in a section that holds locks. */
+static void ios_stale_image_log( const char *fn, const void *base, size_t size )
+{
+    static int logged;
+    TEB *teb;
+
+    if (__atomic_fetch_add( &logged, 1, __ATOMIC_RELAXED ) >= 8) return;
+    teb = NtCurrentTeb();
+    dprintf( 2, "[stale-image] #%d %s: the view %p+0x%lx can no longer be read (unmapped while it was being copied); "
+                "the copy is skipped, tid=%04x\n", logged, fn, base, (unsigned long)size,
+             teb ? (unsigned)(ULONG_PTR)teb->ClientId.UniqueThread : 0u );
+}
+
 const char *ios_pe_module_name( const void *image_base, size_t image_size )
 {
     const unsigned char *b = image_base;
     uint32_t lfanew, exp_rva, name_rva;
     const unsigned char *pe;
 
+    if (!b || image_size < 0x100) return "?";
+    if (ios_safe_image_read_enabled())
+    {
+        /* Same checks as below, every load through mach_vm_read_overwrite. The name is copied out of the view
+         * (a ring of 8 buffers) so a caller that prints it later does not read the view again. */
+        static char names[8][65];
+        static unsigned next;
+        unsigned char sig[2], nm[64];
+        uint16_t magic;
+        size_t i, cap;
+        char *out;
+
+        if (!ios_safe_read( (uintptr_t)b, sig, 2 ) || sig[0] != 'M' || sig[1] != 'Z') return "?";
+        if (!ios_safe_read( (uintptr_t)b + 0x3c, &lfanew, 4 )) return "?";
+        if ((size_t)lfanew + 0x90 > image_size) return "?";
+        if (!ios_safe_read( (uintptr_t)b + lfanew, sig, 2 ) || sig[0] != 'P' || sig[1] != 'E') return "?";
+        if (!ios_safe_read( (uintptr_t)b + lfanew + 0x18, &magic, 2 ) || magic != 0x20b) return "?";   /* PE32+ only */
+        if (!ios_safe_read( (uintptr_t)b + lfanew + 0x88, &exp_rva, 4 )) return "?";                  /* DataDir[0] Export VA */
+        if (!exp_rva || (size_t)exp_rva + 0x10 > image_size) return "?";
+        if (!ios_safe_read( (uintptr_t)b + exp_rva + 0x0c, &name_rva, 4 )) return "?";                /* Export Name */
+        if (!name_rva || (size_t)name_rva + 1 > image_size) return "?";
+        cap = image_size - name_rva;
+        if (cap > 64) cap = 64;
+        if (!ios_safe_read( (uintptr_t)b + name_rva, nm, cap )) return "?";
+        for (i = 0; i < cap; i++) if (!nm[i]) break;
+        if (i == cap) return "?";
+        out = names[__atomic_fetch_add( &next, 1, __ATOMIC_RELAXED ) & 7];
+        memcpy( out, nm, i + 1 );
+        return out;
+    }
     if (!b || image_size < 0x100) return "?";
     if (b[0] != 'M' || b[1] != 'Z') return "?";
     lfanew = *(const uint32_t *)(b + 0x3c);
@@ -15811,6 +16503,321 @@ static int ios_sc_current_is_helper(void)
     return ios_sc_path_is_helper( pp->ImagePathName.Buffer, pp->ImagePathName.Length / sizeof(WCHAR) );
 }
 
+/* BeamNG.drive (2026-11-01): env.MADEIRA_CEF_PA_EXES = "a.exe;b.exe" names
+ * programs that run Chromium inside their own process and so need the large
+ * address-space room SocialClubHelper.exe gets: the layout 1/2 slots for
+ * chrome_elf.dll's and libcef.dll's PartitionAlloc pools and their metadata,
+ * Oilpan, the V8 cage, the widened HighestUserAddress and the release of a
+ * dead process's grants. BeamNG.drive.x64.exe loads chrome_elf.dll and
+ * libcef.dll itself; without this its 32 GB PartitionAlloc reserve was
+ * refused three times and chrome_elf.dll stopped on its own int3 (80000003)
+ * although layout 2 held the slots. Entries are image names (any directory,
+ * ASCII case ignored), separated by ';' or ','; spaces around them are
+ * dropped. Read once. Only the address-space paths use this: Social Club's
+ * command line, [sc-rph] patch and libcef refusal stay SocialClubHelper.exe's. */
+#define IOS_CEF_PA_MAX 8
+static char ios_cef_pa_names[IOS_CEF_PA_MAX][64];
+static int ios_cef_pa_n;
+static pthread_once_t ios_cef_pa_once = PTHREAD_ONCE_INIT;
+
+static void ios_cef_pa_parse_list( const char *list )
+{
+    ios_cef_pa_n = 0;
+    while (list && *list && ios_cef_pa_n < IOS_CEF_PA_MAX)
+    {
+        const char *end = list;
+        int n = 0, k;
+
+        while (*end && *end != ';' && *end != ',') end++;
+        while (list < end && (*list == ' ' || *list == '\t' || *list == '"')) list++;
+        n = (int)(end - list);
+        while (n > 0 && (list[n - 1] == ' ' || list[n - 1] == '\t' || list[n - 1] == '"')) n--;
+        if (n > 0 && n < (int)sizeof(ios_cef_pa_names[0]))
+        {
+            for (k = 0; k < n; k++)
+            {
+                char c = list[k];
+                ios_cef_pa_names[ios_cef_pa_n][k] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+            }
+            ios_cef_pa_names[ios_cef_pa_n][n] = 0;
+            ios_cef_pa_n++;
+        }
+        list = *end ? end + 1 : end;
+    }
+}
+
+static void ios_cef_pa_init(void)
+{
+    const char *e = getenv( "MADEIRA_CEF_PA_EXES" );
+    int k;
+
+    ios_cef_pa_parse_list( e );
+    for (k = 0; k < ios_cef_pa_n; k++)
+        dprintf( 2, "[sc-cef] env.MADEIRA_CEF_PA_EXES: %s gets SocialClubHelper.exe's CEF address space\n",
+                 ios_cef_pa_names[k] );
+}
+
+/* 1 when the path's last component is one of env.MADEIRA_CEF_PA_EXES. */
+static int ios_cef_pa_listed( const WCHAR *path, size_t len )
+{
+    size_t base = 0, k;
+    int i;
+
+    if (!path) return 0;
+    pthread_once( &ios_cef_pa_once, ios_cef_pa_init );
+    if (!ios_cef_pa_n) return 0;
+    for (k = 0; k < len; k++) if (path[k] == '\\' || path[k] == '/') base = k + 1;
+    for (i = 0; i < ios_cef_pa_n; i++)
+    {
+        const char *want = ios_cef_pa_names[i];
+        size_t n = strlen( want );
+
+        if (len - base != n) continue;
+        for (k = 0; k < n; k++)
+        {
+            WCHAR c = path[base + k];
+            if (c >= 'A' && c <= 'Z') c += 32;
+            if (c != (WCHAR)(unsigned char)want[k]) break;
+        }
+        if (k == n) return 1;
+    }
+    return 0;
+}
+
+/* Does the calling pseudo-process get the CEF address space? SocialClubHelper.exe
+ * always (as before), any other program when env.MADEIRA_CEF_PA_EXES names it. */
+static int ios_sc_current_is_cef_host(void)
+{
+    PEB *peb = ios_jit_current_peb();
+    RTL_USER_PROCESS_PARAMETERS *pp = peb ? peb->ProcessParameters : NULL;
+    size_t n;
+
+    if (!pp || !pp->ImagePathName.Buffer) return 0;
+    n = pp->ImagePathName.Length / sizeof(WCHAR);
+    return ios_sc_path_is_helper( pp->ImagePathName.Buffer, n ) || ios_cef_pa_listed( pp->ImagePathName.Buffer, n );
+}
+
+/* The calling process's image name for [sc-cef] lines, in `buf` (ASCII, '?'
+ * for anything else). */
+static const char *ios_sc_host_name( char *buf, size_t cap )
+{
+    PEB *peb = ios_jit_current_peb();
+    RTL_USER_PROCESS_PARAMETERS *pp = peb ? peb->ProcessParameters : NULL;
+    size_t len, base = 0, k, o = 0;
+
+    if (!cap) return "";
+    buf[0] = 0;
+    if (!pp || !pp->ImagePathName.Buffer) { snprintf( buf, cap, "the CEF host" ); return buf; }
+    len = pp->ImagePathName.Length / sizeof(WCHAR);
+    for (k = 0; k < len; k++) if (pp->ImagePathName.Buffer[k] == '\\' || pp->ImagePathName.Buffer[k] == '/') base = k + 1;
+    for (k = base; k < len && o + 1 < cap; k++)
+    {
+        WCHAR c = pp->ImagePathName.Buffer[k];
+        buf[o++] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+    }
+    buf[o] = 0;
+    return buf;
+}
+
+/* BeamNG.drive (2026-11-02): [cef-cmdline] let a listed CEF host's Chromium read
+ * its own process command line.
+ *
+ * Every CEF process needs its own two 32 GB-aligned PartitionAlloc pools, and
+ * the 64 GB band above 0x7000000000 holds one set (Social Club's layout 2).
+ * BeamNG.drive.x64.exe got that set (env.MADEIRA_CEF_PA_EXES), then its CEF
+ * started gpu, network, storage and renderer processes whose pools could not
+ * be placed: chrome_elf.dll stopped on its int3 (80000003) in each and the game
+ * waited forever (build 70 logs, 2026-11-02/03). Social Club's helper avoids
+ * that with --single-process. BeamNG ignored --single-process on its command
+ * line (env.MADEIRA_CHILD_ARGS): the gpu process still started, so the switch
+ * never reached Chromium. The game's cef_settings_t most likely has
+ * command_line_args_disabled set, which makes CEF drop the process command
+ * line.
+ *
+ * With env.MADEIRA_CEF_CMDLINE = 1, when libcef.dll is mapped in a program
+ * named by env.MADEIRA_CEF_PA_EXES, its cef_initialize export is pointed at a
+ * 38-byte x64 thunk written into the zero tail of an executable section. The
+ * thunk clears settings->command_line_args_disabled when the struct looks like
+ * CEF 128+'s (size 0x68..0x1000, the field at +0x64 equal to 1), then jumps to
+ * the real cef_initialize. Switches then come from env.MADEIRA_CHILD_ARGS.
+ * Opt-in, off by default; nothing else in libcef.dll changes. */
+static const unsigned char ios_cef_cmdline_thunk[38] =
+{
+    0x48,0x85,0xd2,                         /* test rdx, rdx                  */
+    0x74,0x1c,                              /* jz   tail                      */
+    0x48,0x83,0x3a,0x68,                    /* cmp  qword [rdx], 0x68         */
+    0x72,0x16,                              /* jb   tail                      */
+    0x48,0x81,0x3a,0x00,0x10,0x00,0x00,     /* cmp  qword [rdx], 0x1000       */
+    0x77,0x0d,                              /* ja   tail                      */
+    0x83,0x7a,0x64,0x01,                    /* cmp  dword [rdx+0x64], 1       */
+    0x75,0x07,                              /* jne  tail                      */
+    0xc7,0x42,0x64,0x00,0x00,0x00,0x00,     /* mov  dword [rdx+0x64], 0       */
+    0xe9,0x00,0x00,0x00,0x00                /* tail: jmp cef_initialize (rel32) */
+};
+#define IOS_CEF_CMDLINE_JMP 33   /* offset of the jmp's opcode */
+
+/* 1 when the path's last component is `want` (ASCII, lower case), any case. */
+static int ios_path_base_is( const WCHAR *path, size_t len, const char *want )
+{
+    size_t base = 0, k, n = strlen( want );
+
+    if (!path) return 0;
+    for (k = 0; k < len; k++) if (path[k] == '\\' || path[k] == '/') base = k + 1;
+    if (len - base != n) return 0;
+    for (k = 0; k < n; k++)
+    {
+        WCHAR c = path[base + k];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c != (WCHAR)(unsigned char)want[k]) return 0;
+    }
+    return 1;
+}
+
+/* Why `base` (libcef.dll, mapped, `size` bytes) cannot take the thunk, or NULL;
+ * on success *eat is the export-address slot of cef_initialize and *cave the
+ * RVA the thunk goes to. Pure: reads only the image. */
+static const char *ios_cef_cmdline_site( const unsigned char *base, SIZE_T size, const IMAGE_NT_HEADERS64 *nt,
+                                         const IMAGE_SECTION_HEADER *sec, DWORD **eat, DWORD *cave )
+{
+    const IMAGE_DATA_DIRECTORY *dir;
+    const IMAGE_EXPORT_DIRECTORY *exp;
+    const DWORD *names, *funcs;
+    const WORD *ords;
+    DWORD i, fn = 0, salign;
+    int s, found = 0;
+
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return "not a 64-bit x64 image";
+    if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) return "no export directory";
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir->VirtualAddress || dir->VirtualAddress + sizeof(*exp) > size) return "no export directory";
+    exp = (const IMAGE_EXPORT_DIRECTORY *)(base + dir->VirtualAddress);
+    if (exp->AddressOfNames + 4ull * exp->NumberOfNames > size ||
+        exp->AddressOfNameOrdinals + 2ull * exp->NumberOfNames > size ||
+        exp->AddressOfFunctions + 4ull * exp->NumberOfFunctions > size) return "export directory out of range";
+    names = (const DWORD *)(base + exp->AddressOfNames);
+    ords  = (const WORD *)(base + exp->AddressOfNameOrdinals);
+    funcs = (const DWORD *)(base + exp->AddressOfFunctions);
+    for (i = 0; i < exp->NumberOfNames; i++)
+    {
+        if (names[i] + sizeof("cef_initialize") > size) continue;
+        if (strcmp( (const char *)base + names[i], "cef_initialize" )) continue;
+        if (ords[i] >= exp->NumberOfFunctions) return "cef_initialize ordinal out of range";
+        *eat = (DWORD *)(funcs + ords[i]);
+        fn = funcs[ords[i]];
+        found = 1;
+        break;
+    }
+    if (!found) return "no cef_initialize export";
+    if (fn >= dir->VirtualAddress && fn < dir->VirtualAddress + dir->Size) return "cef_initialize is forwarded";
+    if (fn == 0 || fn >= size) return "cef_initialize out of range";
+    salign = nt->OptionalHeader.SectionAlignment ? nt->OptionalHeader.SectionAlignment : 0x1000;
+    for (s = 0; s < nt->FileHeader.NumberOfSections; s++)
+    {
+        DWORD va = sec[s].VirtualAddress, vs = sec[s].Misc.VirtualSize;
+        DWORD end = (va + vs + salign - 1) & ~(salign - 1), start = (va + vs + 15) & ~15u, k;
+
+        if (!(sec[s].Characteristics & IMAGE_SCN_MEM_EXECUTE) || !vs) continue;
+        if (fn < va || fn >= va + vs) continue;   /* the thunk sits beside cef_initialize */
+        if (end > size || start + sizeof(ios_cef_cmdline_thunk) > end) return "no room after cef_initialize's section";
+        /* Past VirtualSize nothing belongs to the section. The mapper zeroes
+         * what lies past SizeOfRawData; up to it is the file's padding, which
+         * lld-link (Chromium's linker) fills with int3 (0xcc) in code sections:
+         * BeamNG's CEF 150 libcef.dll was refused with "tail not zero" on IPA
+         * #15. Either filler is free space; anything else is left alone. */
+        *cave = start;   /* also on refusal, so the log can show the bytes */
+        for (k = start; k < start + sizeof(ios_cef_cmdline_thunk); k++)
+            if (base[k] && base[k] != 0xcc) return "section tail not free (not 0x00/0xcc padding)";
+        *cave = start;
+        return NULL;
+    }
+    return "cef_initialize is not in an executable section";
+}
+
+/* Write the thunk at `cave` and point the export slot at it. */
+static void ios_cef_cmdline_apply( unsigned char *base, DWORD *eat, DWORD cave )
+{
+    DWORD orig = *eat;
+    int32_t disp = (int32_t)(orig - (cave + IOS_CEF_CMDLINE_JMP + 5));
+
+    memcpy( base + cave, ios_cef_cmdline_thunk, sizeof(ios_cef_cmdline_thunk) );
+    memcpy( base + cave + IOS_CEF_CMDLINE_JMP + 1, &disp, sizeof(disp) );
+    *eat = cave;
+}
+
+/* The cave lies past the section's VirtualSize, and FEX's InvalidationTracker
+ * (HandleImageMap) marks only [VirtualAddress, +VirtualSize) of each executable
+ * section as code, reading the section table from the mapped headers. Without
+ * this the first call into the thunk died as "NoExec instruction in entry
+ * block" / AV EXEC at the cave (BeamNG, Build IPA #17). So grow the section
+ * that holds the cave to cover it in `sec`, which is the mapped table unless
+ * the mapper had to work from a copy. The cave is inside the section's last page
+ * (ios_cef_cmdline_site checks it), so the page protections do not change. */
+static void ios_cef_cmdline_grow_section( IMAGE_SECTION_HEADER *sec, IMAGE_SECTION_HEADER *mapped, int count,
+                                          DWORD cave, DWORD len )
+{
+    int s;
+
+    for (s = 0; s < count; s++)
+    {
+        DWORD va = sec[s].VirtualAddress, vs = sec[s].Misc.VirtualSize;
+
+        if (!(sec[s].Characteristics & IMAGE_SCN_MEM_EXECUTE) || !vs) continue;
+        if (cave != ((va + vs + 15) & ~15u)) continue;   /* the cave ios_cef_cmdline_site picked */
+        if (cave + len - va <= vs) return;
+        sec[s].Misc.VirtualSize = cave + len - va;
+        /* A copy means the mapped table runs past header_map_size and a section
+         * mapping may have overwritten it: leave those bytes alone. libcef never
+         * takes that path, so FEX still reads the grown size from `sec`. */
+        (void)mapped;
+        return;
+    }
+}
+
+static void ios_cef_cmdline_patch( char *base, SIZE_T total_size, const IMAGE_NT_HEADERS *nt,
+                                   const IMAGE_SECTION_HEADER *sec, const UNICODE_STRING *nt_name )
+{
+    static int enabled = -1;
+    PEB *peb;
+    RTL_USER_PROCESS_PARAMETERS *pp;
+    DWORD *eat = NULL, cave = 0, orig;
+    const char *why;
+    char hn[64];
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_CEF_CMDLINE" );
+        enabled = e && e[0] == '1';
+    }
+    if (!enabled || !nt_name || !nt_name->Buffer ||
+        !ios_path_base_is( nt_name->Buffer, nt_name->Length / sizeof(WCHAR), "libcef.dll" )) return;
+    peb = ios_jit_current_peb();
+    pp = peb ? peb->ProcessParameters : NULL;
+    if (!pp || !pp->ImagePathName.Buffer ||
+        !ios_cef_pa_listed( pp->ImagePathName.Buffer, pp->ImagePathName.Length / sizeof(WCHAR) )) return;
+    if ((why = ios_cef_cmdline_site( (const unsigned char *)base, total_size, (const IMAGE_NT_HEADERS64 *)nt,
+                                     sec, &eat, &cave )))
+    {
+        const unsigned char *t = (const unsigned char *)base + cave;
+        if (cave && cave + 8 <= total_size)
+            dprintf( 2, "[cef-cmdline] %s: libcef.dll at %p not patched: %s (rva 0x%x: %02x %02x %02x %02x %02x %02x %02x %02x)\n",
+                     ios_sc_host_name( hn, sizeof(hn) ), base, why, (unsigned)cave,
+                     t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7] );
+        else
+            dprintf( 2, "[cef-cmdline] %s: libcef.dll at %p not patched: %s\n",
+                     ios_sc_host_name( hn, sizeof(hn) ), base, why );
+        return;
+    }
+    orig = *eat;
+    ios_cef_cmdline_apply( (unsigned char *)base, eat, cave );
+    ios_cef_cmdline_grow_section( (IMAGE_SECTION_HEADER *)sec, IMAGE_FIRST_SECTION( (IMAGE_NT_HEADERS *)nt ),
+                                  nt->FileHeader.NumberOfSections, cave, sizeof(ios_cef_cmdline_thunk) );
+    dprintf( 2, "[cef-cmdline] %s: libcef.dll at %p: cef_initialize (rva 0x%x) now goes through rva 0x%x, "
+                "which lets CEF read the process command line (env.MADEIRA_CHILD_ARGS switches); "
+                "its section now ends past the thunk, so the emulator runs it\n",
+             ios_sc_host_name( hn, sizeof(hn) ), base, (unsigned)orig, (unsigned)cave );
+}
+
 /* madeira-bcd: [sc-rph] the renderer half of Social Club's pages under
  * --single-process.
  *
@@ -15828,10 +16835,11 @@ static int ios_sc_current_is_helper(void)
  * and offline content" (SC_INIT_ERR_WEBSITE_FAILED_LOAD). A renderer process of
  * its own cannot exist here: layout 2 has room for one Chromium.
  *
- * Two helper builds are analysed, each one ios_sch_build entry below (its
+ * Three helper builds are analysed, each one ios_sch_build entry below (its
  * RVAs, the SHA-256 of every code range relied on, its blobs and hooks): the
  * first one (TimeDateStamp 0x6a86d563, SizeOfImage 0x244000, device-proven)
- * and Social Club 2.4.0.296's (0x6ae5e38b, 0x26d000). For the build found
+ * Social Club 2.4.0.296's (0x6ae5e38b, 0x26d000) and 2.4.0.302's (0x6aeb6937, 0x26e000;
+ * 296's code with 0x670 bytes inserted into .text). For the build found
  * every byte this relies on is checked first. Then a 112-byte x64 thunk goes
  * into the zero tail of .text (past VirtualSize: zero in the file or cleared
  * by the mapper above) and the browser app's GetRenderProcessHandler vtable
@@ -15968,6 +16976,51 @@ static int ios_sc_current_is_helper(void)
 #define IOS_SCH296_IPC_DESTROY 0x1a3f8fu
 #define IOS_SCH296_IPC_DIRECT  0x1a3fe8u
 #define IOS_SCH296_IPC_CONTEXT 0x1f8e50u
+
+/* Social Club 2.4.0.302: the same roles, moved again (.text grew by 0x670, so everything above
+ * the insertion and .rdata/.data moved); slots 3 / 4 as above. */
+#define IOS_SCH302_STAMP       0x6aeb6937u
+#define IOS_SCH302_SIZE        0x26e000u
+#define IOS_SCH302_TEXT_VS     0x1a3358u  /* .text at 0x1000, raw 0x1a3400 */
+#define IOS_SCH302_TEXT_RAW    0x1a3400u
+#define IOS_SCH302_DATA        0x1f5000u  /* .data: VirtualSize 0x436c */
+#define IOS_SCH302_DATA_VS     0x436cu
+#define IOS_SCH302_THUNK       0x1a4360u  /* tail 0x1a4358..0x1a5000 */
+#define IOS_SCH302_CACHE       0x1f9ff8u
+#define IOS_SCH302_VT_BROWSER  0x1a6288u
+#define IOS_SCH302_VT_RENDERER 0x1a6678u
+#define IOS_SCH302_GET_HANDLER 0x5ae0u
+#define IOS_SCH302_GET_NULL    0x4a90u
+#define IOS_SCH302_VT_RPH      0x1a66a8u
+#define IOS_SCH302_WEBKIT      0x8880u
+#define IOS_SCH302_CURRENT_LOOP 0x197340u
+#define IOS_SCH302_LOOP_CTOR   0x195ca0u
+#define IOS_SCH302_LOOP_WORK   0x196760u
+#define IOS_SCH302_LOOP_DELAYED 0x196600u
+#define IOS_SCH302_LOOP_IDLE   0x1966e0u
+#define IOS_SCH302_POST_TASK   0x1a5b10u  /* cef_post_delayed_task import slot */
+#define IOS_SCH302_LOOP_INIT   0x1a43d0u
+#define IOS_SCH302_LOOP_PUMP   0x1a4440u
+#define IOS_SCH302_TASK_ADD    0x197424u  /* int3 padding, each after a RET */
+#define IOS_SCH302_TASK_RELEASE 0x1977f4u
+#define IOS_SCH302_TASK_ONE    0x196b65u
+#define IOS_SCH302_TASK_ANY    0x199365u
+#define IOS_SCH302_TASK        0x1f9c00u
+#define IOS_SCH302_RENDER_DRAIN_SITE 0x49d74u
+#define IOS_SCH302_RENDER_DRAIN 0x1a44f1u
+#define IOS_SCH302_IPC_CONNECT 0x4ba30u
+#define IOS_SCH302_RENDER_CHANNEL_REPLY 0x491e1u
+#define IOS_SCH302_RENDER_CHANNEL_KEEP  0x491e6u
+#define IOS_SCH302_RENDER_CHANNEL_THUNK 0x1a4510u
+#define IOS_SCH302_IPC_SPLIT   0x1a4529u
+#define IOS_SCH302_IPC_CAPTURE 0x1a45b6u
+#define IOS_SCH302_IPC_STORE   0x1a45ccu
+#define IOS_SCH302_IPC_ROLE    0x1a45e3u
+#define IOS_SCH302_IPC_GLOBAL_LOOP 0x483e1u     /* int3 padding after a RET */
+#define IOS_SCH302_IPC_INITIAL_CONNECT 0x1963d1u /* int3 padding after a RET */
+#define IOS_SCH302_IPC_DESTROY 0x1a45ffu
+#define IOS_SCH302_IPC_DIRECT  0x1a4658u
+#define IOS_SCH302_IPC_CONTEXT 0x1f9e50u
 
 
 /* Source: tests/host/sc-renderer-channels.S. Preserve page channels within
@@ -16688,6 +17741,347 @@ static const struct ios_sch_zero ios_sch296_zero[] =
     { IOS_SCH296_CACHE, 8, ".data tail not zero" },
 };
 
+/* 2.4.0.302's blobs (the same code as 296 with this build's displacements). Sources: tests/host/sc-renderer-channels.S,
+ * sc-render-handler.S, sc-render-loop.S, sc-render-drain.S and sc-ipc-split.S
+ * assembled with --defsym SCH296=1 (the compact variant, selected by 2.4.0.296 and kept for
+ * 302); the host tests rebuild and compare them.
+ * The thunk, adapter, drain and channel code are the first build's with this
+ * build's displacements; the getter, destructor and direct-load hooks are
+ * the compact forms described above. */
+static const unsigned char ios_sch302_renderer_channels[25] =
+{
+    0x83,0xb8,0x20,0x02,0x00,0x00,0x40,0x73,0x0b,0x45,0x31,0xc0,0x48,0x89,0xc1,0xe9,
+    0xc9,0x4c,0xea,0xff,0xe9,0xd1,0x4c,0xea,0xff,
+};
+
+static const unsigned char ios_sch302_thunk[112] =
+{
+    0x53,0x48,0x83,0xec,0x30,0x48,0x89,0xd3,0x48,0x8b,0x05,0x89,0x5c,0x05,0x00,0x48,
+    0x85,0xc0,0x75,0x3f,0xb9,0x60,0x00,0x00,0x00,0xe8,0xaa,0xe5,0xfb,0xff,0x48,0x85,
+    0xc0,0x74,0x44,0x48,0x89,0xc1,0xba,0x01,0x00,0x00,0x00,0xe8,0x30,0x30,0xe6,0xff,
+    0x48,0x89,0x44,0x24,0x20,0x48,0x8b,0x48,0x08,0x48,0x63,0x49,0x04,0x48,0x8d,0x4c,
+    0x08,0x08,0x48,0x8b,0x11,0xff,0x12,0x48,0x8b,0x44,0x24,0x20,0x48,0x89,0x05,0x45,
+    0x5c,0x05,0x00,0x48,0x89,0xc1,0x48,0x89,0xda,0xe8,0x22,0x17,0xe6,0xff,0x48,0x89,
+    0xd8,0x48,0x83,0xc4,0x30,0x5b,0xc3,0x48,0xc7,0x03,0x00,0x00,0x00,0x00,0xeb,0xee,
+};
+
+static const unsigned char ios_sch302_loop_thunk[289] =
+{
+    0x53,0x48,0x83,0xec,0x30,0x48,0x89,0xcb,0xc7,0x44,0x24,0x20,0x00,0x00,0x00,0x00,
+    0xe8,0x5b,0x2f,0xff,0xff,0x48,0x85,0xc0,0x75,0x28,0xb9,0x60,0x01,0x00,0x00,0xe8,
+    0x34,0xe5,0xfb,0xff,0x48,0x85,0xc0,0x74,0x19,0x48,0x89,0xc1,0x31,0xd2,0xe8,0x9d,
+    0x18,0xff,0xff,0x48,0x89,0x05,0x26,0x58,0x05,0x00,0xc7,0x44,0x24,0x20,0x01,0x00,
+    0x00,0x00,0x48,0x89,0xd9,0xe8,0x66,0x44,0xe6,0xff,0x83,0x7c,0x24,0x20,0x00,0x74,
+    0x18,0xb9,0x06,0x00,0x00,0x00,0x48,0x8d,0x15,0xd3,0x57,0x05,0x00,0x41,0xb8,0x0a,
+    0x00,0x00,0x00,0xff,0x15,0xd7,0x16,0x00,0x00,0x48,0x83,0xc4,0x30,0x5b,0xc3,0x90,
+    0x53,0x56,0x48,0x83,0xec,0x58,0x48,0x89,0xcb,0x48,0x8b,0x4b,0x30,0x48,0x85,0xc9,
+    0x0f,0x84,0x94,0x00,0x00,0x00,0x48,0x8b,0x81,0x28,0x01,0x00,0x00,0x48,0x89,0x44,
+    0x24,0x30,0xba,0x01,0x00,0x00,0x00,0x48,0x85,0xc0,0x74,0x04,0x8b,0x10,0xff,0xc2,
+    0x89,0x54,0x24,0x38,0xc7,0x44,0x24,0x3c,0x00,0x00,0x00,0x00,0x48,0xc7,0x44,0x24,
+    0x40,0x00,0x00,0x00,0x00,0x48,0x8d,0x44,0x24,0x38,0x48,0x89,0x81,0x28,0x01,0x00,
+    0x00,0xbe,0x20,0x00,0x00,0x00,0x48,0x8b,0x4b,0x30,0xe8,0xc1,0x22,0xff,0xff,0x88,
+    0x44,0x24,0x28,0x48,0x8b,0x4b,0x30,0x48,0x8d,0x54,0x24,0x20,0xe8,0x4f,0x21,0xff,
+    0xff,0x0a,0x44,0x24,0x28,0x74,0x06,0xff,0xce,0x75,0xdb,0xeb,0x09,0x48,0x8b,0x4b,
+    0x30,0xe8,0x1a,0x22,0xff,0xff,0x48,0x8b,0x4b,0x30,0x48,0x8b,0x44,0x24,0x30,0x48,
+    0x89,0x81,0x28,0x01,0x00,0x00,0xb9,0x06,0x00,0x00,0x00,0x48,0x89,0xda,0x41,0xb8,
+    0x0a,0x00,0x00,0x00,0xff,0x15,0x26,0x16,0x00,0x00,0x48,0x83,0xc4,0x58,0x5e,0x5b,
+    0xc3,
+};
+
+static const unsigned char ios_sch302_task_add[5] =
+{
+    0xf0,0xff,0x41,0x38,0xc3,
+};
+
+static const unsigned char ios_sch302_task_release[7] =
+{
+    0xf0,0xff,0x49,0x38,0x31,0xc0,0xc3,
+};
+
+static const unsigned char ios_sch302_task_one[11] =
+{
+    0x83,0x79,0x38,0x01,0x0f,0x94,0xc0,0x0f,0xb6,0xc0,0xc3,
+};
+
+static const unsigned char ios_sch302_task_any[11] =
+{
+    0x83,0x79,0x38,0x00,0x0f,0x95,0xc0,0x0f,0xb6,0xc0,0xc3,
+};
+
+static const unsigned char ios_sch302_render_drain[31] =
+{
+    0x48,0x83,0xec,0x28,0xe8,0x46,0x2e,0xff,0xff,0x48,0x85,0xc0,0x74,0x0c,0x48,0x89,
+    0xc1,0x48,0x83,0xc4,0x28,0xe9,0x35,0x27,0xff,0xff,0x48,0x83,0xc4,0x28,0xc3,
+};
+
+static const unsigned char ios_sch302_ipc_split[303] =
+{
+    0x48,0x83,0xec,0x28,0xb9,0x06,0x00,0x00,0x00,0xff,0x15,0xc8,0x15,0x00,0x00,0x85,
+    0xc0,0x74,0x6e,0x48,0x8b,0x05,0x0d,0x59,0x05,0x00,0x48,0x85,0xc0,0x75,0x69,0x48,
+    0x83,0x3d,0x08,0x59,0x05,0x00,0x00,0x74,0x58,0xb9,0x30,0x1a,0x00,0x00,0xe8,0xcc,
+    0xe3,0xfb,0xff,0x48,0x85,0xc0,0x74,0x49,0x48,0x89,0x05,0xe8,0x58,0x05,0x00,0x48,
+    0x89,0xc1,0xe8,0xb0,0x69,0xea,0xff,0x48,0x8b,0x15,0xe1,0x58,0x05,0x00,0x48,0x89,
+    0x54,0x24,0x20,0x48,0x8b,0x42,0x08,0x48,0x8d,0x4a,0x08,0x48,0x63,0x40,0x04,0x48,
+    0x01,0xc1,0x48,0x8b,0x01,0xff,0x10,0x48,0x8d,0x54,0x24,0x20,0x48,0x8b,0x0d,0xb4,
+    0x58,0x05,0x00,0xe8,0x9f,0x82,0xea,0xff,0x48,0x8b,0x05,0xa8,0x58,0x05,0x00,0xeb,
+    0x07,0x48,0x8b,0x05,0xef,0x25,0x05,0x00,0x48,0x83,0xc4,0x28,0xc3,0x48,0x89,0x5c,
+    0x24,0x10,0x50,0x48,0x8b,0x02,0x48,0x89,0x05,0x92,0x58,0x05,0x00,0x58,0xe9,0x79,
+    0x82,0xea,0xff,0x9c,0x48,0x3b,0x1d,0x7c,0x58,0x05,0x00,0x74,0x07,0x48,0x89,0x1d,
+    0xc3,0x25,0x05,0x00,0x9d,0xe9,0x07,0x6b,0xea,0xff,0x9c,0x4c,0x3b,0x35,0x65,0x58,
+    0x05,0x00,0x75,0x05,0xb8,0x01,0x00,0x00,0x00,0x41,0x89,0x86,0xf0,0x00,0x00,0x00,
+    0x9d,0xe9,0xae,0x82,0xea,0xff,0x48,0x3b,0x3d,0x4a,0x58,0x05,0x00,0x74,0x40,0x48,
+    0x83,0x3d,0x40,0x58,0x05,0x00,0x00,0x74,0x2a,0x51,0x48,0x83,0xec,0x28,0x48,0x8b,
+    0x0d,0x32,0x58,0x05,0x00,0x48,0x89,0x4c,0x24,0x20,0xe8,0x18,0x6c,0xea,0xff,0x48,
+    0x8b,0x4c,0x24,0x20,0xba,0x30,0x1a,0x00,0x00,0xe8,0x2d,0xe3,0xfb,0xff,0x48,0x83,
+    0xc4,0x28,0x59,0x48,0x89,0x35,0x5d,0x25,0x05,0x00,0xe9,0x38,0x6c,0xea,0xff,0x48,
+    0xc7,0x05,0xfd,0x57,0x05,0x00,0x00,0x00,0x00,0x00,0xe9,0x28,0x6c,0xea,0xff,
+};
+
+static const unsigned char ios_sch302_ipc_direct[13] =
+{
+    0xe8,0x73,0x7a,0xea,0xff,0x48,0x89,0xc3,0xe9,0x0c,0xa1,0xea,0xff,
+};
+
+static const unsigned char ios_sch302_ipc_global_loop[15] =
+{
+    0x4c,0x3b,0x35,0x68,0x1a,0x1b,0x00,0x74,0x05,0xe9,0xa1,0x6c,0x0f,0x00,0xc3,
+};
+
+static const unsigned char ios_sch302_ipc_initial_connect[15] =
+{
+    0x48,0x3b,0x0d,0x78,0x3a,0x06,0x00,0x74,0x05,0xe9,0x51,0x56,0xeb,0xff,0xc3,
+};
+
+/* 2.4.0.296's guarded code ranges, as SHA-256 like ios_sch_code. Each int3
+ * padding range starts with the RET that ends the function before it. */
+static const struct ios_sch_range ios_sch302_code[] =
+{
+    { IOS_SCH302_GET_HANDLER, 0x3b, /* App::GetRenderProcessHandler / GetBrowserProcessHandler */
+      {
+        0xbf,0xf1,0x79,0x08,0x92,0xbe,0x32,0xf0,0x8e,0x4a,0xd7,0x26,0x87,0x96,0x48,0x60,
+        0xc0,0x66,0x80,0xfd,0x5e,0xb7,0x01,0x04,0x4b,0xc9,0xb4,0x42,0xaa,0x53,0xf8,0x55 } },
+    { 0x73c0, 0x20, /* RendererApp::RendererApp(this, most_derived) */
+      {
+        0xbe,0x7e,0x19,0xa1,0x0b,0x42,0x36,0x55,0xa0,0x71,0x28,0xef,0x67,0xf7,0x94,0xc2,
+        0x6d,0x24,0x98,0x5c,0x57,0x0e,0xeb,0xaa,0xd0,0x60,0x94,0x68,0x0a,0x4a,0x74,0x4a } },
+    { 0x162928, 0x20, /* operator new */
+      {
+        0x82,0x73,0x33,0x2b,0xfc,0x01,0x08,0xf9,0xc9,0xf5,0xdc,0xad,0x01,0x3c,0x5e,0x5b,
+        0x80,0x91,0x10,0xd7,0x60,0x4f,0x49,0x56,0x2f,0xd4,0xdd,0x3b,0xc6,0x79,0x89,0xe9 } },
+    { IOS_SCH302_GET_NULL, 0xb,
+      {
+        0x7e,0x90,0xc2,0x24,0x72,0x8a,0x8e,0x94,0xca,0x0a,0x73,0x81,0xc4,0x4b,0x1d,0x32,
+        0x26,0x75,0x55,0xc7,0x55,0xfa,0xb1,0x86,0x74,0x12,0x92,0xf9,0x99,0xf2,0x54,0x46 } },
+    { 0x84101, 0x6,
+      {
+        0xe7,0x74,0x7f,0xe6,0xd8,0xbe,0x61,0x5e,0x01,0x5d,0x32,0x45,0xb7,0x45,0x60,0xf3,
+        0xa9,0x11,0x67,0xf3,0xa3,0x66,0x67,0xd8,0xc7,0x68,0x7b,0xe3,0xd7,0xc8,0x17,0xd3 } },
+    { IOS_SCH302_CURRENT_LOOP, 0x1f, /* MessageLoop::current (TLS initialization) */
+      {
+        0x1f,0x4b,0xa8,0x32,0x4a,0x77,0x49,0x75,0x3c,0x77,0xf5,0x46,0x8e,0xe5,0xe5,0x7a,
+        0x11,0xc6,0xf1,0x5f,0xa2,0x6f,0x3c,0x21,0xb7,0x64,0x04,0xdf,0xc0,0x06,0x80,0xa3 } },
+    { 0x19739f, 0x10, /* MessageLoop::current (TLS getter tail) */
+      {
+        0x45,0x8c,0xd8,0x56,0x95,0x3b,0x8e,0x42,0xa5,0x69,0xcf,0xf8,0x76,0x44,0x54,0x8c,
+        0x40,0x29,0xc2,0x39,0xc4,0x4b,0x4d,0x2a,0x73,0x31,0xc0,0x49,0x65,0x48,0x44,0x4d } },
+    { 0x19ab80, 0x8, /* TLS slot getter */
+      {
+        0xab,0xff,0x72,0x65,0x02,0x99,0x48,0xfd,0x16,0xf7,0xc7,0x32,0x8e,0x90,0x0e,0xc8,
+        0x90,0x6c,0x26,0x8d,0x3b,0x39,0xfd,0x2c,0xf3,0x35,0x6c,0x81,0xb2,0xb3,0xe2,0xac } },
+    { IOS_SCH302_LOOP_CTOR, 0x20, /* MessageLoop constructor */
+      {
+        0x34,0x3a,0xd9,0x7b,0xb3,0xca,0x7e,0xdb,0xe0,0x14,0x05,0x0b,0xca,0x9d,0x30,0x5b,
+        0x85,0xb1,0x7c,0x5a,0x6d,0xf9,0xf2,0xc9,0xd7,0xe8,0x00,0xa4,0xe6,0x76,0x6b,0x1e } },
+    { 0x195e29, 0x28, /* constructor installs this thread TLS loop; type 0 keeps the default pump */
+      {
+        0x43,0x64,0xc8,0x65,0xe3,0x6e,0xfb,0xe3,0xc0,0x34,0x79,0x5d,0x31,0x24,0xc6,0xb6,
+        0x58,0x6d,0xca,0xcb,0xf7,0xf3,0xdc,0x4a,0x4b,0x25,0xa5,0x69,0x47,0x7d,0x14,0x87 } },
+    { 0x195ee5, 0x18, /* constructor returns the loop */
+      {
+        0x7f,0xaa,0x45,0x3c,0xb6,0x39,0xf5,0x0f,0x40,0x2f,0x90,0xf3,0x06,0x7c,0xfc,0x83,
+        0x76,0xb2,0xea,0xc7,0xd9,0xf1,0xd3,0x4a,0x53,0x09,0xa4,0xc7,0xd8,0xe7,0x0c,0x96 } },
+    { IOS_SCH302_LOOP_WORK, 0x20, /* DoWork */
+      {
+        0xe3,0xa6,0x77,0x5f,0x43,0x26,0x0a,0x47,0x38,0xce,0xff,0xdb,0x25,0x7a,0x3b,0x65,
+        0x0c,0xb8,0x19,0x5b,0x4d,0x71,0x30,0x8b,0x5b,0x46,0xe4,0x95,0x91,0x05,0x3f,0x80 } },
+    { IOS_SCH302_LOOP_DELAYED, 0x20, /* DoDelayedWork */
+      {
+        0xaa,0xac,0x3b,0x50,0x8e,0x12,0x3e,0x76,0x82,0xcc,0xbe,0x44,0xbf,0xa9,0xfb,0x7c,
+        0xd8,0xac,0x2e,0xbc,0xd3,0x9a,0x12,0xda,0x84,0x1c,0x5c,0x4b,0xfb,0x8b,0x5e,0xb6 } },
+    { IOS_SCH302_LOOP_IDLE, 0x20, /* DoIdleWork */
+      {
+        0x71,0x8f,0x26,0xea,0x35,0x5f,0x85,0x94,0xae,0x33,0x4d,0x28,0x2b,0x28,0x31,0x56,
+        0x12,0xde,0xca,0xaa,0x28,0x4b,0x41,0xcf,0xe6,0x77,0xbb,0x7b,0xc6,0x80,0xf5,0xcc } },
+    { 0x196c40, 0x40, /* scoped RunState layout and nesting */
+      {
+        0x73,0x1e,0x73,0xa0,0xb2,0x9f,0x58,0x56,0x7a,0x17,0xb8,0xb5,0x93,0xf1,0x92,0x67,
+        0x1f,0x2a,0xca,0x02,0xf2,0x1c,0x5c,0xa0,0x94,0x45,0x89,0xb1,0xad,0xab,0x70,0x32 } },
+    { 0x196c81, 0x1c, /* scoped RunState quit flag and restore */
+      {
+        0xe5,0x39,0xde,0xc2,0x15,0x2a,0x4f,0x02,0x2b,0x08,0xfd,0xac,0x00,0x0e,0xdd,0xdc,
+        0x2d,0x65,0xc3,0xa8,0xab,0xfa,0x56,0x01,0x07,0x08,0x0a,0x23,0xbb,0x52,0x31,0x43 } },
+    { 0x49cdf, 0x12, /* only the CEF TID_RENDERER branch reaches the patched call */
+      {
+        0x02,0xca,0xd6,0x9f,0x06,0x15,0x03,0x12,0xe2,0x50,0xef,0x2f,0x79,0xac,0x8d,0xad,
+        0xad,0xf7,0xc8,0x87,0xea,0x5e,0xc2,0xbb,0xe4,0x97,0x09,0x59,0x31,0xfb,0x6f,0x4e } },
+    { IOS_SCH302_RENDER_DRAIN_SITE, 0x5,
+      {
+        0x0e,0x46,0x23,0x2e,0xf4,0x49,0xc4,0x93,0x13,0x35,0xbf,0x35,0x47,0x98,0x2f,0xcb,
+        0x68,0xad,0xe8,0xf4,0xc6,0x7b,0x7c,0xfd,0xbb,0x1d,0xfa,0x5f,0x64,0x73,0x5a,0x84 } },
+    { 0x13f410, 0x11, /* original global browser drain remains unchanged */
+      {
+        0x7c,0xe4,0x20,0x0c,0x64,0x50,0x4b,0x45,0x73,0x2d,0x62,0x66,0xee,0x85,0x6e,0x51,
+        0x6c,0x91,0x9e,0x3f,0xd6,0xbb,0x7a,0xa8,0x1c,0x8d,0xd8,0xbb,0x6e,0x94,0x57,0x9e } },
+    { 0x4ba4e, 0x7, /* Connect keeps replace_old in R12B */
+      {
+        0xb3,0x42,0xe1,0xb5,0x09,0x94,0x4a,0xe2,0x36,0x60,0xd2,0x7c,0x0b,0xcc,0x79,0x45,
+        0x2c,0x10,0xd5,0xd5,0xf7,0xf9,0x00,0x8e,0x98,0x37,0xf1,0xbd,0x4f,0x13,0x7f,0x01 } },
+    { 0x491c9, 0x31, /* renderer's Channel Response -> Connect(name, replace_old) */
+      {
+        0xee,0x6b,0xd0,0xaf,0x6c,0x1c,0x67,0x61,0x20,0x73,0x21,0xed,0xa6,0xbd,0xbf,0x96,
+        0xa0,0xee,0xe2,0x4d,0x4f,0xd4,0x61,0x99,0x1a,0xbb,0x1f,0xa8,0xc5,0x6c,0xb2,0xbd } },
+    { 0x4bbe6, 0x3d, /* Connect removes the previous named channel only when replace_old is true */
+      {
+        0x85,0x2e,0xe2,0xca,0x0c,0x63,0xc6,0x25,0x2f,0x3f,0xd1,0x93,0x03,0x5c,0x38,0x3f,
+        0xdb,0xaf,0x6c,0xcd,0x81,0x79,0x21,0x9b,0x3e,0x95,0x53,0xe5,0x88,0xce,0x4e,0xc4 } },
+    { 0x4ba10, 0xe, /* embedded IPC client appends a connection and increments its counts */
+      {
+        0x1a,0x90,0x5d,0xa9,0xfd,0x37,0x16,0x45,0xff,0x9c,0x9a,0x1d,0x2b,0x30,0x26,0xfc,
+        0x55,0x37,0x22,0xd4,0xf8,0xf3,0x1c,0xdb,0xcf,0x71,0x01,0xe1,0x47,0xd4,0xc3,0xef } },
+    { 0x4bdaf, 0x3e, /* explicit disconnect locates and closes only the named connection */
+      {
+        0x42,0xe4,0x12,0x01,0x77,0x6b,0x6d,0x0e,0x66,0x9b,0x43,0x21,0xcf,0x94,0xb2,0xf3,
+        0x05,0xc4,0xd3,0x7a,0xb3,0x8f,0xd7,0xad,0x13,0x77,0x0c,0xa2,0x52,0xe1,0xc1,0x51 } },
+    { 0x4c0d0, 0x8, /* original process-wide manager getter */
+      {
+        0x1e,0x05,0xc0,0xce,0xc9,0x3d,0x36,0x47,0x9d,0x29,0xfa,0xca,0x2f,0x8a,0x59,0x94,
+        0x11,0x55,0x83,0x17,0x15,0x61,0xd5,0x58,0x91,0x46,0xd0,0x8c,0xdc,0x97,0x05,0xf5 } },
+    { 0x4c840, 0x5, /* Initialize entry; captures the live main command line */
+      {
+        0xc1,0x68,0x0a,0x7b,0x16,0x88,0xcf,0x4f,0x20,0x14,0x55,0x9f,0xce,0x61,0x3b,0x47,
+        0x1a,0x88,0xc0,0x77,0x20,0xd0,0xc3,0x61,0x9f,0xbf,0x9a,0x63,0xdd,0x55,0xde,0xeb } },
+    { 0x4b0e3, 0x7, /* constructor singleton store */
+      {
+        0x89,0x96,0xf9,0x69,0x3f,0x2d,0xf0,0x42,0xdf,0xd0,0xcc,0x46,0xf0,0x37,0x0f,0x2c,
+        0xb7,0x82,0xdf,0xa6,0x09,0x8c,0xf2,0xc9,0x97,0xa6,0xc1,0x4b,0xe8,0x9b,0x1b,0x18 } },
+    { 0x4c8a6, 0x7, /* Initialize role store */
+      {
+        0x0e,0x87,0x5d,0xc4,0x18,0xa1,0x92,0x01,0xc1,0xd2,0x6d,0x2f,0x91,0xb2,0x5c,0xd9,
+        0x42,0x51,0xee,0x5a,0xbd,0xd5,0x67,0x91,0x7e,0x2a,0x3c,0xbc,0x04,0xf4,0x0d,0x0c } },
+    { 0x4e084, 0x18, /* global browser loop initialization, R14 = this */
+      {
+        0x71,0x0c,0x61,0xd7,0x9e,0x87,0xd2,0x4a,0x13,0xb7,0x25,0x8a,0x00,0x89,0xbd,0xb2,
+        0x74,0x09,0x66,0x04,0xd2,0x48,0x70,0x6c,0x0e,0xea,0xa0,0x3e,0x15,0xb6,0x72,0x5e } },
+    { 0x4e0de, 0xa, /* browser-role-only handler registration */
+      {
+        0x3a,0xde,0xcd,0xeb,0x13,0xca,0xcd,0x77,0x7b,0x9b,0x3e,0x24,0x0d,0x35,0x16,0x13,
+        0x60,0xf9,0xcb,0x95,0xde,0x84,0x08,0x81,0x29,0x40,0x6c,0x28,0xda,0x4e,0xa3,0x05 } },
+    { 0x4e128, 0x20, /* initial channel connection from the command line */
+      {
+        0xb2,0xbf,0x16,0x6d,0xa0,0x49,0x36,0xe3,0xbc,0x71,0x0b,0xb6,0x25,0x4b,0x17,0xd7,
+        0xbb,0xe8,0x22,0x96,0x3e,0x53,0x63,0xdc,0xcd,0x44,0xba,0x1f,0xf2,0x0f,0xfa,0x63 } },
+    { 0x4b240, 0x50, /* destructor: RDI = this, RSI = 0, only RCX live after the singleton clear */
+      {
+        0x72,0x42,0xa5,0xaf,0x5d,0x99,0x64,0x5f,0x1b,0xbe,0xd1,0xc4,0x32,0x73,0xba,0x0e,
+        0x01,0x79,0x75,0x30,0xf8,0xab,0x53,0x24,0xd9,0xb4,0x60,0x78,0x89,0x73,0x6d,0x8d } },
+    { 0x4af20, 0x2a, /* manager constructor ABI and initial fields */
+      {
+        0x7c,0xf0,0x14,0x50,0x6e,0x58,0x18,0xa4,0x05,0xbe,0x4c,0x0b,0x9c,0xc9,0x77,0x1e,
+        0xc8,0x66,0xa7,0x85,0xda,0x5b,0x64,0x75,0xea,0x26,0xe2,0xfb,0xe7,0x56,0x27,0xeb } },
+    { 0x4b0d4, 0xf, /* embedded client construction and final owned-object field */
+      {
+        0x8e,0xc2,0xb6,0x7c,0x85,0xf0,0xeb,0xcb,0x9a,0x10,0x95,0x14,0xd8,0xad,0x0f,0xe7,
+        0xd3,0xa4,0xf3,0xe6,0x3f,0x64,0x3f,0x62,0xd4,0x76,0x47,0x81,0xd0,0xb0,0x04,0x5d } },
+    { 0x4e240, 0x1e, /* Initialize consumes its by-value command-line reference */
+      {
+        0xe8,0xcd,0xc5,0xe3,0x65,0x96,0xd4,0x39,0x5e,0x07,0xd4,0x6e,0xe0,0x65,0x11,0x5c,
+        0xea,0xb3,0xe4,0x99,0x90,0x79,0x63,0x87,0xea,0xa6,0x85,0x13,0x21,0x2c,0xc5,0x3b } },
+    { 0x4e765, 0x24, /* inlined manager lookup after a CALL; RAX/RCX/flags rewritten before use */
+      {
+        0x54,0x4a,0xdc,0x85,0xd9,0xd0,0x5c,0xff,0x69,0x88,0x0c,0xbe,0x72,0x08,0x01,0x0c,
+        0x0d,0xb3,0x80,0xac,0xd1,0x6b,0x42,0x2c,0xa8,0x23,0x2c,0xa0,0xff,0x43,0xc6,0x31 } },
+    { 0x162964, 0x6, /* helper sized deallocator */
+      {
+        0x6f,0xc3,0x6c,0xb0,0x1f,0xd7,0x87,0xe3,0x1e,0x2e,0x8b,0x56,0x11,0xfe,0x8a,0xe5,
+        0xd5,0x50,0xe7,0x6c,0x3c,0x64,0x3f,0xa4,0xf3,0x62,0xc9,0x8b,0x55,0xdf,0xcd,0x04 } },
+    { IOS_SCH302_WEBKIT, 0x20, /* original OnWebKitInitialized */
+      {
+        0x1a,0x66,0x35,0xcb,0x9f,0x7a,0x1e,0x99,0xa9,0x71,0x21,0x8d,0x52,0x26,0x71,0xc8,
+        0xec,0x12,0xf9,0xf1,0xe2,0x4f,0x04,0x93,0xa5,0xb4,0x1c,0x09,0x6d,0xeb,0x45,0x40 } },
+    { 0x197423, 0xd, /* RET, then int3 padding: task AddRef */
+      {
+        0xfa,0x14,0xaf,0x33,0x83,0x8c,0x18,0xaa,0x65,0x46,0x20,0xc1,0xc1,0xed,0x5f,0x1a,
+        0x28,0xc9,0xc5,0x87,0x4b,0xb4,0xf5,0xfa,0xfa,0xe0,0x46,0xb4,0x07,0x4a,0x5c,0x15 } },
+    { 0x1977f3, 0xd, /* RET, then int3 padding: task Release */
+      {
+        0xfa,0x14,0xaf,0x33,0x83,0x8c,0x18,0xaa,0x65,0x46,0x20,0xc1,0xc1,0xed,0x5f,0x1a,
+        0x28,0xc9,0xc5,0x87,0x4b,0xb4,0xf5,0xfa,0xfa,0xe0,0x46,0xb4,0x07,0x4a,0x5c,0x15 } },
+    { 0x196b64, 0xc, /* RET, then int3 padding: task HasOneRef */
+      {
+        0xf7,0x77,0x9d,0x90,0x63,0x35,0x27,0x79,0x04,0xd5,0xdf,0x8f,0x37,0x6e,0xdc,0xc6,
+        0x50,0xb1,0xcd,0xc0,0x5a,0x85,0x57,0x50,0x90,0xee,0x46,0x8a,0x2a,0xff,0x24,0xa8 } },
+    { 0x199364, 0xc, /* RET, then int3 padding: task HasAtLeastOneRef */
+      {
+        0xf7,0x77,0x9d,0x90,0x63,0x35,0x27,0x79,0x04,0xd5,0xdf,0x8f,0x37,0x6e,0xdc,0xc6,
+        0x50,0xb1,0xcd,0xc0,0x5a,0x85,0x57,0x50,0x90,0xee,0x46,0x8a,0x2a,0xff,0x24,0xa8 } },
+    { 0x483e0, 0x10, /* RET, then int3 padding: global-loop stub */
+      {
+        0x52,0xbe,0x34,0x27,0x50,0x79,0xab,0xd5,0x9f,0xd4,0xed,0xc2,0xd5,0x6f,0xe1,0x81,
+        0xe5,0x21,0x44,0x48,0x9f,0x0d,0xa2,0x25,0x17,0x0c,0x9d,0x43,0x88,0x73,0x82,0x4d } },
+    { 0x1963d0, 0x10, /* RET, then int3 padding: initial-connect stub */
+      {
+        0x52,0xbe,0x34,0x27,0x50,0x79,0xab,0xd5,0x9f,0xd4,0xed,0xc2,0xd5,0x6f,0xe1,0x81,
+        0xe5,0x21,0x44,0x48,0x9f,0x0d,0xa2,0x25,0x17,0x0c,0x9d,0x43,0x88,0x73,0x82,0x4d } },
+};
+
+static const struct ios_sch_blob ios_sch302_blob[] =
+{
+    { IOS_SCH302_RENDER_CHANNEL_THUNK, ios_sch302_renderer_channels, sizeof(ios_sch302_renderer_channels), 0, 1,
+      "renderer channel .text tail not zero" },
+    { IOS_SCH302_THUNK, ios_sch302_thunk, sizeof(ios_sch302_thunk), 0, 0, ".text tail not zero" },
+    { IOS_SCH302_LOOP_INIT, ios_sch302_loop_thunk, sizeof(ios_sch302_loop_thunk), 0, 0,
+      "renderer loop .text tail not zero" },
+    { IOS_SCH302_TASK_ADD, ios_sch302_task_add, sizeof(ios_sch302_task_add), 0xcc, 0,
+      "renderer task callback padding not int3" },
+    { IOS_SCH302_TASK_RELEASE, ios_sch302_task_release, sizeof(ios_sch302_task_release), 0xcc, 0,
+      "renderer task callback padding not int3" },
+    { IOS_SCH302_TASK_ONE, ios_sch302_task_one, sizeof(ios_sch302_task_one), 0xcc, 0,
+      "renderer task callback padding not int3" },
+    { IOS_SCH302_TASK_ANY, ios_sch302_task_any, sizeof(ios_sch302_task_any), 0xcc, 0,
+      "renderer task callback padding not int3" },
+    { IOS_SCH302_RENDER_DRAIN, ios_sch302_render_drain, sizeof(ios_sch302_render_drain), 0, 0,
+      "renderer drain .text tail not zero" },
+    { IOS_SCH302_IPC_SPLIT, ios_sch302_ipc_split, sizeof(ios_sch302_ipc_split), 0, 1,
+      "IPC split .text tail not zero" },
+    { IOS_SCH302_IPC_DIRECT, ios_sch302_ipc_direct, sizeof(ios_sch302_ipc_direct), 0, 1,
+      "IPC split .text tail not zero" },
+    { IOS_SCH302_IPC_GLOBAL_LOOP, ios_sch302_ipc_global_loop, sizeof(ios_sch302_ipc_global_loop), 0xcc, 1,
+      "IPC split padding not int3" },
+    { IOS_SCH302_IPC_INITIAL_CONNECT, ios_sch302_ipc_initial_connect, sizeof(ios_sch302_ipc_initial_connect),
+      0xcc, 1, "IPC split padding not int3" },
+};
+
+static const struct ios_sch_hook ios_sch302_hook[] =
+{
+    { IOS_SCH302_RENDER_DRAIN_SITE, IOS_SCH302_RENDER_DRAIN, 5, 0xe8, 0 },
+    { 0x4c0d0, IOS_SCH302_IPC_SPLIT, 7, 0xe9, 1 },
+    { 0x4c840, IOS_SCH302_IPC_CAPTURE, 5, 0xe9, 1 },
+    { 0x4b0e3, IOS_SCH302_IPC_STORE, 7, 0xe9, 1 },
+    { 0x4c8a6, IOS_SCH302_IPC_ROLE, 7, 0xe9, 1 },
+    { 0x4e097, IOS_SCH302_IPC_GLOBAL_LOOP, 5, 0xe8, 1 },
+    { 0x4e143, IOS_SCH302_IPC_INITIAL_CONNECT, 5, 0xe8, 1 },
+    { 0x4b279, IOS_SCH302_IPC_DESTROY, 7, 0xe9, 1 },
+    { 0x4e76a, IOS_SCH302_IPC_DIRECT, 7, 0xe9, 1 },
+    { IOS_SCH302_RENDER_CHANNEL_KEEP, IOS_SCH302_RENDER_CHANNEL_THUNK, 7, 0xe9, 1 },
+};
+
+static const struct ios_sch_zero ios_sch302_zero[] =
+{
+    { IOS_SCH302_TASK, 64, "renderer task .data tail not zero" },
+    { IOS_SCH302_IPC_CONTEXT, 16, "IPC split context not zero" },
+    { IOS_SCH302_CACHE, 8, ".data tail not zero" },
+};
+
 static const struct ios_sch_build ios_sch_builds[] =
 {
     { IOS_SCH_STAMP, IOS_SCH_SIZE, 0x17f34c, 0x17f400, IOS_SCH_DATA, 0x43bc,
@@ -16705,6 +18099,14 @@ static const struct ios_sch_build ios_sch_builds[] =
       ios_sch296_code, ARRAY_SIZE(ios_sch296_code), ios_sch296_blob, ARRAY_SIZE(ios_sch296_blob),
       ios_sch296_hook, ARRAY_SIZE(ios_sch296_hook), ios_sch296_zero, ARRAY_SIZE(ios_sch296_zero),
       "no diagnostic traces (2.4.0.296 has no room for them); " },
+    { IOS_SCH302_STAMP, IOS_SCH302_SIZE, IOS_SCH302_TEXT_VS, IOS_SCH302_TEXT_RAW, IOS_SCH302_DATA, IOS_SCH302_DATA_VS,
+      IOS_SCH302_VT_BROWSER, IOS_SCH302_VT_RENDERER, IOS_SCH302_VT_RPH, IOS_SCH302_GET_HANDLER, IOS_SCH302_GET_NULL,
+      IOS_SCH302_WEBKIT,
+      IOS_SCH302_THUNK, IOS_SCH302_LOOP_INIT, IOS_SCH302_LOOP_PUMP, IOS_SCH302_TASK_ADD, IOS_SCH302_TASK_RELEASE,
+      IOS_SCH302_TASK_ONE, IOS_SCH302_TASK_ANY, IOS_SCH302_TASK,
+      ios_sch302_code, ARRAY_SIZE(ios_sch302_code), ios_sch302_blob, ARRAY_SIZE(ios_sch302_blob),
+      ios_sch302_hook, ARRAY_SIZE(ios_sch302_hook), ios_sch302_zero, ARRAY_SIZE(ios_sch302_zero),
+      "no diagnostic traces (as 2.4.0.296); " },
 };
 
 /* Why `base` (SocialClubHelper.exe, mapped) cannot take the patch, or NULL when
@@ -17648,7 +19050,7 @@ static void ios_sc_grants_owner_died( void *peb )
     ios_sc_grant_dead_n += n;
     pthread_mutex_unlock( &ios_sc_grant_lock );
     if (n)
-        dprintf( 2, "[sc-cef] SocialClubHelper.exe (peb=%p) exited holding %d large reservation(s); they are "
+        dprintf( 2, "[sc-cef] a CEF host (peb=%p) exited holding %d large reservation(s); they are "
                     "released when the next helper asks\n", peb, n );
 }
 
@@ -18094,7 +19496,27 @@ static int ios_guest_image_is_host_data( const void *base, size_t size )
     struct file_view *view;
 
     if (!ios_guest_image_write_enabled()) return 0;
-    if (!ios_wow_in_window( base )) return 0;
+    if (!ios_wow_in_window( base ))
+    {
+        /* wow-image-anywindow (Battle.net + Overwatch 2, bnettest16 log 41384ecd): the caller can be
+         * another process. Wine's virtual_enable_write_exceptions, run by the first x64 process,
+         * re-protects every view in the shared address space; on that x64 thread the 32-bit views of
+         * the other processes failed the current-window test, kept PROT_EXEC and were copied into the
+         * JIT pool (libcef.dll, 160 MB, in each of six Battle.net processes -> EXHAUSTED). A SEC_IMAGE
+         * view inside any 32-bit window is i386 whoever re-protects it. env MADEIRA_GUEST_IMAGE_ANYWIN=0
+         * keeps the old current-window-only test. */
+        static int anywin = -1;
+        static unsigned long anywin_n;
+        if (anywin < 0)
+        {
+            const char *e = getenv( "MADEIRA_GUEST_IMAGE_ANYWIN" );
+            anywin = !(e && e[0] == '0');
+        }
+        if (!anywin || !ios_wow_in_any_window( base )) return 0;
+        if (++anywin_n <= 8 && !ios_in_mach_exc)
+            dprintf( 2, "[guest-image-anywin] #%lu %p+0x%lx is in another process's 32-bit window: kept out of the pool "
+                        "rev=wow-image-anywindow\n", anywin_n, base, (unsigned long)size );
+    }
     if (!(view = find_view( base, size )))
     {
         /* ml2020: the request is host-page rounded while an image view ends on a
@@ -18164,6 +19586,30 @@ static int ios_x64_image_nocopy_enabled(void)
     return cached;
 }
 
+/* x64-image-auto: Hatsune Miku Project DIVA Mega Mix+ (Sentry 7850233569-fdec1d98,
+ * 7850232970-7aa2f842, Nov 16 2026): DivaMegaMix.exe is 0x23e73000 bytes and the
+ * pool held 416 MB, so the copy failed ([jit-pool] EXHAUSTED, c0000017) on the first
+ * launch; Madeira then added env.MADEIRA_X64_IMAGE_NOCOPY = 1 and the next launch ran.
+ * Same images, same pool, no copy needed. So when a pure-x64 image alone is larger than
+ * what is left of the pool, mark just that image like the switch would, this launch.
+ * env.MADEIRA_X64_IMAGE_NOCOPY_AUTO = 0 turns it off. Defined before the pool globals
+ * it reads are used; declared extern here. */
+extern size_t ios_jit_pool_size_global;
+static int ios_x64_image_auto_nocopy( size_t image_size )
+{
+    static int cached = -1;
+    size_t pool = ios_jit_pool_size_global, used = jit_pool_offset, tail = ios_jit_tail_reserved;
+
+    if (cached < 0)
+    {
+        const char *s = getenv( "MADEIRA_X64_IMAGE_NOCOPY_AUTO" );
+        cached = (s && s[0] == '0' && !s[1]) ? 0 : 1;
+    }
+    if (!cached || !pool) return 0;
+    if (used + tail >= pool) return 1;
+    return image_size > pool - used - tail;
+}
+
 /* The request is host-page rounded (16 KB) while SizeOfImage is only 4 KB
  * aligned, so a last section's request ends up to 12 KB past the view: GTA V
  * Enhanced build 423 (2026-10-07 09:18), GTA5_Enhanced.exe 0x72d4840000+
@@ -18191,7 +19637,7 @@ static int ios_x64_image_is_host_data( const void *base, size_t size )
 #ifdef WINE_IOS
     struct file_view *view;
 
-    if (!ios_x64_image_nocopy_enabled()) return 0;
+    /* VPROT_X64DATA is only ever set under the switch or by x64-image-auto, so the flag alone decides. */
     if (!(view = find_view( base, 0 ))) return 0;
     if (!(view->protect & VPROT_X64DATA)) return 0;
     return ios_x64_image_view_covers( (uintptr_t)view->base, view->size, (uintptr_t)base, size );
@@ -18331,6 +19777,79 @@ static void ios_wow_note_image( const void *base, const UNICODE_STRING *nt_name 
                                       : "still pool-aliased (MADEIRA_WOW_RWX_PLAIN=0)" );
 }
 
+/* x64 Unity Mono: the 64-bit counterpart of the window rule above. A 64-bit Unity game loads
+ * its own mono-2.0-bdwgc.dll; its JIT chunks and Boehm GC heap are anonymous RWX memory that
+ * only FEX ever executes, so, as in a 32-bit window, they are plain read/write to the host
+ * instead of pool-aliased (every store a Mach fault). Automatic: the flag is set when
+ * mono-2.0-bdwgc.dll is mapped outside a 32-bit window. MADEIRA_X64_RWX_PLAIN=0 never turns
+ * it on, =1 turns it on for every 64-bit process. Log tag [x64-rwx]. */
+static unsigned ios_x64_unity_mono;
+
+/* madeira [x64-rwx-reread]: the Madeira app exports each game's env lines before its session starts, but this
+ * unix image lives as long as the app, so reading MADEIRA_X64_RWX_PLAIN once (the old code) kept the FIRST
+ * game's value for every later game of the same app launch: a game that wants it never got it after another
+ * game, and one that set it left it on for the next game. Now the value is read again on every call and the
+ * log line is printed when it changes. env MADEIRA_X64_RWX_PLAIN_REREAD=0 restores the read-once behaviour. */
+static int ios_x64_rwx_plain_mode(void)
+{
+    static int cached = -2, reread = -1;
+    const char *s;
+    int v;
+
+    if (reread < 0)
+    {
+        const char *r = getenv( "MADEIRA_X64_RWX_PLAIN_REREAD" );
+        reread = !(r && r[0] == '0' && !r[1]);
+    }
+    if (cached != -2 && !reread) return cached;
+    s = getenv( "MADEIRA_X64_RWX_PLAIN" );
+    v = !s || !*s ? -1 : (*s == '0') ? 0 : 1;
+    if (v != cached)
+    {
+        cached = v;
+        dprintf( 2, "[x64-rwx] MADEIRA_X64_RWX_PLAIN=%s -> 64-bit guest RWX memory is %s%s\n",
+                 s ? s : "(unset)",
+                 v == 1 ? "plain read/write in every 64-bit process" :
+                 v == 0 ? "pool-aliased (stores emulated)" :
+                          "plain read/write once Unity's mono-2.0-bdwgc.dll is mapped",
+                 reread ? " (read again per call, MADEIRA_X64_RWX_PLAIN_REREAD=0 reads once)" : "" );
+    }
+    return v;
+}
+
+static int ios_x64_rwx_plain_active(void)
+{
+    int mode = ios_x64_rwx_plain_mode();
+    if (!mode) return 0;
+    return mode == 1 || __atomic_load_n( &ios_x64_unity_mono, __ATOMIC_ACQUIRE );
+}
+
+/* Called for every image mapping: notice Unity's 64-bit Mono runtime. */
+static void ios_x64_note_image( const void *base, const UNICODE_STRING *nt_name )
+{
+    static const WCHAR mono[] = {'m','o','n','o','-','2','.','0','-','b','d','w','g','c','.','d','l','l'};
+    const size_t n = ARRAY_SIZE( mono );
+    const WCHAR *name;
+    size_t len, i;
+
+    if (!nt_name || !nt_name->Buffer) return;
+    len = nt_name->Length / sizeof(WCHAR);
+    if (len < n) return;
+    name = nt_name->Buffer + len - n;
+    if (len > n && name[-1] != '\\' && name[-1] != '/') return;
+    for (i = 0; i < n; i++)
+    {
+        WCHAR c = name[i];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (c != mono[i]) return;
+    }
+    if (ios_wow_live_slot_for_addr( base )) return;   /* 32-bit window: its own rule */
+    if (__atomic_exchange_n( &ios_x64_unity_mono, 1, __ATOMIC_ACQ_REL )) return;
+    dprintf( 2, "[x64-rwx] Unity Mono mapped at %p: 64-bit RWX memory is %s\n", base,
+             ios_x64_rwx_plain_mode() ? "plain read/write from now on"
+                                      : "still pool-aliased (MADEIRA_X64_RWX_PLAIN=0)" );
+}
+
 static int ios_wow_rwx_view_ok( const struct file_view *view )
 {
     if (!is_view_valloc( view )) return 0;
@@ -18353,6 +19872,22 @@ static int ios_guest_anon_rwx_is_host_data( const void *base, size_t size )
     struct ios_wow_window *plain_w = (!ios_alloc_ec_code && e > b) ? ios_wow_rwx_plain_window( base ) : NULL;
 
     if (plain_w && e - 1 < plain_w->base + IOS_WOW_WINDOW_SIZE &&
+        !(rx && e > rx && b < rx + ios_jit_pool_size_global) &&
+        !ios_jit_anon_alias_find_cover( (void *)base, size, &cov_rw, &cov_rx ))
+    {
+        for (a = b; a < e; )
+        {
+            struct file_view *view = find_view( (const void *)a, 1 );
+            if (!view) { a = (a + 0x1000) & ~(uintptr_t)0xfff; continue; }   /* rounding gap */
+            if (!ios_wow_rwx_view_ok( view )) { any = -1; break; }
+            any = 1;
+            a = (uintptr_t)view->base + view->size;
+        }
+        if (any == 1) return 1;
+        any = 0;
+    }
+
+    if (ios_x64_rwx_plain_active() && !ios_alloc_ec_code && arm64ec_view && e > b &&
         !(rx && e > rx && b < rx + ios_jit_pool_size_global) &&
         !ios_jit_anon_alias_find_cover( (void *)base, size, &cov_rw, &cov_rx ))
     {
@@ -19573,6 +21108,13 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 size_t offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
                 if (offset == (size_t)-1)
                 {
+                    /* pool-tail-for-head: a free FEX code buffer may hold the space the head lacks */
+                    ios_tail_carve_census_once( "anon RWX", alloc_size );
+                    if (ios_pool_tail_for_head( alloc_size, "anon RWX" ))
+                        offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
+                }
+                if (offset == (size_t)-1)
+                {
                     ERR("iOS JIT: pool exhausted for anon RWX %p+0x%lx\n",
                         base, (unsigned long)size);
                     dprintf(2, "[jit-pool] EXHAUSTED (anon RWX): want=0x%lx bump=0x%lx/0x%lx tail_resv=0x%lx freelist=%d — FAILING allocation\n",
@@ -19779,6 +21321,28 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 return -1;
             }
 
+            /* [stale-image] the view this copy would read may be gone already (its own unmap, another
+             * thread's). Probe it before the pool range and the x18 / data-alignment scans below, which read it
+             * too. Same early-out as the refused loads above: the protect fails, nothing is allocated. */
+            if (!ios_image_view_readable( image_base, image_size ))
+            {
+                ios_stale_image_log( "mprotect_exec", image_base, image_size );
+                mprotect( base, size, PROT_READ );
+                errno = ENOMEM;
+                return -1;
+            }
+
+            /* [jit-map] a full mapping table fails the load BEFORE any pool range is taken: a copy
+             * the table cannot register is unusable (its PE VA exec-faults), and the retries each
+             * made another one. Same early-out shape as the stale-image probe above. */
+            if (!ios_jit_mapping_has_room( image_base, image_size ))
+            {
+                ios_jit_copy_refused = 1;   /* map_image_into_view fails the load */
+                mprotect( base, size, PROT_READ );
+                errno = ENOMEM;
+                return -1;
+            }
+
             /* ml457 REVERTED (ml458) — DO NOT RE-ATTEMPT skipping pool copies
              * for pure-x64 images.  The premise ("x64 runs only through FEX, so
              * its pool copy is never entered") is FALSE: x64 guest RIPs ARE
@@ -19839,6 +21403,13 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 if (offset == (size_t)-1) offset = ios_pool_low_image_range( alloc_size );
                 if (offset == (size_t)-1 && ios_pool_recycle_code_range( alloc_size ))
                     offset = ios_pool_alloc_range_tagged(alloc_size, jit_pool_size - ios_jit_tail_reserved, image_tag);
+                if (offset == (size_t)-1)
+                {
+                    /* pool-tail-for-head: a free FEX code buffer may hold the space the head lacks */
+                    ios_tail_carve_census_once( "image", alloc_size );
+                    if (ios_pool_tail_for_head( alloc_size, "image" ))
+                        offset = ios_pool_alloc_range_tagged(alloc_size, jit_pool_size - ios_jit_tail_reserved, image_tag);
+                }
             }
             if (!reload_jit && offset != (size_t)-1 && data_delta)
             {
@@ -19868,6 +21439,16 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
             /* Copy ENTIRE PE image to JIT pool (code + data + headers).
              * This preserves ADRP-based PC-relative references between sections. */
+            /* [stale-image] second probe, right before the copy: the allocation above is the longest wait in
+             * this function. The range just taken stays allocated (there is no release for a range that is not
+             * registered yet); the load fails like an exhausted pool instead of the thread faulting. */
+            if (!ios_image_view_readable( image_base, image_size ))
+            {
+                ios_stale_image_log( "mprotect_exec (before the copy)", image_base, image_size );
+                mprotect( base, size, PROT_READ );
+                errno = ENOMEM;
+                return -1;
+            }
             ios_jit_scan_nonexec( "pre-memcpy", ios_pe_module_name( image_base, image_size ),
                                   (char *)jit_rx_base + offset, image_size );
             memcpy((char *)jit_rw_base + offset, image_base, image_size);
@@ -20617,6 +22198,14 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
         }
     }
 
+    /* [stale-image] the parent view may be gone (unmapped since it was registered): probe it before a pool
+     * range is taken and the scans below read it. */
+    if (!ios_image_view_readable( m->pe_base, m->size ))
+    {
+        ios_stale_image_log( "ios_jit_copy_module_for_child", m->pe_base, m->size );
+        return -1;
+    }
+
     alloc_size = (m->size + pg - 1) & ~(pg - 1);
     /* task #34: reserve the x18 trampoline region inside this allocation at
      * a fixed image-relative offset (mirrors the parent path — see the
@@ -20864,6 +22453,61 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
 }
 
 
+/* madeira-bcd [x64-noaccess] diagnostic (env MADEIRA_X64_NOACCESS_TRACE = 0 turns it off;
+ * log-only, changes no protection).
+ *
+ * Overwatch 2, bnettest23 (Nov 19 2026): the process dies on
+ * "AV READ of 1405431E0" from ntdll native code; the host region
+ * 0x140004000+0x2f58000 (Overwatch.exe .text, a VPROT_X64DATA view) is prot=0,
+ * and Wine's own table agrees ("vprot prev/this/next=20/20/20" = COMMITTED only,
+ * i.e. PAGE_NOACCESS). At map time [x64-image] applied r-- to that range, and no
+ * [exec-req]/[unexec] line shows the change, so something set it to no-access
+ * later without being logged. This names it: every set_vprot that leaves a page of
+ * a pure-x64 image view with no READ/WRITE/EXEC/WRITECOPY bit, or with GUARD, is
+ * logged with the old page vprot, set_vprot's caller (host pc in ntdll.so), the
+ * thread and the guest x64 Rip/Rsp last saved in ContextAmd64 (can be stale while
+ * the thread is inside simulation). First 32 hits per process. */
+#ifdef WINE_IOS
+static int ios_x64_noaccess_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *s = getenv( "MADEIRA_X64_NOACCESS_TRACE" );
+        cached = (s && s[0] == '0' && !s[1]) ? 0 : 1;
+    }
+    return cached;
+}
+
+static void ios_x64_noaccess_trace( struct file_view *view, void *base, size_t size, BYTE vprot, void *caller )
+{
+    static int hits;
+    ULONG64 rip = 0, rsp = 0;
+    BYTE old;
+    TEB *teb;
+
+    if (!(view->protect & VPROT_X64DATA)) return;
+    if ((vprot & (VPROT_READ | VPROT_WRITE | VPROT_EXEC | VPROT_WRITECOPY)) && !(vprot & VPROT_GUARD)) return;
+    if (ios_in_mach_exc || !ios_x64_noaccess_trace_enabled()) return;
+    if (hits >= 32) return;
+    hits++;
+    old = get_page_vprot( base );
+    teb = NtCurrentTeb();
+    if (teb && teb->ChpeV2CpuAreaInfo && teb->ChpeV2CpuAreaInfo->ContextAmd64)
+    {
+        rip = *(ULONG64 *)((char *)teb->ChpeV2CpuAreaInfo->ContextAmd64 + 0xF8);
+        rsp = *(ULONG64 *)((char *)teb->ChpeV2CpuAreaInfo->ContextAmd64 + 0x98);
+    }
+    dprintf( 2, "[x64-noaccess] #%d tid=%04x %p+0x%lx view=%p+0x%lx off=0x%lx vprot 0x%02x -> 0x%02x%s "
+                "caller=%p | saved guest Rip=0x%llx Rsp=0x%llx (may be stale) rev=x64-noaccess\n",
+             hits, teb ? (unsigned)(ULONG_PTR)teb->ClientId.UniqueThread : 0u,
+             base, (unsigned long)size, view->base, (unsigned long)view->size,
+             (unsigned long)((char *)base - (char *)view->base), old, vprot,
+             (vprot & VPROT_GUARD) ? " GUARD" : " NOACCESS", caller,
+             (unsigned long long)rip, (unsigned long long)rsp );
+}
+#endif
+
 /***********************************************************************
  *           set_vprot
  *
@@ -20871,6 +22515,9 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
  */
 static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vprot )
 {
+#ifdef WINE_IOS
+    ios_x64_noaccess_trace( view, base, size, vprot, __builtin_return_address(0) );
+#endif
     if (!use_kernel_writewatch && view->protect & VPROT_WRITEWATCH)
     {
         /* each page may need different protections depending on write watch flag */
@@ -21837,6 +23484,36 @@ static int ios_stack_spill_enabled(void)
     return v;
 }
 
+/* [stack-spill-auto] the same spill, taken only AFTER the band has refused the request.
+ *
+ * Nine logs on a 512 GB map (the owner's Deep Rock Galactic run on Direct3D 12, 0.2.35, and
+ * Get Help reports of RimWorld, Survivalist: Invisible Strain and Alba) have the same lines:
+ * "[va-scan] FAILED window=0x100000000..0x73ffff0000 size=0x100000 ... <-- STATUS_NO_MEMORY",
+ * then "[thr-create] FAILED at emulator stack" (or "kernel stack"), while the last census
+ * before it reads "[slot#2] 0x7800000000+16GB CLEAR": 16 GB and more are free above the band,
+ * and every other request already goes there through the advisory-ceiling rule. Only these 4 GB-floored stack requests cannot (see
+ * ios_stack_spill_enabled), unless the game's config has MADEIRA_THREAD_STACK_SPILL = 1.
+ *
+ * So when such a request has found no room and would return STATUS_NO_MEMORY, give it the
+ * kernel's pick instead, the placement the switch ends with (the switch also starts the scan
+ * at the furniture floor; this path keeps today's scan from 4 GB and only adds the fallback). Nothing changes for a request the band
+ * can serve: the scan, its order and its result are the same, so a start that works today is
+ * untouched. On by default; env.MADEIRA_STACK_SPILL_AUTO = 0 turns it off. */
+static int ios_stack_spill_auto_enabled(void)
+{
+    static int enabled = -1;
+    int v = __atomic_load_n( &enabled, __ATOMIC_ACQUIRE );
+
+    if (v < 0)
+    {
+        const char *s = getenv( "MADEIRA_STACK_SPILL_AUTO" );
+
+        v = !(s && s[0] == '0');
+        __atomic_store_n( &enabled, v, __ATOMIC_RELEASE );
+    }
+    return v;
+}
+
 /***********************************************************************
  *           map_view
  *
@@ -22064,6 +23741,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
          * 16GB/32GB pool reserves may use the slots above. */
         int ceiling_relaxable = 0;
         int stack_spill = 0;   /* madeira-bcd: relaxable only through ios_stack_spill_enabled */
+        int stack_spill_late = 0;   /* [stack-spill-auto]: may take the kernel's pick once the band has refused it */
         if (ios_furniture_ceiling && !limit_high && size < 0x400000000ULL &&
             (void *)ios_furniture_ceiling < end)
         {
@@ -22084,6 +23762,9 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             /* madeira-bcd: [stack-spill] — see ios_stack_spill_enabled */
             if (!ceiling_relaxable && limit_low <= limit_4g && ios_stack_spill_enabled())
                 ceiling_relaxable = stack_spill = 1;
+            /* [stack-spill-auto] — see ios_stack_spill_auto_enabled */
+            else if (!ceiling_relaxable && limit_low <= limit_4g && ios_stack_spill_auto_enabled())
+                stack_spill_late = 1;
         }
         size_t host_size = ROUND_SIZE( 0, size, host_page_mask );
         size_t unmap_size, view_size = host_size + align_mask + 1;
@@ -22227,6 +23908,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         {
             unsigned int tries0 = ios_va_scan_tries;
             unsigned int skips0 = ios_va_scan_skips;
+            unsigned int below0 = ios_va_scan_below_floor;
 
             ptr = map_free_area( start, end, host_size, top_down, unix_prot, align_mask );
 #ifdef WINE_IOS
@@ -22281,19 +23963,20 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                  * could be seen when the Social Club helper failed to create
                  * a thread 6 minutes later. */
                 if (ptr ? ios_storm_gate( &vs_storm )
-                        : ceiling_relaxable ? (++vs_relaxed <= 64 || !(vs_relaxed % 1024)) : (vs_fails++ < 256))
-                dprintf( 2, "[va-scan] %s window=%p..%p size=%p align=%p %s tries=%u skips=%u"
+                        : (ceiling_relaxable || stack_spill_late) ? (++vs_relaxed <= 64 || !(vs_relaxed % 1024)) : (vs_fails++ < 256))
+                dprintf( 2, "[va-scan] %s window=%p..%p size=%p align=%p %s tries=%u skips=%u below-floor=%u"
                             " | seen=%p..%p views=%u maxgap=%p tailgap=%p stop=%s"
                             " | firstfail=%p errno=%d(%s) %s%s\n",
                          ptr ? "SLOW" : "FAILED", start, end, (void *)size,
                          (void *)(align_mask + 1), top_down ? "top-down" : "bottom-up",
                          ios_va_scan_tries - tries0, ios_va_scan_skips - skips0,
+                         ios_va_scan_below_floor - below0,   /* of the tries: counted, not attempted */
                          ios_scan_base, ios_scan_end, ios_scan_views,
                          (void *)ios_scan_maxgap, (void *)ios_scan_tailgap,
                          ios_scan_stop_name( ios_scan_stop ),
                          ios_scan_fail_addr, ios_scan_fail_errno,
                          ios_scan_fail_errno ? strerror( ios_scan_fail_errno ) : "-", what,
-                         ptr ? "" : (ceiling_relaxable ? "  --> relaxing ceiling, retrying unclamped"
+                         ptr ? "" : ((ceiling_relaxable || stack_spill_late) ? "  --> relaxing ceiling, retrying unclamped"
                                                        : "  <-- STATUS_NO_MEMORY (callers see a NULL alloc)") );
                 }
             }
@@ -22355,11 +24038,12 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                 goto done;
             }
 #endif
-            if (!ceiling_relaxable)
+            if (!ceiling_relaxable && !stack_spill_late)
             {
                 ios_af_set( 2, ios_scan_fail_errno, ios_scan_fail_addr, size );
                 return STATUS_NO_MEMORY;
             }
+            if (!ceiling_relaxable) stack_spill_late = 2;   /* [stack-spill-auto]: refused by the band, taking the kernel's pick */
             start = address_space_start;
             end = min( user_space_limit, host_addr_space_limit );
             if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
@@ -22400,6 +24084,16 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                 dprintf( 2, "[stack-spill] #%lu furniture band full: 0x%lx bytes with a 4 GB floor "
                             "placed at %p by the kernel's pick (MADEIRA_THREAD_STACK_SPILL)\n",
                          spill_n, (unsigned long)size, ptr );
+        }
+        if (stack_spill_late == 2)
+        {
+            static unsigned long auto_n;
+
+            if (++auto_n <= 16 || !(auto_n % 256))
+                dprintf( 2, "[stack-spill-auto] #%lu the band had no room for 0x%lx bytes with a 4 GB floor "
+                            "(a thread's stack): placed at %p by the kernel's pick instead of failing "
+                            "(env.MADEIRA_STACK_SPILL_AUTO = 0 turns this off)\n",
+                         auto_n, (unsigned long)size, ptr );
         }
     }
 done:
@@ -24649,11 +26343,31 @@ static void ios_swap_image_flush( int ok )
  * faults in host code with virtual_mutex held, and the calling thread is lost. Pages that
  * are not committed are skipped, as on Windows; they were zeroed when they were last
  * decommitted, or never committed at all. virtual_mutex held. Returns the bytes zeroed. */
+static int ios_range_writable( const void *addr, size_t size );
+
+/* [decommit-zero-prot] (Battle.net StarCraft menu freeze, iPad log b88b8e63): a COMMITTED
+ * guest page can still be host read-only (PAGE_READONLY, write-watch, guard, or a 4 KB
+ * neighbour on the same 16 KB host page). The memset below then faults with virtual_mutex
+ * held; the Mach exception thread waits for that mutex ([vm-fault-wait] write fault of the
+ * same tid) and every Wine process stops for good. Unlock such a host page for the memset
+ * and put its protection back from the vprot table afterwards. Real host protection is read
+ * with mach_vm_region, once per host page. env.MADEIRA_DECOMMIT_ZERO_PROT=0 turns it off. */
+static int ios_decommit_zero_prot_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_DECOMMIT_ZERO_PROT" );
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 static size_t ios_decommit_zero_committed( char *start, char *end )
 {
-    static unsigned long skipped, logs;
+    static unsigned long skipped, logs, unlocks;
     size_t zeroed = 0;
-    char *p, *next;
+    char *p, *next, *unlocked = NULL, *checked = NULL;
 
     for (p = start; p < end; p = next)
     {
@@ -24661,11 +26375,26 @@ static size_t ios_decommit_zero_committed( char *start, char *end )
         if (next > end) next = end;
         if (get_page_vprot( p ) & VPROT_COMMITTED)
         {
+            char *hp = ROUND_ADDR( p, host_page_mask );
+            if (hp != checked && ios_decommit_zero_prot_on())
+            {
+                if (unlocked) { mprotect_range( unlocked, host_page_size, 0, 0 ); unlocked = NULL; }
+                checked = hp;
+                if (!ios_range_writable( hp, host_page_size ) &&
+                    !mprotect( hp, host_page_size, PROT_READ | PROT_WRITE ))
+                {
+                    unlocked = hp;
+                    if (unlocks++ < 16)
+                        dprintf( 2, "[decommit-zero-prot] #%lu host page %p was not writable (vprot 0x%x): unlocked for the zeroing, then restored\n",
+                                 unlocks, hp, get_host_page_vprot( hp ) );
+                }
+            }
             memset( p, 0, next - p );
             zeroed += next - p;
         }
         else skipped++;
     }
+    if (unlocked) mprotect_range( unlocked, host_page_size, 0, 0 );
     if (zeroed != (size_t)(end - start) && (logs++ < 32 || !(logs % 1024)))
         dprintf( 2, "[decommit-skip] %p-%p zeroed=0x%lx: uncommitted guest pages left alone (%lu so far)\n",
                  start, end, (unsigned long)zeroed, skipped );
@@ -25648,6 +27377,7 @@ static void *get_host_addr_space_limit(void)
          * real top between the two powers of two anyway, so a device log shows that
          * the whole map is reachable. Log only; one fixed 16 KB allocation per step,
          * given back at once, before anything else maps. */
+        UINT_PTR probed = 0;   /* small-map-end: the ml1310 probe's answer */
         {
             UINT_PTR lo = addr, hi = addr << 1;
 
@@ -25664,6 +27394,24 @@ static void *get_host_addr_space_limit(void)
             dprintf( 2, "[va-limit] ml1310 probed top=%p (64 KB steps) walk=%p: %s\n", (void *)lo, walked,
                      (void *)lo <= walked ? "the walk covers the whole map"
                                           : "the walk UNDER-reads the map (kernel max decides below)" );
+            probed = lo;
+        }
+
+        /* small-map-end: the walk can only over-read. When the probed top is well below it
+         * (iPad8,11 on iPadOS 26: walk 0x800000000, map end 0x458000000), use the probe:
+         * otherwise user_space_limit lies past the map and every top-down placement lands in a
+         * range iOS refuses ("iOS REFUSED A FREE ADDRESS" at 0x7ffe00000). On a 512 GB map the
+         * whole probed range is mappable, the probe ends within 64 KB of the walk and nothing
+         * changes. Off with env.MADEIRA_SMALL_MAP_FIX = 0. */
+        {
+            const char *e = getenv( "MADEIRA_SMALL_MAP_FIX" );
+            probed &= ~(UINT_PTR)0xffff;
+            if (!(e && e[0] == '0') && probed >= 0x100000000ULL && (UINT_PTR)walked > probed &&
+                (UINT_PTR)walked - probed > (256ULL << 20))
+            {
+                dprintf( 2, "[va-limit] using the probed top %p: the walk %p over-reads the map\n", (void *)probed, walked );
+                return (void *)probed;
+            }
         }
 
         if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) == KERN_SUCCESS)
@@ -25683,6 +27431,29 @@ static void *get_host_addr_space_limit(void)
 #endif /* _WIN64 */
 
 #ifdef __aarch64__
+
+/***********************************************************************
+ *           is_emulated_code
+ *
+ * Wine 11.22 moved this here from unix_private.h, where it was is_ec_code() with the
+ * opposite sense.  Madeira: pseudo-processes share one address space and the process
+ * globals (`peb`, arm64ec_view, main_image_info) describe whichever process set them
+ * last, so the answer comes from THIS thread's PEB (from the unix thread data, good
+ * even when x18 is clobbered in a signal context) and this thread's own image kind.
+ */
+BOOL is_emulated_code( ULONG_PTR ptr )
+{
+    extern int ios_is_arm64ec_cur(void);
+    struct thread_data *data = get_thread_data();
+    PEB *cur_peb = (data && data->teb) ? (PEB *)data->teb->Peb : peb;
+    const UINT64 *map = cur_peb ? (const UINT64 *)cur_peb->EcCodeBitMap : NULL;
+    ULONG_PTR page = ptr / page_size;
+
+    if (!ios_is_arm64ec_cur() || ptr >= (ULONG_PTR)user_space_limit) return FALSE;
+    if (!map) return TRUE;   /* no bitmap: nothing is known to be ARM64EC code (as is_ec_code did) */
+    return !((map[page / 64] >> (page & 63)) & 1);
+}
+
 
 /***********************************************************************
  *           alloc_arm64ec_map
@@ -26024,6 +27795,22 @@ static BOOL ios_subfloor_window_held( ULONG_PTR low, ULONG_PTR real )
 #define IOS_OVERSIZE_MIN   0x1000000000ULL   /* 64 GB */
 #define IOS_OVERSIZE_ALIGN 0x4000000UL       /* 64 MB */
 
+/* ml1300: the size from which a reserve counts as oversize. Default 64 GB. A game's
+ * own config can lower it with oversize-reserve-min-gb (never below 33, so Chromium's
+ * 16 and 32 GB pools stay on their own paths). Subliminal (UE5) asks for 48 GB, fails
+ * with c0000017, and its main thread then waits forever on "waiting for window". */
+static SIZE_T ios_oversize_min( void )
+{
+    static SIZE_T min;
+    if (!min)
+    {
+        long long gb = madeira_cfg_int( "oversize-reserve-min-gb", 64 );
+        if (gb < 33 || gb > 64) gb = 64;
+        min = (SIZE_T)gb << 30;
+    }
+    return min;
+}
+
 static long long ios_oversize_real_mb( void )
 {
     static long long mb = -1;
@@ -26251,6 +28038,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 
 #ifdef WINE_IOS
     ios_wow_note_image( view->base, nt_name );   /* ml1282 */
+    ios_x64_note_image( view->base, nt_name );
 #endif
 
     TRACE_(module)( "mapping PE file %s at %p-%p\n", debugstr_us(nt_name), ptr, ptr + total_size );
@@ -26648,12 +28436,14 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     ios_sc_render_handler_patch( ptr, total_size, nt, sec, nt_name );
     /* [fex-vmeta], likewise (opt-in, ignore-volatile-metadata). */
     ios_ignore_volatile_metadata( ptr, total_size, nt, (ULONG_PTR)image_info->base, nt_name );
+    /* BeamNG.drive: [cef-cmdline], same moment (see ios_cef_cmdline_patch). */
+    ios_cef_cmdline_patch( ptr, total_size, nt, sec, nt_name );
 
     /* madeira-bcd [x64-image]: decided before any protection is set, so both
      * the section pass and the eager copy loop below see the mark (see
      * ios_x64_image_is_host_data). update_arm64ec_ranges has run: a hybrid
      * image carries VPROT_ARM64EC by now. */
-    if (ios_x64_image_nocopy_enabled() && !ios_map_resource_view && !ios_wow_base() &&
+    if ((ios_x64_image_nocopy_enabled() || ios_x64_image_auto_nocopy( total_size )) && !ios_map_resource_view && !ios_wow_base() &&
         nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
         nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
         !(view->protect & VPROT_ARM64EC) && !image_info->is_hybrid && !image_info->wine_builtin)
@@ -26662,8 +28452,10 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         view->protect |= VPROT_X64DATA;
         if (x64_images++ < 64)
             dprintf( 2, "[x64-image] %s %p+0x%lx mapped without a pool copy (pure x64: the emulator runs "
-                        "it at the PE VA; MADEIRA_X64_IMAGE_NOCOPY)\n",
-                     debugstr_us(nt_name), ptr, (unsigned long)total_size );
+                        "it at the PE VA; %s)\n",
+                     debugstr_us(nt_name), ptr, (unsigned long)total_size,
+                     ios_x64_image_nocopy_enabled() ? "MADEIRA_X64_IMAGE_NOCOPY" :
+                     "x64-image-auto: the image is larger than the free pool");
     }
     ios_fft_arena_patch( ptr, nt, sec, total_size, nt_name );   /* ml1299 */
 #endif
@@ -26772,52 +28564,60 @@ done:
 
 
 /***********************************************************************
+ *             free_pe_mapping_info
+ */
+static void free_pe_mapping_info( struct pe_mapping_info *info )
+{
+    if (info->shared_file) NtClose( info->shared_file );
+    free( info );
+}
+
+
+/***********************************************************************
  *             get_mapping_info
  */
 static unsigned int get_mapping_info( HANDLE handle, ACCESS_MASK access, unsigned int *sec_flags,
-                                      mem_size_t *full_size, HANDLE *shared_file,
-                                      struct pe_image_info **info, UNICODE_STRING *nt_name,
-                                      ANSI_STRING *exp_name )
+                                      mem_size_t *full_size, struct pe_mapping_info **info_ret )
 {
-    struct pe_image_info *image_info;
-    SIZE_T namelen, total, size = 1024;
+    struct pe_mapping_info *info;
+    SIZE_T total, size = 2048;
     unsigned int status;
 
+    *info_ret = NULL;
     for (;;)
     {
-        if (!(image_info = malloc( size ))) return STATUS_NO_MEMORY;
+        if (!(info = malloc( offsetof(struct pe_mapping_info, image) + size ))) return STATUS_NO_MEMORY;
 
         SERVER_START_REQ( get_mapping_info )
         {
             req->handle = wine_server_obj_handle( handle );
             req->access = access;
-            wine_server_set_reply( req, image_info, size );
+            wine_server_set_reply( req, &info->image, size );
             status = wine_server_call( req );
             *sec_flags   = reply->flags;
             *full_size   = reply->size;
-            namelen      = reply->name_len;
             total        = reply->total;
-            *shared_file = wine_server_ptr_handle( reply->shared_file );
+            info->shared_file = wine_server_ptr_handle( reply->shared_file );
+            info->version_len = reply->ver_len;
+            info->nt_name.Length = info->nt_name.MaximumLength = reply->name_len;
         }
         SERVER_END_REQ;
         if (!status && total <= size) break;
-        free( image_info );
+        free_pe_mapping_info( info );
         if (status) return status;
-        if (*shared_file) NtClose( *shared_file );
         size = total;
     }
 
     if (total)
     {
-        assert( total >= sizeof(*image_info) );
-        total -= sizeof(*image_info);
-        nt_name->Buffer = (WCHAR *)(image_info + 1);
-        nt_name->Length = nt_name->MaximumLength = namelen;
-        exp_name->Buffer = (char *)nt_name->Buffer + namelen;
-        exp_name->Length = exp_name->MaximumLength = total - namelen;
-        *info = image_info;
+        info->version_res     = info->data;
+        info->nt_name.Buffer  = (WCHAR *)(info->data + info->version_len);
+        info->exp_name.Buffer = info->data + info->version_len + info->nt_name.Length;
+        info->exp_name.Length = total - sizeof(info->image) - info->version_len - info->nt_name.Length;
+        info->exp_name.MaximumLength = info->exp_name.Length;
+        *info_ret = info;
     }
-    else free( image_info );
+    else free_pe_mapping_info( info );
 
     return STATUS_SUCCESS;
 }
@@ -27029,14 +28829,18 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
  *
  * Map a PE image section into memory.
  */
-static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size_ptr, HANDLE shared_file,
+static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size_ptr,
                                    ULONG_PTR limit_low, ULONG_PTR limit_high, ULONG alloc_type,
-                                   USHORT machine, struct pe_image_info *image_info,
-                                   UNICODE_STRING *nt_name, BOOL is_builtin, off_t offset)
+                                   struct pe_mapping_info *pe_mapping, USHORT machine,
+                                   BOOL is_builtin, off_t offset)
 {
     int unix_fd = -1, needs_close;
     int shared_fd = -1, shared_needs_close = 0;
-    SIZE_T size = image_info->map_size;
+    SIZE_T size = pe_mapping->image.map_size;
+    /* Wine 11.22 passes one struct pe_mapping_info; these keep the names the body used */
+    HANDLE shared_file = pe_mapping->shared_file;
+    struct pe_image_info *image_info = &pe_mapping->image;
+    UNICODE_STRING *nt_name = &pe_mapping->nt_name;
     struct file_view *view;
     unsigned int status;
     sigset_t sigset;
@@ -27091,14 +28895,14 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
             size -= offset;
         }
 
-        image_info->base = wine_server_client_ptr( view->base );
+        pe_mapping->image.base = wine_server_client_ptr( view->base );
         SERVER_START_REQ( map_image_view )
         {
             req->mapping = wine_server_obj_handle( mapping );
-            req->base    = image_info->base;
+            req->base    = pe_mapping->image.base;
             req->size    = size;
-            req->entry   = image_info->entry_point;
-            req->machine = image_info->machine;
+            req->entry   = pe_mapping->image.entry_point;
+            req->machine = pe_mapping->image.machine;
             req->offset  = offset;
             status = wine_server_call( req );
         }
@@ -27182,14 +28986,11 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     mem_size_t full_size;
     ACCESS_MASK access;
     SIZE_T size;
-    struct pe_image_info *image_info = NULL;
-    UNICODE_STRING nt_name;
-    ANSI_STRING exp_name;
+    struct pe_mapping_info *pe_mapping;
     void *base;
     int unix_handle = -1, needs_close;
     unsigned int vprot, sec_flags;
     struct file_view *view;
-    HANDLE shared_file;
     LARGE_INTEGER offset;
     sigset_t sigset;
 
@@ -27221,8 +29022,7 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
         return STATUS_INVALID_PAGE_PROTECTION;
     }
 
-    res = get_mapping_info( handle, access, &sec_flags, &full_size, &shared_file,
-                            &image_info, &nt_name, &exp_name );
+    res = get_mapping_info( handle, access, &sec_flags, &full_size, &pe_mapping );
     if (res)
     {
         dprintf(2, "[map-sec] get_mapping_info handle=%p access=0x%x -> 0x%x\n",
@@ -27232,19 +29032,21 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
 
     offset.QuadPart = offset_ptr ? offset_ptr->QuadPart : 0;
 
-    if (image_info)
+    if (pe_mapping)
     {
         SECTION_IMAGE_INFORMATION info;
         ULONG64 prev = 0;
+        struct thread_data *data = get_thread_data();
+        TEB64 *teb64 = get_teb64( data->teb );
 
-        if (NtCurrentTeb64())
+        if (teb64)
         {
-            prev = NtCurrentTeb64()->Tib.ArbitraryUserPointer;
-            NtCurrentTeb64()->Tib.ArbitraryUserPointer = PtrToUlong(NtCurrentTeb()->Tib.ArbitraryUserPointer);
+            prev = teb64->Tib.ArbitraryUserPointer;
+            teb64->Tib.ArbitraryUserPointer = PtrToUlong(data->teb->Tib.ArbitraryUserPointer);
         }
         /* check if we can replace that mapping with the builtin */
-        res = load_builtin( image_info, &nt_name, &exp_name, machine, &info,
-                            addr_ptr, size_ptr, limit_low, limit_high, offset.QuadPart );
+        res = load_builtin( pe_mapping, machine, &info, addr_ptr, size_ptr,
+                            limit_low, limit_high, offset.QuadPart );
         if (res == STATUS_IMAGE_ALREADY_LOADED)
         {
 #ifdef WINE_IOS
@@ -27256,16 +29058,15 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
             ios_exe_win_resource_request = !(access & SECTION_MAP_EXECUTE) &&
                                            !NtCurrentTeb()->Tib.ArbitraryUserPointer;
 #endif
-            res = virtual_map_image( handle, addr_ptr, size_ptr, shared_file, limit_low, limit_high,
-                                     alloc_type, machine, image_info, &nt_name, FALSE, offset.QuadPart );
+            res = virtual_map_image( handle, addr_ptr, size_ptr, limit_low, limit_high,
+                                     alloc_type, pe_mapping, machine, FALSE, offset.QuadPart );
 #ifdef WINE_IOS
             ios_map_resource_view = 0;
             ios_exe_win_resource_request = 0;
 #endif
         }
-        if (shared_file) NtClose( shared_file );
-        free( image_info );
-        if (NtCurrentTeb64()) NtCurrentTeb64()->Tib.ArbitraryUserPointer = prev;
+        free_pe_mapping_info( pe_mapping );
+        if (teb64) teb64->Tib.ArbitraryUserPointer = prev;
         return res;
     }
 
@@ -27480,6 +29281,7 @@ void virtual_init(void)
     int i;
     pthread_mutexattr_t attr;
 
+    pthread_key_create( &thread_data_key, NULL );   /* Wine 11.22: per-thread unix data */
     pthread_mutexattr_init( &attr );
     pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
     pthread_mutex_init( &virtual_mutex, &attr );
@@ -27554,9 +29356,29 @@ void virtual_init(void)
     ios_sc2_boot_holds();
     if (ios_sc_layout_mode == 2) ios_cage_base = IOS_SC2_CAGE_BASE;
 
+    /* ios26-small-map: a map that ends at or below 0x7000000000 has no high guest band */
+    {
+        const char *e = getenv( "MADEIRA_SMALL_MAP_FIX" );
+        if (!(e && e[0] == '0') && host_addr_space_limit && (uintptr_t)host_addr_space_limit <= 0x7000000000ULL)
+        {
+            ios_guest_band_lo    = IOS_SMALL_MAP_ADDR_LO;
+            ios_guest_band_hi    = (uintptr_t)host_addr_space_limit;
+            ios_small_map_floor  = (uintptr_t)host_addr_space_limit >= 0x800000000ULL ? IOS_SMALL_MAP_FLOOR : IOS_TINY_MAP_FLOOR;
+            ios_guest_band_pc_lo = ios_small_map_floor;
+            ios_small_map = 1;
+            dprintf( 2, "[small-map] the address map ends at %p (no extended VA): guest faults at [%p,%p), "
+                        "guest pcs from %p, usable floor %p; off: env.MADEIRA_SMALL_MAP_FIX = 0\n",
+                     host_addr_space_limit, (void *)ios_guest_band_lo, (void *)ios_guest_band_hi,
+                     (void *)ios_guest_band_pc_lo, (void *)ios_usable_va_floor );
+        }
+    }
+
     /* ml433 (#72): hold back the only 8GB-aligned stretch in the guest band
      * before top-down placement can put furniture in it — see IOS_CAGE_BASE. */
-    if (anon_mmap_fixed( (void *)(uintptr_t)IOS_CAGE_BASE, IOS_CAGE_REAL_SIZE, PROT_NONE, 0 ) != MAP_FAILED)
+    if (ios_small_map)
+        dprintf( 2, "[small-map] cage holdback skipped: 0x%llx is past the end of the map (%p)\n",
+                 (unsigned long long)IOS_CAGE_BASE, host_addr_space_limit );
+    else if (anon_mmap_fixed( (void *)(uintptr_t)IOS_CAGE_BASE, IOS_CAGE_REAL_SIZE, PROT_NONE, 0 ) != MAP_FAILED)
     {
         ios_cage_holdback_live = 1;
         dprintf( 2, "[cage] holdback reserved 0x%llx+0x%llx rev=ml433\n",
@@ -27690,14 +29512,14 @@ unsigned long long ios_avail_phys( unsigned long long host_free )
 }
 
 
+/* get_system_affinity_mask() is an inline in unix_private.h since Wine 11.22 */
+
 /***********************************************************************
- *           get_system_affinity_mask
+ *           get_host_page_size
  */
-ULONG_PTR get_system_affinity_mask(void)
+UINT_PTR get_host_page_size(void)
 {
-    ULONG num_cpus = peb->NumberOfProcessors;
-    if (num_cpus >= sizeof(ULONG_PTR) * 8) return ~(ULONG_PTR)0;
-    return ((ULONG_PTR)1 << num_cpus) - 1;
+    return host_page_size;
 }
 
 /* [user-va]: env.MADEIRA_USER_VA_GB = n, off by default: tell a 64-bit process that its user address space ends at n GiB.
@@ -27956,7 +29778,7 @@ void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
     info->AllocationGranularity   = granularity_mask + 1;
     info->LowestUserAddress       = (void *)0x10000;
     info->ActiveProcessorsAffinityMask = get_system_affinity_mask();
-    info->NumberOfProcessors      = peb->NumberOfProcessors;
+    info->NumberOfProcessors      = peb->NumberOfProcessors;   /* Madeira: the PEB count (ml1122), not Wine 11.22's cpu_count */
     if (wow64) info->HighestUserAddress = (char *)get_wow_user_space_limit() - 1;
     else info->HighestUserAddress = (char *)user_space_limit - 1;
 
@@ -27967,7 +29789,7 @@ void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
     if (!wow64 && ios_sc_layout_mode == 2 && ios_sc_cef_enabled())
     {
         ULONG_PTR real = (ULONG_PTR)info->HighestUserAddress;
-        ULONG_PTR told = ios_sc2_reported_highest( real, wow64, ios_sc_layout_mode, ios_sc_current_is_helper() );
+        ULONG_PTR told = ios_sc2_reported_highest( real, wow64, ios_sc_layout_mode, ios_sc_current_is_cef_host() );
 
         if (told != real)
         {
@@ -27978,9 +29800,10 @@ void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
             if (said != peb)
             {
                 said = peb;
-                dprintf( 2, "[sc-cef] layout 2: SocialClubHelper.exe (peb=%p) told HighestUserAddress=%p (V8 CHECKs "
+                char hn[64];
+                dprintf( 2, "[sc-cef] layout 2: %s (peb=%p) told HighestUserAddress=%p (V8 CHECKs "
                             "its 1 TB sandbox against lpMaximumApplicationAddress); placement keeps %p\n",
-                         peb, (void *)told, (void *)real );
+                         ios_sc_host_name( hn, sizeof(hn) ), peb, (void *)told, (void *)real );
             }
         }
     }
@@ -28040,47 +29863,48 @@ NTSTATUS virtual_map_builtin_module( HANDLE mapping, void **module, SIZE_T *size
 {
     mem_size_t full_size;
     unsigned int sec_flags;
-    HANDLE shared_file;
-    struct pe_image_info *image_info = NULL;
+    struct pe_mapping_info *pe_mapping;
     NTSTATUS status;
-    UNICODE_STRING nt_name;
-    ANSI_STRING exp_name;
 
-    if ((status = get_mapping_info( mapping, SECTION_MAP_READ, &sec_flags, &full_size, &shared_file,
-                                    &image_info, &nt_name, &exp_name )))
+    if ((status = get_mapping_info( mapping, SECTION_MAP_READ, &sec_flags, &full_size, &pe_mapping )))
         return status;
 
-    if (!image_info) return STATUS_INVALID_PARAMETER;
+    if (!pe_mapping) return STATUS_INVALID_PARAMETER;
 
     *module = NULL;
     *size = 0;
 
-    if (!image_info->wine_builtin) /* ignore non-builtins */
+    if (!pe_mapping->image.wine_builtin) /* ignore non-builtins */
     {
-        if (!image_info->wine_fakedll)
-            WARN_(module)( "%s found in WINEDLLPATH but not a builtin, ignoring\n", debugstr_us(&nt_name) );
+        if (!pe_mapping->image.wine_fakedll)
+            WARN_(module)( "%s found in WINEDLLPATH but not a builtin, ignoring\n",
+                           debugstr_us(&pe_mapping->nt_name) );
         status = STATUS_DLL_NOT_FOUND;
     }
-    else if (prefer_native && (image_info->dll_charact & IMAGE_DLLCHARACTERISTICS_PREFER_NATIVE))
+    else if (prefer_native && (pe_mapping->image.dll_charact & IMAGE_DLLCHARACTERISTICS_PREFER_NATIVE))
     {
-        TRACE_(module)( "%s has prefer-native flag, ignoring builtin\n", debugstr_us(&nt_name) );
+        TRACE_(module)( "%s has prefer-native flag, ignoring builtin\n",
+                        debugstr_us(&pe_mapping->nt_name) );
         status = STATUS_IMAGE_ALREADY_LOADED;
     }
     else
     {
-        status = virtual_map_image( mapping, module, size, shared_file, limit_low, limit_high, 0,
-                                    machine, image_info, &nt_name, TRUE, offset );
-        virtual_fill_image_information( image_info, info );
+        status = virtual_map_image( mapping, module, size, limit_low, limit_high, 0,
+                                    pe_mapping, machine, TRUE, offset );
+        virtual_fill_image_information( &pe_mapping->image, info );
     }
 
-    if (shared_file) NtClose( shared_file );
-    free( image_info );
+    free_pe_mapping_info( pe_mapping );
     return status;
 }
 
 
 /***********************************************************************
  *           virtual_map_module
+ *
+ * Madeira: kept from Wine 11.4.  11.22 replaced it with virtual_map_main_module(), which
+ * writes the process globals main_module / main_image_info; pseudo-processes boot through
+ * this library at the same time, so the caller's own variables are still used.
  */
 NTSTATUS virtual_map_module( HANDLE mapping, void **module, SIZE_T *size, SECTION_IMAGE_INFORMATION *info,
                              ULONG_PTR limit_low, ULONG_PTR limit_high, USHORT machine )
@@ -28088,33 +29912,41 @@ NTSTATUS virtual_map_module( HANDLE mapping, void **module, SIZE_T *size, SECTIO
     unsigned int status;
     mem_size_t full_size;
     unsigned int sec_flags;
-    HANDLE shared_file;
-    struct pe_image_info *image_info = NULL;
-    UNICODE_STRING nt_name;
-    ANSI_STRING exp_name;
+    struct pe_mapping_info *pe_mapping;
 
-    if ((status = get_mapping_info( mapping, SECTION_MAP_READ, &sec_flags, &full_size, &shared_file,
-                                    &image_info, &nt_name, &exp_name )))
+    if ((status = get_mapping_info( mapping, SECTION_MAP_READ, &sec_flags, &full_size, &pe_mapping )))
         return status;
 
-    if (!image_info) return STATUS_INVALID_PARAMETER;
+    if (!pe_mapping) return STATUS_INVALID_PARAMETER;
 
     *module = NULL;
     *size = 0;
 
     /* check if we can replace that mapping with the builtin */
-    status = load_builtin( image_info, &nt_name, &exp_name, machine, info,
-                           module, size, limit_low, limit_high, 0 );
+    status = load_builtin( pe_mapping, machine, info, module, size, limit_low, limit_high, 0 );
     if (status == STATUS_IMAGE_ALREADY_LOADED)
     {
-        ios_exe_win_wait_for_handoff( image_info );
-        status = virtual_map_image( mapping, module, size, shared_file, limit_low, limit_high, 0,
-                                    machine, image_info, &nt_name, FALSE, 0 );
-        virtual_fill_image_information( image_info, info );
+        ios_exe_win_wait_for_handoff( &pe_mapping->image );
+        status = virtual_map_image( mapping, module, size, limit_low, limit_high, 0,
+                                    pe_mapping, machine, FALSE, 0 );
+        virtual_fill_image_information( &pe_mapping->image, info );
     }
-    if (shared_file) NtClose( shared_file );
-    free( image_info );
+    free_pe_mapping_info( pe_mapping );
     return status;
+}
+
+
+/***********************************************************************
+ *           virtual_map_main_module
+ *
+ * The Wine 11.22 entry point, for code that has not been moved off the globals.
+ */
+NTSTATUS virtual_map_main_module( HANDLE mapping, USHORT machine )
+{
+    SIZE_T size = 0;
+
+    main_module = NULL;
+    return virtual_map_module( mapping, &main_module, &size, &main_image_info, 0, 0, machine );
 }
 
 
@@ -28247,10 +30079,47 @@ NTSTATUS virtual_relocate_module( void *module )
 
 
 /* set some initial values in a new TEB */
-static TEB *init_teb( void *ptr, BOOL is_wow )
+/* Madeira: the process id for a new TEB.  Wine 11.22 takes it from the process-global `pid`,
+ * but pseudo-processes share this library, so it is the creating thread's own process id;
+ * the global serves only the very first thread, which has no TEB to ask. */
+static DWORD ios_teb_owner_pid(void)
 {
-    struct ntdll_thread_data *thread_data;
+    struct thread_data *cur = get_thread_data();
+
+    if (cur && cur->teb && cur->teb->ClientId.UniqueProcess)
+        return HandleToULong( cur->teb->ClientId.UniqueProcess );
+    return pid;
+}
+
+/* Madeira (ml1122): Wine 11.4's set_thread_id(), which 11.22 removed because its TEBs are
+ * created with their ids already known.  Madeira's FIRST TEB of every pseudo-process is
+ * created before the server has answered and before the image's machine is known, so the
+ * ids are still written afterwards: by server_ios.c after init_first_thread, and by
+ * env_ios.c init_peb() when the 32-bit half is switched on. */
+void ios_set_thread_id( TEB *teb, DWORD pid, DWORD tid )
+{
+    WOW_TEB *wow_teb = get_wow_teb( teb );
+
+    teb->ClientId.UniqueProcess = ULongToHandle( pid );
+    teb->ClientId.UniqueThread  = ULongToHandle( tid );
+    teb->RealClientId = teb->ClientId;
+    if (wow_teb)
+    {
+        wow_teb->ClientId.UniqueProcess = pid;
+        wow_teb->ClientId.UniqueThread  = tid;
+        wow_teb->RealClientId = wow_teb->ClientId;
+        if (!wow_teb->Tib.FiberData) wow_teb->Tib.FiberData = 0x1e00;   /* as 11.22's init_teb */
+    }
+}
+
+/* TEB64 + TEB32 + the old debug info area: what a reused TEB block is cleared to.  Wine 11.22
+ * dropped teb_size (its TEB blocks have another layout); the iOS blocks keep the 11.4 one. */
+static const SIZE_T ios_teb_size = 0x3800;
+
+static TEB *init_teb( struct thread_data *data, void *ptr, BOOL is_wow )
+{
     TEB *teb;
+    DWORD owner_pid = ios_teb_owner_pid();
     TEB64 *teb64 = ptr;
     TEB32 *teb32 = (TEB32 *)((char *)ptr + teb_offset);
 #ifdef WINE_IOS
@@ -28279,7 +30148,16 @@ static TEB *init_teb( void *ptr, BOOL is_wow )
     teb32->StaticUnicodeString.MaximumLength = sizeof( teb32->StaticUnicodeBuffer );
     teb32->GdiBatchCount = ios_wow_guest_addr( teb64 );
     teb32->WowTebOffset  = -teb_offset;
-    if (is_wow) teb64->WowTebOffset = teb_offset;
+    if (is_wow)
+    {
+        /* Wine 11.22 fills these here (it used to be done by the thread creation code) */
+        teb32->Tib.FiberData = 0x1e00;
+        teb32->ClientId.UniqueProcess = owner_pid;
+        teb32->ClientId.UniqueThread  = data->tid;
+        teb32->RealClientId  = teb32->ClientId;
+        teb->Tib.ExceptionList = (void *)teb32;
+        teb64->WowTebOffset = teb_offset;
+    }
 #else
     teb = (TEB *)teb32;
     teb32->Tib.ExceptionList = ~0u;
@@ -28314,28 +30192,65 @@ static TEB *init_teb( void *ptr, BOOL is_wow )
 #endif
     teb->Tib.Self = &teb->Tib;
     teb->Tib.StackBase = (void *)~0ul;
+    teb->Tib.FiberData = (void *)0x1e00;
+    teb->ClientId = make_client_id( owner_pid, data->tid );
     teb->ActivationContextStackPointer = &teb->ActivationContextStack;
     InitializeListHead( &teb->ActivationContextStack.FrameListCache );
     teb->StaticUnicodeString.Buffer = teb->StaticUnicodeBuffer;
     teb->StaticUnicodeString.MaximumLength = sizeof(teb->StaticUnicodeBuffer);
-    thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
-    thread_data->request_fd = -1;
-    thread_data->reply_fd   = -1;
-    thread_data->wait_fd[0] = -1;
-    thread_data->wait_fd[1] = -1;
-    thread_data->alert_fd   = -1;
-    list_add_head( &teb_list, &thread_data->entry );
+    teb->RealClientId = teb->ClientId;
+    data->teb = teb;
+    /* Madeira (ml1122): back pointer TEB -> thread data, in a spare cpu_data slot. Wine
+     * 11.22 has no such link; the Mach exception thread needs another thread's jmp_buf
+     * (signal_arm64_ios.c, IOS_TEB_THREAD_DATA_SLOT) without walking teb_list. */
+    ((struct teb_data *)&teb->GdiTebBatch)->cpu_data[15] = data;
+    list_add_head( &teb_list, &data->entry );
     return teb;
+}
+
+/* Wine 11.22: the per-thread unix data (server fds, signal stack, kernel stack) has its own
+ * block now instead of living inside the TEB. */
+static struct thread_data *init_thread_data( void *ptr )
+{
+    struct thread_data *data = ptr;
+    data->request_fd = -1;
+    data->reply_fd   = -1;
+    data->wait_fd[0] = -1;
+    data->wait_fd[1] = -1;
+    data->alert_fd   = -1;
+    return data;
+}
+
+static struct thread_data *ios_map_thread_data(void)
+{
+    struct file_view *view;
+    SIZE_T size = signal_stack_mask + 1 + kernel_stack_size;
+
+    /* virtual_mutex held.  Above 4 GB, as the kernel stack was before 11.22
+     * (virtual_alloc_thread_stack( &stack, limit_4g, ... ) in init_thread_stack). */
+    if (map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED, limit_4g, 0, 0 ))
+        return NULL;
+    VIRTUAL_DEBUG_DUMP_VIEW( view );
+    return init_thread_data( view->base );
 }
 
 
 /***********************************************************************
- *           virtual_alloc_first_teb
+ *           virtual_alloc_first_thread_data
+ *
+ * Madeira / Wine 11.22: upstream now starts the first thread with thread data only and
+ * allocates the first TEB and the PEB after the main image is loaded
+ * (virtual_alloc_first_teb, called from init_startup_info).  The iOS boot needs the
+ * PEB from the start: the 32-bit guest window is bound to it, the TEB is published
+ * to the x18 trampolines before any PE code loads, and every per-process table is
+ * keyed on it.  So the first TEB and PEB are still created here, in the 11.4 order,
+ * and virtual_alloc_first_teb() has nothing left to do.
  */
-TEB *virtual_alloc_first_teb(void)
+struct thread_data *virtual_alloc_first_thread_data(void)
 {
     void *ptr;
-    TEB *teb;
+    struct thread_data *data;
+    sigset_t sigset;
     unsigned int status;
     SIZE_T data_size = page_size;
     SIZE_T block_size = signal_stack_mask + 1;
@@ -28432,17 +30347,51 @@ TEB *virtual_alloc_first_teb(void)
 #ifdef WINE_IOS
     ios_session_peb = peb;   /* see ios_wow_window_teardown */
 #endif
-    teb = init_teb( ptr, FALSE );
-    pthread_key_create( &teb_key, NULL );
-    pthread_setspecific( teb_key, teb );
-    return teb;
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    data = ios_map_thread_data();
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (!data)
+    {
+        ERR( "wine: failed to map the first thread data\n" );
+        ios_unix_fatal_exit( 1, "first thread data" );
+    }
+    init_teb( data, ptr, FALSE );
+    pthread_setspecific( thread_data_key, data );
+    return data;
+}
+
+
+/***********************************************************************
+ *           virtual_alloc_first_teb
+ *
+ * See virtual_alloc_first_thread_data: on iOS the first TEB already exists.
+ * The large-address decision upstream makes here is still made by
+ * virtual_set_large_address_space(), called from init_peb as before.
+ */
+void virtual_alloc_first_teb(void)
+{
+}
+
+
+/***********************************************************************
+ *           virtual_alloc_thread_data
+ */
+struct thread_data *virtual_alloc_thread_data(void)
+{
+    sigset_t sigset;
+    struct thread_data *data;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    data = ios_map_thread_data();
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return data;
 }
 
 
 /***********************************************************************
  *           virtual_alloc_teb
  */
-NTSTATUS virtual_alloc_teb( TEB **ret_teb )
+NTSTATUS virtual_alloc_teb( struct thread_data *data )
 {
     sigset_t sigset;
     TEB *teb;
@@ -28480,7 +30429,7 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
     {
         ptr = *p_next_free_teb;
         *p_next_free_teb = *(void **)ptr;
-        memset( ptr, 0, teb_size );
+        memset( ptr, 0, ios_teb_size );
     }
     else
     {
@@ -28583,7 +30532,7 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
         return STATUS_NO_MEMORY;
     }
 #endif
-    *ret_teb = teb = init_teb( ptr, is_wow );
+    teb = init_teb( data, ptr, is_wow );
 
     if ((status = signal_alloc_thread( teb )))
     {
@@ -28663,13 +30612,19 @@ static void ios_stack_release( void *base )
     }
 }
 
-void virtual_free_teb( TEB *teb )
+/* Wine 11.22: was virtual_free_teb( TEB * ).  Frees the thread's stacks and TEB and then the
+ * thread data block itself (which holds the kernel stack that used to be freed here).
+ * Upstream returns at once when process_exiting is set; that flag is one per Mach task
+ * here, so it is not consulted. */
+void virtual_free_thread_data( struct thread_data *data )
 {
-    struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
+    TEB *teb;
     void *ptr;
     SIZE_T size;
     sigset_t sigset;
-    WOW_TEB *wow_teb = get_wow_teb( teb );
+    WOW_TEB *wow_teb;
+
+    if (!(teb = data->teb)) goto done;   /* a system thread: no TEB, no stacks of its own */
 
     ios_vh_why = "TEB free (thread stacks)";   /* madeira-bcd: view history */
     if (teb->DeallocationStack) ios_stack_release( teb->DeallocationStack );   /* madeira-bcd: quarantined */
@@ -28680,12 +30635,7 @@ void virtual_free_teb( TEB *teb )
         NtFreeVirtualMemory( GetCurrentProcess(), (void **)&teb->ChpeV2CpuAreaInfo, &size, MEM_RELEASE );
     }
 #endif
-    if (thread_data->kernel_stack)
-    {
-        size = 0;
-        NtFreeVirtualMemory( GetCurrentProcess(), &thread_data->kernel_stack, &size, MEM_RELEASE );
-    }
-    if (wow_teb && (ptr = ULongToPtr( wow_teb->DeallocationStack )))
+    if ((wow_teb = get_wow_teb( teb )) && (ptr = ULongToPtr( wow_teb->DeallocationStack )))
     {
         size = 0;
 #ifdef WINE_IOS
@@ -28752,7 +30702,7 @@ void virtual_free_teb( TEB *teb )
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     signal_free_thread( teb );
-    list_remove( &thread_data->entry );
+    list_remove( &data->entry );
     ptr = teb;
     if (!is_win64) ptr = (char *)ptr - teb_offset;
 #ifdef WINE_IOS
@@ -28801,6 +30751,13 @@ void virtual_free_teb( TEB *teb )
     next_free_teb = ptr;
 #endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+ done:
+    ios_vh_why = "thread data free (kernel stack)";
+    size = 0;
+    ptr = data;
+    NtFreeVirtualMemory( GetCurrentProcess(), &ptr, &size, MEM_RELEASE );
+    ios_vh_why = NULL;
 }
 
 
@@ -28822,6 +30779,7 @@ void virtual_free_teb( TEB *teb )
  */
 struct ios_ea_retired_thread
 {
+    struct thread_data *data;
     TEB *teb;
     CLIENT_ID client;
     pthread_t pthread_id;
@@ -28832,12 +30790,12 @@ static struct ios_ea_retired_thread ios_ea_pending_thread;
 /* virtual_mutex held; do not read the possibly unmapped retired->teb. */
 static int ios_ea_retired_thread_matches( const struct ios_ea_retired_thread *retired )
 {
-    struct ntdll_thread_data *data;
+    struct thread_data *data;
 
-    LIST_FOR_EACH_ENTRY( data, &teb_list, struct ntdll_thread_data, entry )
+    LIST_FOR_EACH_ENTRY( data, &teb_list, struct thread_data, entry )
     {
-        TEB *teb = CONTAINING_RECORD( data, TEB, GdiTebBatch );
-        if (teb != retired->teb) continue;
+        TEB *teb = data->teb;
+        if (data != retired->data || teb != retired->teb) continue;
         return teb->ClientId.UniqueProcess == retired->client.UniqueProcess &&
                teb->ClientId.UniqueThread == retired->client.UniqueThread &&
                data->pthread_id && pthread_equal( data->pthread_id, retired->pthread_id );
@@ -28845,9 +30803,9 @@ static int ios_ea_retired_thread_matches( const struct ios_ea_retired_thread *re
     return 0;
 }
 
-void ios_ea_reap_exited_thread( TEB *current )
+void ios_ea_reap_exited_thread( struct thread_data *current )
 {
-    struct ntdll_thread_data *data, *owned = NULL;
+    struct thread_data *data, *owned = NULL;
     struct ios_ea_retired_thread retired;
     sigset_t sigset;
     int eligible, joined;
@@ -28856,10 +30814,10 @@ void ios_ea_reap_exited_thread( TEB *current )
     /* A laggard of a replaced window can reach here on its native stack.
      * Validate even the caller through list membership before dereferencing
      * its TEB, and never enqueue another thread at a recycled address. */
-    LIST_FOR_EACH_ENTRY( data, &teb_list, struct ntdll_thread_data, entry )
+    LIST_FOR_EACH_ENTRY( data, &teb_list, struct thread_data, entry )
     {
-        if (CONTAINING_RECORD( data, TEB, GdiTebBatch ) != current) continue;
-        if (data->pthread_id && pthread_equal( data->pthread_id, pthread_self() )) owned = data;
+        if (data != current) continue;
+        if (data->teb && data->pthread_id && pthread_equal( data->pthread_id, pthread_self() )) owned = data;
         break;
     }
     if (!owned)
@@ -28868,10 +30826,11 @@ void ios_ea_reap_exited_thread( TEB *current )
         return;
     }
     retired = ios_ea_pending_thread;
-    ios_ea_pending_thread.teb = current;
-    ios_ea_pending_thread.client = current->ClientId;
+    ios_ea_pending_thread.data = owned;
+    ios_ea_pending_thread.teb = owned->teb;
+    ios_ea_pending_thread.client = owned->teb->ClientId;
     ios_ea_pending_thread.pthread_id = owned->pthread_id;
-    eligible = retired.teb && retired.teb != current && retired.pthread_id &&
+    eligible = retired.teb && retired.data != current && retired.pthread_id &&
                !pthread_equal( retired.pthread_id, pthread_self() ) && ios_ea_retired_thread_matches( &retired );
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
 
@@ -28880,7 +30839,7 @@ void ios_ea_reap_exited_thread( TEB *current )
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     if (!joined && ios_ea_retired_thread_matches( &retired ))
-        virtual_free_teb( retired.teb );
+        virtual_free_thread_data( retired.data );
     else
     {
         static unsigned int logs;
@@ -28953,7 +30912,7 @@ NTSTATUS ldt_get_entry( WORD sel, CLIENT_ID client_id, LDT_ENTRY *entry )
     struct ldt_bits bits = { 0 };
     unsigned int idx = sel >> 3;
 
-    if (client_id.UniqueProcess == NtCurrentTeb()->ClientId.UniqueProcess)
+    if (HandleToULong(client_id.UniqueProcess) == pid)
     {
         if (ldt_copy)
         {
@@ -29041,7 +31000,7 @@ NTSTATUS WINAPI NtSetLdtEntries( ULONG sel1, ULONG entry1_low, ULONG entry1_high
  */
 NTSTATUS virtual_clear_tls_index( ULONG index )
 {
-    struct ntdll_thread_data *thread_data;
+    struct thread_data *thread_data;
     sigset_t sigset;
 #ifdef WINE_IOS
     /* teb_list holds the threads of every pseudo-process in this task, but a
@@ -29054,9 +31013,9 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
     if (index < TLS_MINIMUM_AVAILABLE)
     {
         server_enter_uninterrupted_section( &virtual_mutex, &sigset );
-        LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
+        LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct thread_data, entry )
         {
-            TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+            TEB *teb = thread_data->teb;
 #ifdef _WIN64
             WOW_TEB *wow_teb = get_wow_teb( teb );
 #endif
@@ -29077,9 +31036,9 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
         if (index >= 8 * sizeof(peb->TlsExpansionBitmapBits)) return STATUS_INVALID_PARAMETER;
 
         server_enter_uninterrupted_section( &virtual_mutex, &sigset );
-        LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
+        LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct thread_data, entry )
         {
-            TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+            TEB *teb = thread_data->teb;
 #ifdef _WIN64
             WOW_TEB *wow_teb = get_wow_teb( teb );
 #endif
@@ -29186,6 +31145,7 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
     NTSTATUS status;
     sigset_t sigset;
     SIZE_T size;
+    SIZE_T asked_size;   /* [stack-floor-retry]: what the program asked for, before the 8 MB floor */
 
     {
         /* Owner-aware (X3): default stack sizes come from the calling
@@ -29198,6 +31158,7 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
 
     size = max( reserve_size, commit_size );
     if (size < 1024 * 1024) size = 1024 * 1024;  /* Xlib needs a large stack */
+    asked_size = size;
 #ifdef WINE_IOS
     /* iOS-Madeira ml422 (#70): first CreateBrowser (ml421) died on a genuine
      * STACK_OVERFLOW — 256+ frames of libcef recursion ran a webhelper thread
@@ -29250,6 +31211,38 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
 
     status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
                        limit_low, limit_high, 0 );
+#ifdef WINE_IOS
+    /* [stack-floor-retry] (Tetris Effect, Mina the Hollower, Nov 16: 78-82 threads x 8 MB filled the
+     * 1.1 GB the emulator arena leaves on a phone; "[mmap-place] NO GAP FITS size=0x810000" then
+     * "[thr-create] FAILED at stack c0000017" and the game's DLLs fail with out of memory).
+     * The 8 MB floor (ml424) is only for Chromium. When the map has no room for the floored
+     * stack, give the thread what the program asked for (at least 2 MB, the same minimum
+     * MADEIRA_SMALL_STACK_EXES uses) instead of failing it. Runs only after a failure, so it
+     * cannot change a start that works. env.MADEIRA_STACK_FLOOR_RETRY = 0 turns it off. */
+    if (status == STATUS_NO_MEMORY && guard_page && asked_size < size)
+    {
+        const char *off = getenv( "MADEIRA_STACK_FLOOR_RETRY" );
+
+        if (!(off && off[0] == '0'))
+        {
+            SIZE_T small = ROUND_SIZE( 0, max( asked_size, IOS_SMALL_STACK_FLOOR ), granularity_mask );
+
+            if (small < size)
+            {
+                static int retried;
+                NTSTATUS first = status;
+
+                status = map_view( &view, NULL, small, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
+                                   limit_low, limit_high, 0 );
+                if (retried < 12 && ++retried <= 12)
+                    dprintf( 2, "[stack-floor-retry] #%d the 0x%lx stack found no room (status=0x%x); "
+                                "0x%lx %s\n", retried, (unsigned long)size, (unsigned int)first,
+                             (unsigned long)small, status ? "failed too" : "worked" );
+                if (!status) size = small;
+            }
+        }
+    }
+#endif
     if (status != STATUS_SUCCESS) goto done;
 
 #ifdef VALGRIND_STACK_REGISTER
@@ -29315,6 +31308,17 @@ void virtual_map_user_shared_data(void)
      * infer it.  A zero here means the clock is frozen and any guest that keys
      * a data structure on the tick will collide every entry against every
      * other one.  Two reads, once per process. */
+#ifdef WINE_IOS
+    /* [kusd-fill] every process maps the page here (game processes start through
+     * wine_ios_child_main and never reach unix_init_startup_info): fill the static
+     * fields when the session's first process left them 0, then say what they read. */
+    if (!user_shared_data->TickCountMultiplier)
+    {
+        madeira_kusd_fill_if_empty();
+        dprintf( 2, "[kusd-fill] after the fill: TickCountMultiplier=0x%x ActiveProcessorCount=%u\n",
+                 (unsigned)user_shared_data->TickCountMultiplier, (unsigned)user_shared_data->ActiveProcessorCount );
+    }
+#endif
     {
         unsigned long long ms = ((unsigned long long)user_shared_data->TickCount.High1Time << 32)
                                 | user_shared_data->TickCount.LowPart;
@@ -29463,6 +31467,41 @@ void ios_wow_map_user_shared_data(void)
 #endif
 
 
+/***********************************************************************
+ *           ios_kuser_version
+ *
+ * kuser-version: KUSER_SHARED_DATA's Windows version fields. Nothing in the unix
+ * side filled NtBuildNumber (0x260), NtProductType (0x264), ProductTypeIsValid
+ * (0x268), NtMajorVersion (0x26c) or NtMinorVersion (0x270), so an x64 guest that
+ * reads them straight from 0x7ffe0000 (as ClientSdk.dll does, 60k+ reads of
+ * 0x7ffe0260/026c/0270 before it calls rip=0) saw Windows 0.0 build 0. Fill them
+ * like a real Windows 10 workstation, with the same numbers init_peb() gives the
+ * PEB (OSMajorVersion 10, OSMinorVersion 0, OSBuildNumber 19045). Real Windows keeps
+ * the plain build number here; the 0xF0000000 "checked/free" flags exist only in the
+ * NtBuildNumber export, so none are added. MADEIRA_KUSER_VERSION=0 leaves the
+ * fields zero as before. The page is the wineserver's shared section, so every
+ * process (64-bit through the sub-floor window, 32-bit through the guest-window
+ * view) reads what is written here once.
+ */
+#define IOS_KUSER_MAJOR 10
+#define IOS_KUSER_MINOR 0
+#define IOS_KUSER_BUILD 19045
+static void ios_kuser_version( KUSER_SHARED_DATA *data )
+{
+    static int logged;
+    const char *e = getenv( "MADEIRA_KUSER_VERSION" );
+
+    if (e && e[0] == '0' && !e[1]) return;
+    data->NtMajorVersion    = IOS_KUSER_MAJOR;
+    data->NtMinorVersion    = IOS_KUSER_MINOR;
+    data->NtBuildNumber     = IOS_KUSER_BUILD;
+    data->NtProductType     = NtProductWinNt;   /* VER_NT_WORKSTATION (1) */
+    data->ProductTypeIsValid = TRUE;
+    if (logged++ < 4)
+        dprintf( 2, "[kuser-version] %u.%u build %u\n", IOS_KUSER_MAJOR, IOS_KUSER_MINOR, IOS_KUSER_BUILD );
+}
+
+
 /******************************************************************
  *		virtual_init_user_shared_data
  *
@@ -29500,6 +31539,26 @@ void virtual_init_user_shared_data(void)
     data->NumberOfPhysicalPages = info.MmNumberOfPhysicalPages;
     data->NXSupportPolicy       = NX_SUPPORT_POLICY_OPTIN;
     data->ActiveProcessorCount  = peb->NumberOfProcessors;
+#ifdef WINE_IOS
+    /* kusd-active-cpu-count: the [kusd-fill] path (madeira_kusd_fill_if_empty, from
+     * virtual_map_user_shared_data) runs before this process's PEB is set up, so
+     * peb->NumberOfProcessors is still 0 there and the shared page got
+     * ActiveProcessorCount = 0 (Black Ops III log: "[kusd-fill] after the fill: ...
+     * ActiveProcessorCount=0"). A program that sizes its worker pool from it gets no
+     * workers. Use the host's online core count in that case. env
+     * MADEIRA_KUSD_CPU_COUNT=0 keeps the old value (0). */
+    if (!data->ActiveProcessorCount)
+    {
+        const char *e = getenv( "MADEIRA_KUSD_CPU_COUNT" );
+        long n = sysconf( _SC_NPROCESSORS_ONLN );
+        if (!(e && e[0] == '0') && n > 0)
+        {
+            if (n > 64) n = 64;   /* one processor group */
+            data->ActiveProcessorCount = (ULONG)n;
+            dprintf( 2, "[kusd-cpu-count] PEB NumberOfProcessors was 0: ActiveProcessorCount = %ld (host online cores) rev=kusd-active-cpu-count\n", n );
+        }
+    }
+#endif
     data->ActiveGroupCount      = 1;
 
     switch (native_machine)
@@ -29511,6 +31570,7 @@ void virtual_init_user_shared_data(void)
     }
 
     init_shared_data_cpuinfo( data );
+    ios_kuser_version( data );
 #ifdef WINE_IOS
     {
         /* ml1310: with MADEIRA_FEX_AVX=1 FEX runs AVX/AVX2 and its CPUID says so, but
@@ -29550,6 +31610,42 @@ void virtual_init_user_shared_data(void)
 }
 
 
+/* iOS-Madeira [kusd-fill] (pending-prs/kusd-tick-multiplier, ported from wine unix/virtual.c to this
+ * file, which is what iOS builds): the static KUSER_SHARED_DATA fields (TickCountMultiplier,
+ * ActiveProcessorCount, NativeProcessorArchitecture, NXSupportPolicy, cpu features) are written only
+ * by the parentless process that runs wineboot. A Madeira session whose first process does not take
+ * that path leaves them 0: Call of Duty Black Ops III computes its tick count as
+ * (TickCount * TickCountMultiplier) >> 24, always gets 0 and spins on its start screen. Fill them once
+ * per session from any process that finds them empty. env MADEIRA_KUSD_FILL=0 turns it off. */
+void madeira_kusd_fill_if_empty(void)
+{
+    UNICODE_STRING name_str = RTL_CONSTANT_STRING( shared_data_nameW );
+    OBJECT_ATTRIBUTES attr = { sizeof(attr), 0, &name_str };
+    const char *env = getenv( "MADEIRA_KUSD_FILL" );
+    KUSER_SHARED_DATA *data;
+    HANDLE section;
+    int fd, needs_close;
+    ULONG mult;
+
+    if (env && env[0] == '0') return;
+    if (NtOpenSection( &section, SECTION_MAP_READ, &attr )) return;
+    if (server_get_unix_fd( section, 0, &fd, &needs_close, NULL, NULL ))
+    {
+        NtClose( section );
+        return;
+    }
+    data = mmap( NULL, sizeof(*data), PROT_READ, MAP_SHARED, fd, 0 );
+    if (needs_close) close( fd );
+    NtClose( section );
+    if (data == MAP_FAILED) return;
+    mult = data->TickCountMultiplier;
+    munmap( data, sizeof(*data) );
+    if (mult) return;
+    dprintf( 2, "[kusd-fill] TickCountMultiplier was 0: filling the static KUSER_SHARED_DATA fields\n" );   /* not ERR: MADEIRA_QUIET hides ERR */
+    virtual_init_user_shared_data();
+}
+
+
 struct thread_stack_info
 {
     char  *start;
@@ -29562,12 +31658,13 @@ struct thread_stack_info
 /***********************************************************************
  *           is_inside_thread_stack
  */
-static BOOL is_inside_thread_stack( void *ptr, struct thread_stack_info *stack )
+static BOOL is_inside_thread_stack( struct thread_data *data, void *ptr, struct thread_stack_info *stack )
 {
-    TEB *teb = NtCurrentTeb();
-    WOW_TEB *wow_teb = get_wow_teb( teb );
+    TEB *teb;
+    WOW_TEB *wow_teb;
     size_t min_guaranteed = max( page_size * (is_win64 ? 2 : 1), host_page_size );
 
+    if (!(teb = data->teb)) return FALSE;
     stack->start = teb->DeallocationStack;
     stack->limit = teb->Tib.StackLimit;
     stack->end   = teb->Tib.StackBase;
@@ -29575,7 +31672,7 @@ static BOOL is_inside_thread_stack( void *ptr, struct thread_stack_info *stack )
     stack->is_wow = FALSE;
     if ((char *)ptr > stack->start && (char *)ptr <= stack->end) return TRUE;
 
-    if (!wow_teb) return FALSE;
+    if (!(wow_teb = get_wow_teb( teb ))) return FALSE;
     stack->start = ULongToPtr( wow_teb->DeallocationStack );
     stack->limit = ULongToPtr( wow_teb->Tib.StackLimit );
     stack->end   = ULongToPtr( wow_teb->Tib.StackBase );
@@ -29588,7 +31685,7 @@ static BOOL is_inside_thread_stack( void *ptr, struct thread_stack_info *stack )
 /***********************************************************************
  *           grow_thread_stack
  */
-static NTSTATUS grow_thread_stack( char *page, struct thread_stack_info *stack_info )
+static NTSTATUS grow_thread_stack( struct thread_data *data, char *page, struct thread_stack_info *stack_info )
 {
     NTSTATUS ret = 0;
 
@@ -29608,10 +31705,10 @@ static NTSTATUS grow_thread_stack( char *page, struct thread_stack_info *stack_i
     }
     if (stack_info->is_wow)
     {
-        WOW_TEB *wow_teb = get_wow_teb( NtCurrentTeb() );
+        WOW_TEB *wow_teb = get_wow_teb( data->teb );
         wow_teb->Tib.StackLimit = PtrToUlong( page );
     }
-    else NtCurrentTeb()->Tib.StackLimit = page;
+    else data->teb->Tib.StackLimit = page;
     return ret;
 }
 
@@ -29619,7 +31716,7 @@ static NTSTATUS grow_thread_stack( char *page, struct thread_stack_info *stack_i
 /***********************************************************************
  *           virtual_handle_fault
  */
-NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
+NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, void *stack )
 {
     NTSTATUS ret = STATUS_ACCESS_VIOLATION;
     ULONG_PTR err = rec->ExceptionInformation[0];
@@ -29639,22 +31736,22 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
     }
 #endif
 
-    if (!is_inside_signal_stack( stack ) && (vprot & VPROT_GUARD))
+    if (!is_inside_signal_stack( data, stack ) && (vprot & VPROT_GUARD))
     {
         struct thread_stack_info stack_info;
-        if (!is_inside_thread_stack( page, &stack_info ))
+        if (!is_inside_thread_stack( data, page, &stack_info ))
         {
             set_page_vprot_bits( page, host_page_size, 0, VPROT_GUARD );
             mprotect_range( page, host_page_size, 0, 0 );
             ret = STATUS_GUARD_PAGE_VIOLATION;
         }
-        else ret = grow_thread_stack( page, &stack_info );
+        else ret = grow_thread_stack( data, page, &stack_info );
     }
     else if (err == EXCEPTION_WRITE_FAULT)
     {
         if (vprot & VPROT_WRITEWATCH)
         {
-            if (enable_write_exceptions && is_vprot_exec_write( vprot ) && !ntdll_get_thread_data()->allow_writes)
+            if (enable_write_exceptions && is_vprot_exec_write( vprot ) && !data->allow_writes)
             {
                 rec->NumberParameters = 3;
                 rec->ExceptionInformation[2] = STATUS_EXECUTABLE_MEMORY_WRITE;
@@ -29864,14 +31961,14 @@ static int ios_range_writable( const void *addr, size_t size )
     return 1;
 }
 
-void *virtual_setup_exception( void *stack_ptr, size_t size, EXCEPTION_RECORD *rec )
+void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t size, EXCEPTION_RECORD *rec )
 {
     char *stack = stack_ptr;
     struct thread_stack_info stack_info;
 
-    if (!is_inside_thread_stack( stack, &stack_info ))
+    if (!is_inside_thread_stack( data, stack, &stack_info ))
     {
-        if (is_inside_signal_stack( stack ))
+        if (is_inside_signal_stack( data, stack ))
         {
             ERR( "nested exception on signal stack addr %p stack %p\n", rec->ExceptionAddress, stack );
             abort_thread(1);
@@ -29935,7 +32032,7 @@ void *virtual_setup_exception( void *stack_ptr, size_t size, EXCEPTION_RECORD *r
     {
         char *page = ROUND_ADDR( stack, host_page_mask );
         mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
-        if ((get_host_page_vprot( page ) & VPROT_GUARD) && grow_thread_stack( page, &stack_info ))
+        if ((get_host_page_vprot( page ) & VPROT_GUARD) && grow_thread_stack( data, page, &stack_info ))
         {
             rec->ExceptionCode = STATUS_STACK_OVERFLOW;
             rec->NumberParameters = 0;
@@ -30366,6 +32463,49 @@ static ssize_t ios_kw_recvmsg( int fd, struct msghdr *hdr, int flags )
 }
 
 
+/* ww-pre-open: would a write to this buffer fault on a write watch? Read without
+ * the lock, as a hint only.
+ *
+ * read() and recvmsg() below are first tried without the lock; when the buffer
+ * has write-watched pages the kernel faults (EFAULT) and the call is retried
+ * under the lock with the pages opened. On Linux the data is still queued for
+ * the retry. On Darwin a read from a socket or a pipe that faults part-way can
+ * already have taken the data out of the queue, so the retry finds nothing and
+ * the data is lost (reported for macOS by the MetalSharp Wine project, whose
+ * test ws2_32:sock test_write_watch waited forever; not measured on iOS here).
+ * So when the hint says yes, the unlocked attempt is skipped and the call goes
+ * straight to the locked path, which is where it would have ended up anyway.
+ * A buffer with no write watch (the common case) takes the old path unchanged.
+ * pread() keeps the retry: reading again at an offset loses nothing.
+ * Off by default; MADEIRA_WW_PRE_OPEN=1 turns this on. Logs [ww-pre-open] (first 8 uses). */
+static BOOL ios_buffer_write_watched( const void *base, size_t size )
+{
+    static int enabled = -1;
+    static int said;
+    char *addr = ROUND_ADDR( base, host_page_mask );
+    size_t i;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_WW_PRE_OPEN" );
+        enabled = (e && e[0] == '1' && !e[1]);
+    }
+    if (!enabled || use_kernel_writewatch || !size) return FALSE;
+    size = ROUND_SIZE( base, size, host_page_mask );
+    for (i = 0; i < size; i += host_page_size)
+    {
+        if (get_host_page_vprot( addr + i ) & VPROT_WRITEWATCH)
+        {
+            if (__atomic_fetch_add( &said, 1, __ATOMIC_RELAXED ) < 8)
+                dprintf( 2, "[ww-pre-open] read into a write-watched buffer %p+0x%lx: pages opened before the read "
+                            "(MADEIRA_WW_PRE_OPEN=1 is set)\n", base, (unsigned long)size );
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+
 /***********************************************************************
  *           virtual_locked_read
  */
@@ -30374,11 +32514,14 @@ ssize_t virtual_locked_read( int fd, void *addr, size_t size )
     sigset_t sigset;
     BOOL has_write_watch = FALSE;
     int err = EFAULT;
-    ssize_t ret;
+    ssize_t ret = -1;   /* ww-pre-open: the unlocked attempt may be skipped */
 
     if (ios_kw_has_rw_alias( (uintptr_t)addr, (uintptr_t)addr + size )) return ios_kw_read( fd, addr, size, 0, FALSE );
-    ret = read( fd, addr, size );
-    if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+    if (!ios_buffer_write_watched( addr, size ))   /* ww-pre-open */
+    {
+        ret = read( fd, addr, size );
+        if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+    }
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     if (!check_write_access( addr, size, &has_write_watch ))
@@ -30429,14 +32572,19 @@ ssize_t virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags )
     size_t i;
     BOOL has_write_watch = FALSE;
     int err = EFAULT;
-    ssize_t ret;
+    ssize_t ret = -1;   /* ww-pre-open: the unlocked attempt may be skipped */
 
     for (i = 0; i < hdr->msg_iovlen; i++)
         if (ios_kw_has_rw_alias( (uintptr_t)hdr->msg_iov[i].iov_base,
                                  (uintptr_t)hdr->msg_iov[i].iov_base + hdr->msg_iov[i].iov_len ))
             return ios_kw_recvmsg( fd, hdr, flags );
-    ret = recvmsg( fd, hdr, flags );
-    if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+    for (i = 0; i < hdr->msg_iovlen; i++)   /* ww-pre-open */
+        if (ios_buffer_write_watched( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len )) break;
+    if (i == hdr->msg_iovlen)
+    {
+        ret = recvmsg( fd, hdr, flags );
+        if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+    }
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     for (i = 0; i < hdr->msg_iovlen; i++)
@@ -31231,7 +33379,19 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
         WARN("called with wrong alloc type flags (%08x) !\n", type);
         return STATUS_INVALID_PARAMETER;
     }
-
+    switch (type & (MEM_PHYSICAL | MEM_LARGE_PAGES))
+    {
+    case MEM_PHYSICAL:
+        if (type & (MEM_COMMIT | MEM_RESET)) return STATUS_INVALID_PARAMETER;
+        break;
+    case MEM_LARGE_PAGES:
+        if (size & (user_shared_data->LargePageMinimum - 1)) return STATUS_INVALID_PARAMETER;
+        if (!(type & MEM_COMMIT)) return STATUS_INVALID_PARAMETER;
+        return STATUS_PRIVILEGE_NOT_HELD;
+    case MEM_PHYSICAL | MEM_LARGE_PAGES:
+        if (size & granularity_mask) return STATUS_INVALID_PARAMETER;
+        break;
+    }
     if (type & MEM_RESERVE_PLACEHOLDER && (protect != PAGE_NOACCESS)) return STATUS_INVALID_PARAMETER;
     if (!arm64ec_view && (attributes & MEM_EXTENDED_PARAMETER_EC_CODE)) return STATUS_INVALID_PARAMETER;
 
@@ -32151,7 +34311,7 @@ static void ios_sc_reap_dead( void )
             st = NtFreeVirtualMemory( NtCurrentProcess(), &b, &s, MEM_RELEASE );
         }
         if (!st) ios_sc_rehold( kind );
-        dprintf( 2, "[sc-cef] reclaimed a dead SocialClubHelper.exe's reservation (peb=%p kind=%d): view 0x%llx "
+        dprintf( 2, "[sc-cef] reclaimed a dead CEF host's reservation (peb=%p kind=%d): view 0x%llx "
                     "(given as 0x%llx) %s\n", peb, kind, (unsigned long long)view, (unsigned long long)report,
                  st ? "was already gone" : "released and held again" );
     }
@@ -32222,7 +34382,7 @@ static int ios_sc_grant_release( void *base, SIZE_T *size, int *rehold )
     return 1;
 }
 
-/* Layout 2: serve a SocialClubHelper.exe jumbo request from its slot. Returns 0
+/* Layout 2: serve a CEF host's (SocialClubHelper.exe or env.MADEIRA_CEF_PA_EXES) jumbo request from its slot. Returns 0
  * when the request is not one of the layout's (the generic path takes it), 1
  * with *st (and *pick / *sz on success) when it was decided here. */
 static int ios_sc2_route( void *hint, SIZE_T size, ULONG type, ULONG protect, void **pick, SIZE_T *sz, NTSTATUS *st )
@@ -32233,6 +34393,7 @@ static int ios_sc2_route( void *hint, SIZE_T size, ULONG type, ULONG protect, vo
     uint64_t base, report;
     void *p;
     SIZE_T s;
+    char hn[64];
 
     if (k == IOS_SC2_NONE) return 0;
     if (k == IOS_SC2_REFUSE)
@@ -32263,8 +34424,8 @@ static int ios_sc2_route( void *hint, SIZE_T size, ULONG type, ULONG protect, vo
     ios_sc_grant_add( base, report, s, size, k, peb );
     *pick = (void *)(ULONG_PTR)report;
     *sz = size;
-    dprintf( 2, "[sc-cef] layout 2: %s for SocialClubHelper.exe: 0x%llx (0x%lx asked), [0x%llx,0x%llx) reserved\n",
-             ios_sc2_slots[k].what, (unsigned long long)report, (unsigned long)size,
+    dprintf( 2, "[sc-cef] layout 2: %s for %s: 0x%llx (0x%lx asked), [0x%llx,0x%llx) reserved\n",
+             ios_sc2_slots[k].what, ios_sc_host_name( hn, sizeof(hn) ), (unsigned long long)report, (unsigned long)size,
              (unsigned long long)base, (unsigned long long)(base + ios_sc2_slots[k].size) );
     return 1;
 }
@@ -32394,8 +34555,10 @@ static void ios_sc2_note_growth( uint64_t a, uint64_t size, const struct ios_sc2
     if ((end >> 28) > (high[k] >> 28) && lines < 64)
     {
         lines++;
-        dprintf( 2, "[sc-cef] layout 2: SocialClubHelper.exe has committed %s up to +%llu MB (%llu MB real of "
-                    "%llu MB reported)\n", ios_sc_kind_what( k ), (unsigned long long)(end >> 20),
+        char hn[64];
+        dprintf( 2, "[sc-cef] layout 2: %s has committed %s up to +%llu MB (%llu MB real of "
+                    "%llu MB reported)\n", ios_sc_host_name( hn, sizeof(hn) ), ios_sc_kind_what( k ),
+                 (unsigned long long)(end >> 20),
                  (unsigned long long)(gv->real >> 20), (unsigned long long)(gv->asked >> 20) );
     }
     high[k] = end;
@@ -32412,7 +34575,7 @@ static void ios_sc2_note_commit( void *addr, SIZE_T size )
     int i, n = 0, gi = -1, c, owner;
     void *peb;
 
-    if (a < IOS_SC2_L_BASE || !ios_sc_grant_n || !ios_sc_current_is_helper()) return;
+    if (a < IOS_SC2_L_BASE || !ios_sc_grant_n || !ios_sc_current_is_cef_host()) return;
     peb = ios_jit_current_peb();
     pthread_mutex_lock( &ios_sc_grant_lock );
     for (i = 0; i < ios_sc_grant_n; i++)
@@ -32453,9 +34616,10 @@ static void ios_sc2_note_commit( void *addr, SIZE_T size )
         void *ab = NULL;
         if (!NtQueryVirtualMemory( NtCurrentProcess(), addr, MemoryBasicInformation, &mbi, sizeof(mbi), NULL ))
             ab = mbi.AllocationBase;
-        dprintf( 2, "[sc-cef] layout 2: SocialClubHelper.exe commit 0x%llx+0x%lx is in %s's given-but-unreserved "
+        char hn[64];
+        dprintf( 2, "[sc-cef] layout 2: %s commit 0x%llx+0x%lx is in %s's given-but-unreserved "
                     "[0x%llx,0x%llx) (allocation base %p) -- it lands on another mapping\n",
-                 (unsigned long long)a, (unsigned long)size, ios_sc_kind_what( g[gi].kind ),
+                 ios_sc_host_name( hn, sizeof(hn) ), (unsigned long long)a, (unsigned long)size, ios_sc_kind_what( g[gi].kind ),
                  (unsigned long long)(g[gi].view + g[gi].real), (unsigned long long)(g[gi].report + g[gi].asked), ab );
     }
 }
@@ -32483,6 +34647,7 @@ static NTSTATUS ios_sc_glued_pools( void **pick, SIZE_T *sz, ULONG type, ULONG p
     void *lo = (void *)(uintptr_t)IOS_SC_GLUED_BASE;
     SIZE_T lsz = IOS_SC_BRP_HOLD_BASE + IOS_SC_BRP_HOLD_SIZE - IOS_SC_GLUED_BASE;   /* 20 GB */
     NTSTATUS st;
+    char hn[64];
 
     if (!ios_sc_brp_layout)
     {
@@ -32514,10 +34679,11 @@ static NTSTATUS ios_sc_glued_pools( void **pick, SIZE_T *sz, ULONG type, ULONG p
     *pick = lo;
     *sz = IOS_SC_GLUED_SIZE;
     ios_sc_grant_add( IOS_SC_GLUED_BASE, IOS_SC_GLUED_BASE, lsz, IOS_SC_GLUED_SIZE, IOS_SC_K_V1, ios_jit_current_peb() );
-    dprintf( 2, "[sc-cef] glued PartitionAlloc pools for SocialClubHelper.exe: 32 GB at 0x%llx; [0x%llx,0x%llx) "
+    dprintf( 2, "[sc-cef] glued PartitionAlloc pools for %s: 32 GB at 0x%llx; [0x%llx,0x%llx) "
                 "reserved (regular pool + the first 4 GB of the BackupRefPtr pool), the rest of it lies over FEX's "
                 "arena and is never reached\n",
-             IOS_SC_GLUED_BASE, IOS_SC_GLUED_BASE, IOS_SC_BRP_HOLD_BASE + IOS_SC_BRP_HOLD_SIZE );
+             ios_sc_host_name( hn, sizeof(hn) ), IOS_SC_GLUED_BASE, IOS_SC_GLUED_BASE,
+             IOS_SC_BRP_HOLD_BASE + IOS_SC_BRP_HOLD_SIZE );
     return STATUS_SUCCESS;
 }
 
@@ -32553,7 +34719,7 @@ static NTSTATUS ios_oversize_reserve( void **ret, SIZE_T *size_ptr, ULONG type, 
     long long cap_mb = ios_oversize_real_mb();
     SIZE_T want = *size_ptr, real, floor;
 
-    if (*ret || want < IOS_OVERSIZE_MIN || (type & ~MEM_TOP_DOWN) != MEM_RESERVE) return STATUS_NO_MEMORY;
+    if (*ret || want < ios_oversize_min() || (type & ~MEM_TOP_DOWN) != MEM_RESERVE) return STATUS_NO_MEMORY;
     if (cap_mb <= 0)
     {
         static int said;
@@ -32620,7 +34786,8 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
 #ifdef WINE_IOS
     ios_tls38_poll( "valloc" );
 #endif
-    static const ULONG type_mask = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET;
+    static const ULONG type_mask = MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN |
+                                   MEM_PHYSICAL | MEM_LARGE_PAGES | MEM_WRITE_WATCH;
     ULONG_PTR limit;
 #ifdef WINE_IOS
     /* ml373: *ret is overwritten with the result, so the [guest-reserve] census
@@ -32710,6 +34877,8 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
         union apc_result result;
         unsigned int status;
 
+        if (is_old_wow64() && !zero_bits) zero_bits = ~0u;
+
         memset( &call, 0, sizeof(call) );
 
         call.virtual_alloc.type         = APC_VIRTUAL_ALLOC;
@@ -32771,7 +34940,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
         if ((type & MEM_COMMIT) && *ret && ios_sc_layout_mode == 2)
             ios_sc2_note_commit( *ret, *size_ptr );
         /* madeira-bcd: a helper's large ask first releases what dead helpers held */
-        if (is_jumbo && ios_sc_grant_dead_n && ios_sc_cef_enabled() && ios_sc_current_is_helper())
+        if (is_jumbo && ios_sc_grant_dead_n && ios_sc_cef_enabled() && ios_sc_current_is_cef_host())
             ios_sc_reap_dead();
         /* ml151: a commit landing in a SOFT pool range — see ios_soft. The range
          * was never backed, so materialise exactly this sub-range now. Check the
@@ -33330,7 +35499,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
              * Keep the existing helper workaround scoped to its owner: its
              * boot-held pools are handed off by the routes below. */
             if (st && *ret && *size_ptr >= 0x40000000 && (type & MEM_RESERVE)
-                && ios_sc_cef_enabled() && ios_sc_current_is_helper())
+                && ios_sc_cef_enabled() && ios_sc_current_is_cef_host())
             {
                 void *hint = *ret;
                 void *pick = NULL;
@@ -33374,7 +35543,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                  * are PartitionAlloc, V8 and Oilpan reservations, which need
                  * memory that is really theirs (jumbo#3 of the 18:24 log died
                  * freeing the soft 0x7400000000). */
-                int sc_helper = ios_sc_cef_enabled() && ios_sc_current_is_helper();
+                int sc_helper = ios_sc_cef_enabled() && ios_sc_current_is_cef_host();
                 int sc2 = sc_helper && ios_sc_layout_mode == 2;
                 if (sc2 && ios_sc2_route( hint, *size_ptr, type, protect, &pick, &sz, &st2 ))
                     goto sc_decided;
@@ -33567,9 +35736,20 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
         }
 
         if (st && (type & MEM_COMMIT) && jumbo_hint) ios_oversize_commit_failed( jumbo_hint, jumbo_size, st );   /* ml1298 */
+        /* ml1310 [jumbo-limits]: a failed big reserve names who capped it (Aperture Desk Job: unhinted 2 GB
+         * reserve, window 0x10000..0x80000000; the log never said whether zero_bits or a
+         * MEM_ADDRESS_REQUIREMENTS ceiling made that window). Diagnostic only. */
+        if (is_jumbo && st)
+        {
+            static unsigned jl_n;
+
+            if (jl_n++ < 16)
+                dprintf( 2, "[jumbo-limits] NtAllocateVirtualMemory zero_bits=0x%lx limit=%p hint=%p size=0x%lx type=0x%x protect=0x%x st=0x%x\n",
+                         (unsigned long)zero_bits, (void *)limit, jumbo_hint, (unsigned long)jumbo_size, type, protect, (unsigned)st );
+        }
         if (is_jumbo) ios_jumbo_census( jumbo_hint, jumbo_size, st ? NULL : *ret, (unsigned)st );
         /* madeira-bcd: remember a helper's large reservation for ios_sc_reap_dead */
-        if (is_jumbo && !st && ios_sc_cef_enabled() && ios_sc_current_is_helper()) ios_sc_grant_note( *ret, *size_ptr );
+        if (is_jumbo && !st && ios_sc_cef_enabled() && ios_sc_current_is_cef_host()) ios_sc_grant_note( *ret, *size_ptr );
         if (!st && *size_ptr >= 0x10000000 && *size_ptr < 0x40000000 && (type & MEM_RESERVE))
             ios_bigres_note( *ret, *size_ptr );
         if (!st) ios_span_census( *ret, *size_ptr, 0 );   /* ml435 (#73) */
@@ -34109,6 +36289,24 @@ void ios_reserve_fex_arena(void)
         void *base;
         kern_return_t kr;
 
+        /* short-map-arena: on a 454 GB map (task ceiling between 64 GB and 496 GB)
+         * every step above 4 GB fails and the 4 GB step leaves only ~1 GB of the ~5 GB
+         * band for the guest (StS2 on iPhone19,4: its 895 MB image then fails to map).
+         * Working StS2 runs use 1.4 to 2.1 GB of their arena, so a 3 GB arena is enough
+         * there. Never taken on a 512 GB map (the 16 GB step succeeds first) or a 63 GB
+         * map (ceiling below 64 GB). env.MADEIRA_SHORT_MAP_ARENA_3GB = 0 turns it off. */
+        if (size == 0x100000000ull && arena_task_max > 0x1000000000ull && arena_task_max < 0x7c00000000ull)
+        {
+            const char *sm = getenv( "MADEIRA_SHORT_MAP_ARENA_3GB" );
+            if (!(sm && sm[0] == '0'))
+            {
+                size = 0xc0000000ull;
+                dprintf( 2, "[fex-arena] short-map-arena: task ceiling 0x%llx, using a 3 GB arena for %s "
+                            "(MADEIRA_SHORT_MAP_ARENA_3GB=0 keeps 4 GB)\n",
+                         arena_task_max, plan[i].what );
+            }
+        }
+
         /* madeira-bcd: env.MADEIRA_SC_PA_POOLS = 1 moves the first candidate 4 GB
          * up and holds the 4 GB below it (ios_sc_pa_hold_arena); without it this
          * is never taken. */
@@ -34268,8 +36466,9 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                                            ULONG protect, MEM_EXTENDED_PARAMETER *parameters,
                                            ULONG count )
 {
-    static const ULONG type_mask = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | MEM_WRITE_WATCH
-                                   | MEM_RESET | MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER;
+    static const ULONG type_mask = MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN |
+                                   MEM_PHYSICAL | MEM_LARGE_PAGES | MEM_WRITE_WATCH |
+                                   MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER;
     ULONG_PTR limit_low = 0;
     ULONG_PTR limit_high = 0;
     ULONG_PTR align = 0;
@@ -34609,6 +36808,7 @@ retry_code_carve_reuse:
         size_t reserve_offset, tail_added, tail_skipped = 0;
         size_t skip_off[3], skip_size[3];
         int skip_n = 0;
+        if (ios_pool_big_refuse( alloc_size )) return STATUS_NO_MEMORY;   /* pool-tail-for-head: MADEIRA_POOL_BIG_MAX */
         if (ios_jit_hole_end > ios_jit_hole_off)
         {
             /* madeira-bcd split pool: a carve that would overlap a hole goes
@@ -34877,6 +37077,8 @@ retry_code_carve_reuse:
         union apc_call call;
         union apc_result result;
 
+        if (is_old_wow64() && !limit_high && !*ret) limit_high = ~0u;
+
         memset( &call, 0, sizeof(call) );
 
         call.virtual_alloc_ex.type         = APC_VIRTUAL_ALLOC_EX;
@@ -35068,7 +37270,7 @@ retry_code_carve_reuse:
          * V8 sandbox's 8 GB step given the cage (ios_sc2_ex_cage) and its large
          * grants remembered for ios_sc_reap_dead (ios_sc_grant_note). */
         {
-            int sc2 = is_jumbo && ios_sc_layout_mode == 2 && ios_sc_cef_enabled() && ios_sc_current_is_helper();
+            int sc2 = is_jumbo && ios_sc_layout_mode == 2 && ios_sc_cef_enabled() && ios_sc_current_is_cef_host();
             int caged = 0;
 
             if ((type & MEM_COMMIT) && *ret && ios_sc_layout_mode == 2 && (ULONG_PTR)*ret < ios_sc2_arena_lo)
@@ -35081,8 +37283,10 @@ retry_code_carve_reuse:
                 SIZE_T sz = 0;
 
                 st = ios_cage_grant( type, protect, *size_ptr, &pick, &sz, "sc2-ex" );
-                dprintf( 2, "[sc-cef] layout 2: V8 sandbox's 8 GB step (VirtualAlloc2, hint %p) for SocialClubHelper.exe: "
-                            "the cage -> %p (st=0x%x)\n", hint, st ? NULL : pick, (unsigned)st );
+                char hn[64];
+                dprintf( 2, "[sc-cef] layout 2: V8 sandbox's 8 GB step (VirtualAlloc2, hint %p) for %s: "
+                            "the cage -> %p (st=0x%x)\n", hint, ios_sc_host_name( hn, sizeof(hn) ),
+                         st ? NULL : pick, (unsigned)st );
                 if (!st)
                 {
                     *ret = pick;
@@ -35103,6 +37307,15 @@ retry_code_carve_reuse:
             st = STATUS_SUCCESS;
         if (st && (type & MEM_COMMIT) && jumbo_hint) ios_oversize_commit_failed( jumbo_hint, jumbo_size, st );
 
+        if (is_jumbo && st)   /* ml1310 [jumbo-limits]: see NtAllocateVirtualMemory; diagnostic only */
+        {
+            static unsigned jl_ex_n;
+
+            if (jl_ex_n++ < 16)
+                dprintf( 2, "[jumbo-limits] NtAllocateVirtualMemoryEx limit_low=%p limit_high=%p align=0x%lx attributes=0x%x hint=%p size=0x%lx type=0x%x protect=0x%x st=0x%x\n",
+                         (void *)limit_low, (void *)limit_high, (unsigned long)align, (unsigned)attributes, jumbo_hint,
+                         (unsigned long)jumbo_size, type, protect, (unsigned)st );
+        }
         if (is_jumbo) ios_jumbo_census( jumbo_hint, jumbo_size, st ? NULL : *ret, (unsigned)st );
         if (!st && *size_ptr >= 0x10000000 && *size_ptr < 0x40000000 && (type & MEM_RESERVE))
             ios_bigres_note( *ret, *size_ptr );
@@ -36136,6 +38349,42 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                      (unsigned)new_prot, status ? 0u : (unsigned)old, status, sec );
         }
     }
+
+    /* img-protect-probe (LOG ONLY): a program that hooks a DLL's code (overlays, mods,
+     * MinHook/Detours, anti-cheat, Steam emulators) calls NtProtectVirtualMemory to
+     * make the code writable, then writes it. A 32-bit Black Ops II log (Sentry
+     * 7849899093) wrote two ntdll syscall stubs right after such a call and the page
+     * was still READ|EXEC for Wine (vprot 0x25). This logs every protect of an image
+     * view that is not the main program, with the result and the vprot the call
+     * left, so a call that "succeeds" without making the page writable shows up.
+     * First 64 calls and every failure up to 64 more; env MADEIRA_IMG_PROTECT_PROBE=0
+     * turns it off. Nothing is changed. */
+    {
+        static int probe_on = -1, probe_n, probe_fail_n;
+        PEB *cur_peb = NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL;
+
+        if (probe_on < 0)
+        {
+            const char *e = getenv( "MADEIRA_IMG_PROTECT_PROBE" );
+            probe_on = !(e && e[0] == '0');
+        }
+        if (probe_on && view && (view->protect & SEC_IMAGE) &&
+            !(cur_peb && cur_peb->ImageBaseAddress == view->base) &&
+            (status ? probe_fail_n < 64 : probe_n < 64))
+        {
+            BYTE after = get_page_vprot( base );
+            int wants_write = (new_prot & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+            const char *verdict = status ? "FAILED"
+                                : (wants_write && !(after & (VPROT_WRITE | VPROT_WRITECOPY))) ? "SUCCESS-BUT-NOT-WRITABLE"
+                                : "ok";
+            if (status) probe_fail_n++; else probe_n++;
+            dprintf( 2, "[img-protect] #%d tid=%04x view %p+%#lx %p+%#lx (rva %#lx) new_prot=%#x old=%#x status=%#x vprot_after=%#x %s rev=img-protect-probe\n",
+                     probe_n + probe_fail_n, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+                     view->base, (unsigned long)view->size, base, (unsigned long)size,
+                     (unsigned long)((char *)base - (char *)view->base),
+                     (unsigned)new_prot, status ? 0u : (unsigned)old, status, (unsigned)after, verdict );
+        }
+    }
 #endif
 
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
@@ -36389,8 +38638,9 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
 
                     if (text_sz == 0 || text_abs_end <= rgn_start || text_abs_start >= rgn_end)
                     {
-                        /* No overlap with .text — safe to copy whole region */
-                        memcpy(jit_rw_dest, base, size);
+                        /* No overlap with .text — safe to copy whole region
+                         * (Madeira-owned padding excepted: [pc2fh-slot]) */
+                        ios_copy_keep_owned(jit_rw_dest, base, size);
                         ERR("iOS JIT IAT sync: full copy %p+0x%lx → JIT (no text overlap)\n",
                             base, (unsigned long)size);
                     }
@@ -36401,9 +38651,9 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                         size_t overlap_end   = text_abs_end   < rgn_end   ? text_abs_end   - rgn_start : size;
 
                         if (overlap_start > 0)
-                            memcpy(jit_rw_dest, (char *)base, overlap_start);
+                            ios_copy_keep_owned(jit_rw_dest, (char *)base, overlap_start);
                         if (overlap_end < size)
-                            memcpy(jit_rw_dest + overlap_end, (char *)base + overlap_end, size - overlap_end);
+                            ios_copy_keep_owned(jit_rw_dest + overlap_end, (char *)base + overlap_end, size - overlap_end);
 
                         ERR("iOS JIT IAT sync: partial copy %p+0x%lx → JIT (skipping text [0x%lx-0x%lx])\n",
                             base, (unsigned long)size,
@@ -36837,6 +39087,81 @@ int ios_addr_max_prot( const void *addr, int *prot )
     return maximum;
 }
 
+/* madeira-bcd [guest-data]: what the address of a guest access violation is.
+ *
+ * Brawlhalla (Wave 13, Nov 8) died on "AV WRITE of 705F950FC2" from FEX code,
+ * and the only line about memory was [guest-rip]'s query of the PC -- a FEX
+ * code buffer in the pool, which Wine has no view of, so it always says
+ * "NOT COMMITTED (jumped into nothing)" and points the reader at the wrong
+ * address. The address that matters is the data address. Say what Wine thinks
+ * it is (view, committed or only reserved, protection, guard, write watch) and
+ * what the host has mapped there, and which of the two disagrees.
+ *
+ * Called from the signal path: the host side is a plain mach_vm_region, and
+ * the Wine side is read only when virtual_mutex can be taken without waiting
+ * (it is recursive, so a fault inside Wine on this thread still gets it). */
+void ios_describe_fault_data( const void *addr, int access, char *buf, size_t len )
+{
+    char *hs = NULL, *he = NULL;
+    int hprot = 0, hmax = 0, host, have_view = 0, view_known = 0;
+    BYTE vprot = 0;
+    void *vbase = NULL;
+    size_t vsize = 0;
+    unsigned int vprotect = 0;
+    const char *verdict, *what = access == 1 ? "WRITE" : access == 8 ? "EXEC" : "READ";
+    uintptr_t a = (uintptr_t)addr;
+    const char *where = "";
+
+    host = ios_query_host_region( (char *)addr, &hs, &he, &hprot, &hmax ) &&
+           (char *)addr >= hs && (char *)addr < he;
+    if (!pthread_mutex_trylock( &virtual_mutex ))
+    {
+        struct file_view *view = find_view( addr, 0 );
+        view_known = 1;
+        if (view)
+        {
+            have_view = 1;
+            vbase = view->base;
+            vsize = view->size;
+            vprotect = view->protect;
+            vprot = get_page_vprot( addr );
+        }
+        pthread_mutex_unlock( &virtual_mutex );
+    }
+
+    if (ios_jit_rx_base_global && a - (uintptr_t)ios_jit_rx_base_global < ios_jit_pool_size_global)
+        where = " [in the JIT pool RX span]";
+    else if (ios_jit_rw_base_global && a - (uintptr_t)ios_jit_rw_base_global < ios_jit_pool_size_global)
+        where = " [in the JIT pool RW alias]";
+    else if (ios_fex_arena_base_unix && a >= ios_fex_arena_base_unix && a < ios_fex_arena_end_unix)
+        where = " [in the FEX arena]";
+
+    if (!view_known)
+        verdict = "Wine's view not read (memory lock busy)";
+    else if (!have_view)
+        verdict = host ? "no Wine view but host-mapped (Madeira's or the host's memory, not the program's)"
+                       : "NOTHING THERE (freed or never allocated: a stale or wild pointer)";
+    else if (!(vprot & VPROT_COMMITTED))
+        verdict = "RESERVED, NEVER COMMITTED (a commit failed or was skipped: see [alloc-fail] before)";
+    else if (vprot & VPROT_GUARD)
+        verdict = "a guard page (should have been a guard-page exception)";
+    else if (access == 1 && !(vprot & (VPROT_WRITE | VPROT_WRITECOPY)))
+        verdict = (vprot & VPROT_WRITEWATCH) ? "committed, write-watched" :
+                  "READ-ONLY FOR WINDOWS TOO (the program or a DLL protected it: a real guest fault)";
+    else if (access == 1 && (!host || !(hprot & VM_PROT_WRITE)))
+        verdict = "WINE SAYS WRITABLE, HOST PAGE IS NOT (Madeira mapping/protection bug)";
+    else if (access != 1 && (!host || !(hprot & VM_PROT_READ)))
+        verdict = "WINE SAYS READABLE, HOST PAGE IS NOT (Madeira mapping/protection bug)";
+    else
+        verdict = "allowed on both sides (transient, or a fault Madeira's handler should have taken)";
+
+    /* the verdict first: Get Help's report clips a line at 220 characters */
+    snprintf( buf, len, "%s of %p: %s%s | wine %s%p+%#lx vprot=%#x protect=%#x | host %s%p-%p prot=%d/%d",
+              what, addr, verdict, where, have_view ? "view " : view_known ? "no view " : "? ",
+              vbase, (unsigned long)vsize, (unsigned)vprot, vprotect,
+              host ? "" : "unmapped, next ", hs, he, host ? hprot : 0, host ? hmax : 0 );
+}
+
 /* ml1101b: the JIT pool is ONE opaque block for this purpose.
  *
  * Measured (dsr-log-nearalloc, 29.09): with ml1101 a startup walker that
@@ -37044,8 +39369,11 @@ static unsigned int get_basic_memory_info( HANDLE process, LPCVOID addr,
             info->AllocationProtect = result.virtual_query.alloc_prot;
             info->State             = (DWORD)result.virtual_query.state << 12;
             info->Type              = (DWORD)result.virtual_query.alloc_type << 16;
-            if (info->RegionSize != result.virtual_query.size)  /* truncated */
-                return STATUS_INVALID_PARAMETER;  /* FIXME */
+#ifndef _WIN64
+            if (result.virtual_query.base >= ~granularity_mask) return STATUS_INVALID_PARAMETER;
+            if ((result.virtual_query.base + result.virtual_query.size) >> 32)  /* overflow */
+                info->RegionSize = ~granularity_mask - result.virtual_query.base;
+#endif
             if (res_len) *res_len = sizeof(*info);
         }
         return result.virtual_query.status;
@@ -37561,7 +39889,7 @@ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
             {
                 UINT64 res[2];
                 const UNICODE_STRING *name = addr;
-                NTSTATUS (*entry)(void);
+                NTSTATUS (*entry)(void) = NULL;
                 const void *funcs;
                 void *handle;
 
@@ -37792,6 +40120,8 @@ NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_p
         union apc_call call;
         union apc_result result;
 
+        if (is_old_wow64() && !zero_bits) zero_bits = ~0u;
+
         memset( &call, 0, sizeof(call) );
 
         call.map_view.type         = APC_MAP_VIEW;
@@ -37865,6 +40195,8 @@ NTSTATUS WINAPI NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID *addr
     {
         union apc_call call;
         union apc_result result;
+
+        if (is_old_wow64() && !limit_high && !*addr_ptr) limit_high = ~0u;
 
         memset( &call, 0, sizeof(call) );
 
@@ -38147,7 +40479,8 @@ NTSTATUS WINAPI NtUnmapViewOfSectionEx( HANDLE process, PVOID addr, ULONG flags 
  */
 void virtual_fill_image_information( const struct pe_image_info *pe_info, SECTION_IMAGE_INFORMATION *info )
 {
-    info->TransferAddress             = wine_server_get_ptr( pe_info->base + pe_info->entry_point );
+    client_ptr_t base = pe_info->map_addr ? pe_info->map_addr : pe_info->base;
+    info->TransferAddress             = wine_server_get_ptr( base + pe_info->entry_point );
     info->ZeroBits                    = pe_info->zerobits;
     info->MaximumStackSize            = pe_info->stack_size;
     info->CommittedStackSize          = pe_info->stack_commit;
@@ -38269,12 +40602,10 @@ static BOOL ios_ucrt_shadow_refused( HANDLE handle, const struct pe_image_info *
     static const char ucrt[] = "ucrtbase.dll";
     static int opt = -1, logged, shadow_logged;
     const char *shadow;
-    struct pe_image_info *info = NULL;
+    struct pe_mapping_info *info = NULL;
     unsigned int sec_flags;
     mem_size_t full_size;
-    HANDLE shared_file = 0;
     UNICODE_STRING nt_name;
-    ANSI_STRING exp_name;
     const WCHAR *name;
     USHORT len, i, name_off;
     BOOL ret = FALSE;
@@ -38286,10 +40617,9 @@ static BOOL ios_ucrt_shadow_refused( HANDLE handle, const struct pe_image_info *
     if (shadow && !*shadow) shadow = NULL;
     if (opt && !shadow) return FALSE;
     memset( &nt_name, 0, sizeof(nt_name) );
-    if (get_mapping_info( handle, SECTION_QUERY, &sec_flags, &full_size, &shared_file,
-                          &info, &nt_name, &exp_name )) return FALSE;
-    if (shared_file) NtClose( shared_file );
+    if (get_mapping_info( handle, SECTION_QUERY, &sec_flags, &full_size, &info )) return FALSE;
     if (!info) return FALSE;
+    nt_name = info->nt_name;
     len = nt_name.Length / sizeof(WCHAR);
     name = nt_name.Buffer;
     for (i = 0; i < len; i++)
@@ -38326,7 +40656,7 @@ static BOOL ios_ucrt_shadow_refused( HANDLE handle, const struct pe_image_info *
                         ios_path_in_windows( nt_name.Buffer, nt_name.Length / sizeof(WCHAR) )
                         ? "in the prefix's system32" : "in the program's own folder" );
     }
-    free( info );
+    free_pe_mapping_info( info );
     return ret;
 }
 
@@ -38395,12 +40725,15 @@ NTSTATUS WINAPI NtQuerySection( HANDLE handle, SECTION_INFORMATION_CLASS class, 
  *             ZwFlushVirtualMemory   (NTDLL.@)
  */
 NTSTATUS WINAPI NtFlushVirtualMemory( HANDLE process, LPCVOID *addr_ptr,
-                                      SIZE_T *size_ptr, ULONG unknown )
+                                      SIZE_T *size_ptr, IO_STATUS_BLOCK *io )
 {
     struct file_view *view;
     unsigned int status = STATUS_SUCCESS;
     sigset_t sigset;
     void *addr = ROUND_ADDR( *addr_ptr, page_mask );
+
+    if (io)
+        FIXME("Currently output io values not set.\n");
 
     if (process != NtCurrentProcess())
     {

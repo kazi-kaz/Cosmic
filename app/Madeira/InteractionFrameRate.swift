@@ -87,7 +87,7 @@ extension UITouch: LiveTouch {
 
     private func startLinkIfWanted() {
         guard link == nil, allowed else { return }
-        let panel = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.screen.maximumFramesPerSecond ?? 60
+        let panel = UIApplication.shared.phoneScenes.compactMap { $0 as? UIWindowScene }.first?.screen.maximumFramesPerSecond ?? 60
         guard panel > 60 else { return }   // a 60 Hz panel has nothing to ask for
         let top = Float(min(panel, 120))
         let l = CADisplayLink(target: self, selector: #selector(tick))

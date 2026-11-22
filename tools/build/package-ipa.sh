@@ -25,6 +25,14 @@ done
 
 python3 "$ROOT/tools/build/runtime-components.py" verify all
 
+# [gl-wow64-patch] libntdll_unix.a must carry opengl32's converted 32-bit thunks
+# (patches/wine-opengl-winios.patch, applied by build/ntdll-unix/build.sh);
+# without them every 32-bit OpenGL game crashes at start. The string is one
+# only the patched unix_wgl.c has. MADEIRA_WINE_OPENGL_PATCH=0 skips the check.
+if [[ "${MADEIRA_WINE_OPENGL_PATCH:-1}" != 0 ]]; then
+  python3 "$ROOT/tests/host/check-wine-opengl-patch.py" --lib "$ROOT/app/Madeira/libntdll_unix.a"
+fi
+
 rm -rf "$DERIVED" "$DIST/Payload"
 mkdir -p "$DIST"
 
@@ -61,6 +69,9 @@ bundle_required=(
 for path in "${bundle_required[@]}"; do
   [[ -e "$path" ]] || { echo "ERROR: required bundle resource missing: $path" >&2; exit 1; }
 done
+# The bundled ntdll must have the loader's TLS index sync (wine 694442e4); without
+# it a DLL with TLS loaded after start reads the main program's TLS block.
+python3 "$ROOT/tests/host/check-ntdll-tls-sync.py" "$APP/arm64ec-windows/ntdll.dll"
 codesign -d --entitlements :- "$APP" 2>/dev/null | grep -q 'com.apple.security.cs.allow-jit' || {
   echo "ERROR: packaged app is missing the allow-jit entitlement" >&2
   exit 1

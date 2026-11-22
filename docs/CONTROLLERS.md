@@ -223,7 +223,14 @@ record each session's choices and the sensors switching on and off.
 
 ## Player 1 as a HID controller (DualSense, DirectInput)
 
-XInput stays the default and is unchanged. A game can instead see player 1 as
+By default (`env.MADEIRA_PAD_MODE` unset, "Automatic (recommended)") each game gets the
+API it needs: a game folder with `SDL2.dll` / `SDL3.dll`, or a Godot 4 game, gets a generic
+HID gamepad (such games read pads through SDL's joystick thread and never see XInput slot 0
+connecting late); every other game gets XInput, unchanged. The `[pad-auto]` log line names
+what was picked and why. `env.MADEIRA_PAD_MODE = xinput` or `env.MADEIRA_PAD_AUTO = 0` keeps
+XInput everywhere; a game's own `env.MADEIRA_PAD_MODE` line always wins.
+
+XInput is what every other game gets and is unchanged. A game can instead see player 1 as
 what it is, a HID game controller, the way CrossOver shows a DualSense on a
 Mac: `env.MADEIRA_PAD_MODE = hid` in madeira.cfg (Settings > All settings >
 Controllers > Controller API). `dualsense` or `generic` force the identity.
@@ -381,6 +388,7 @@ user sees are opt-in (only `1` enables); the others are on unless set to `0`:
 | --- | --- | --- |
 | `MADEIRA_CONTROL_PRESETS` | on | `0`: no layout menu, no write-back |
 | `MADEIRA_CONTROLS_EDITOR_DONE` | on | `0`: the checkmark and show/hide glyph while editing |
+| `MADEIRA_TOUCH_KEY_MIN_HOLD_MS` | 60 | The shortest press (ms, 0 to 500) an on-screen key or mouse button sends, so a game that reads key state once a frame sees a quick tap; `0`: release the moment the finger lifts. A game's own config can set it |
 | `MADEIRA_CONTROLS_XBOX_DEFAULT` | **off** | `1`: a user with no controls file gets the built-in once |
 | `MADEIRA_PAD_EARLY_SLOT` | **off** | `1`: player 1 is reserved at session start (see above) |
 | `MADEIRA_PAD_MODE` | XInput | `hid` / `dualsense` / `generic`: player 1 as a HID controller (see above) |

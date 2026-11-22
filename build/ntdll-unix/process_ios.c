@@ -281,19 +281,11 @@ static unsigned int get_pe_file_info( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *n
     memset( info, 0, sizeof(*info) );
     if (!(status = get_nt_and_unix_names( attr, nt_name, unix_name, FILE_OPEN, FALSE )))
     {
-        status = open_unix_file( handle, *unix_name, GENERIC_READ, attr, 0,
+        status = open_unix_file( handle, *unix_name, GENERIC_READ | SYNCHRONIZE, attr, 0,
                                  FILE_SHARE_READ | FILE_SHARE_DELETE,
                                  FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0 );
     }
-    if (status)
-    {
-        if (is_builtin_path( attr->ObjectName, &info->machine ))
-        {
-            TRACE( "assuming %04x builtin for %s\n", info->machine, debugstr_us(attr->ObjectName));
-            return STATUS_SUCCESS;
-        }
-        return status;
-    }
+    if (status) goto done;
 
     if (!(status = NtCreateSection( &mapping, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY |
                                     SECTION_MAP_READ | SECTION_MAP_EXECUTE,
@@ -319,6 +311,13 @@ static unsigned int get_pe_file_info( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *n
             status = get_non_pe_file_info( unix_fd, info );
             if (needs_close) close( unix_fd );
         }
+    }
+
+ done:
+    if (status && is_prefix_bootstrap && is_system_dir_path( attr->ObjectName, &info->machine ))
+    {
+        TRACE( "assuming %04x builtin for %s\n", info->machine, debugstr_us(attr->ObjectName));
+        return STATUS_SUCCESS;
     }
     return status;
 }
@@ -652,6 +651,8 @@ int ios_child_slot_note_exit( void *peb, int status )
     unsigned i;
     int noted = 0;
     double now = ios_child_now();
+    char trace_name[64] = "";
+    double trace_life = 0;
     if (!peb) return 0;
     pthread_mutex_lock( &ios_child_lock );
     for (i = 0; i < IOS_CHILD_SLOTS; i++)
@@ -665,9 +666,14 @@ int ios_child_slot_note_exit( void *peb, int status )
             ios_child_ended[at].status = status;
             ios_child_slots[i].noted = 1;
             noted = 1;
+            memcpy( trace_name, ios_child_ended[at].name, sizeof(trace_name) );
+            trace_life = now - ios_child_slots[i].started;
             break;
         }
     pthread_mutex_unlock( &ios_child_lock );
+    /* Madeira (log only, launcher-restart-trace): one line per ended child, with the seconds it lived. A launcher
+     * that ends 0 after ~3 s and is started again (Fallout NV, 23-39 times a run) shows as a repeating pattern. */
+    if (noted) ERR("[child-end] %s status=0x%x lived=%.2fs\n", trace_name, (unsigned)status, trace_life);
     return noted;
 }
 
@@ -747,6 +753,138 @@ int madeira_live_user_processes( char *buf, int len )
  *   T                                                                    the text was cut: the snapshot is incomplete
  * <helper> is 1 for a crash reporter or helper by the file-name rule above; where a program lives is judged by the
  * library from its path. Returns the number of process lines. Paths go nowhere else (no log line carries them). */
+/* respawn-guard (pending-prs/respawn-guard): a program that keeps starting a new copy of
+ * itself that dies at once (Fallout: New Vegas with FalloutNV.exe in the launcher's place:
+ * 32 copies of FalloutNVLauncher.exe, each living 1.05-4.80 s, status 0, until a copy died
+ * out of memory; GET-HELP-LOGS-137). A spawn is refused (STATUS_ACCESS_DENIED, as a failed
+ * CreateProcess; logged once) only when all of these hold:
+ *  - its image is the spawning process's own image (a self-respawn);
+ *  - its command line has no "--type=" (Chromium/CEF helpers: Battle.net.exe starts 6 copies
+ *    of itself with --type= in one session, bnettest16 log 41384ecd);
+ *  - its image is not under C:\windows\ (cmd.exe, start.exe, conhost.exe and the other
+ *    system programs Wine and launchers start again and again);
+ *  - at least IOS_RESPAWN_FAST copies of that image already ENDED inside the last
+ *    IOS_RESPAWN_WINDOW seconds, each after living less than IOS_RESPAWN_SHORT seconds
+ *    (the ended ring, ios_child_slot_note_exit). Long-lived helpers never count.
+ * The app only tells the player after the session (madeira_respawn_guard_image); nothing
+ * else changes. env.MADEIRA_RESPAWN_GUARD = 0: no check (old behaviour). */
+#define IOS_RESPAWN_FAST   3
+#define IOS_RESPAWN_SHORT  6.0
+#define IOS_RESPAWN_WINDOW 60.0
+static pthread_mutex_t ios_respawn_lock = PTHREAD_MUTEX_INITIALIZER;
+static char ios_respawn_tripped[IOS_CHILD_PATH];
+static int ios_respawn_logged;
+
+/* "\??\" and "\\?\" prefixes skipped. */
+static const char *ios_respawn_path_body( const char *p )
+{
+    if ((p[0] == '\\') && (p[1] == '?' || p[1] == '\\') && p[2] == '?' && p[3] == '\\') return p + 4;
+    return p;
+}
+
+/* A system program: the path starts with C:\windows\ (any case, / or \, prefixes ignored). */
+static int ios_respawn_is_system( const char *p )
+{
+    static const char want[] = "c:\\windows\\";
+    unsigned k;
+    p = ios_respawn_path_body( p );
+    for (k = 0; k < sizeof(want) - 1; k++)
+    {
+        char c = p[k];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c == '/') c = '\\';
+        if (c != want[k]) return 0;
+    }
+    return 1;
+}
+
+/* Same Windows path, ASCII case folded, / = \, prefixes ignored. */
+static int ios_respawn_same_path( const char *a, const char *b )
+{
+    a = ios_respawn_path_body( a ); b = ios_respawn_path_body( b );
+    if (!*a) return 0;
+    for (;; a++, b++)
+    {
+        char c = *a, d = *b;
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (d >= 'A' && d <= 'Z') d += 32;
+        if (c == '/') c = '\\';
+        if (d == '/') d = '\\';
+        if (c != d) return 0;
+        if (!c) return 1;
+    }
+}
+
+static int ios_respawn_has_type_arg( const UNICODE_STRING *cmdline )
+{
+    static const char want[] = "--type=";
+    unsigned i, k, len = cmdline && cmdline->Buffer ? cmdline->Length / sizeof(WCHAR) : 0;
+
+    for (i = 0; i + sizeof(want) - 1 <= len; i++)
+    {
+        for (k = 0; k < sizeof(want) - 1 && cmdline->Buffer[i + k] == (WCHAR)want[k]; k++) ;
+        if (k == sizeof(want) - 1) return 1;
+    }
+    return 0;
+}
+
+static int ios_respawn_guard_stop( const UNICODE_STRING *image, const UNICODE_STRING *cmdline )
+{
+    const char *e = getenv( "MADEIRA_RESPAWN_GUARD" );
+    const RTL_USER_PROCESS_PARAMETERS *self = NtCurrentTeb()->Peb ? NtCurrentTeb()->Peb->ProcessParameters : NULL;
+    char path[IOS_CHILD_PATH], own[IOS_CHILD_PATH];
+    double now;
+    unsigned i, first;
+    int fast = 0, log = 0;
+
+    if (e && e[0] == '0' && !e[1]) return 0;
+    if (!image || !image->Length || !self || !self->ImagePathName.Length) return 0;
+    ios_child_path_text( path, image );
+    ios_child_path_text( own, &self->ImagePathName );
+    if (!ios_respawn_same_path( path, own )) return 0;
+    if (ios_respawn_is_system( path )) return 0;
+    if (ios_respawn_has_type_arg( cmdline )) return 0;
+    now = ios_child_now();
+    pthread_mutex_lock( &ios_child_lock );
+    first = ios_child_ended_count > IOS_CHILD_ENDED ? ios_child_ended_count - IOS_CHILD_ENDED : 0;
+    for (i = first; i < ios_child_ended_count; i++)
+    {
+        unsigned at = i % IOS_CHILD_ENDED;
+        if (now - ios_child_ended[at].ended_at > IOS_RESPAWN_WINDOW) continue;
+        if (ios_child_ended[at].ended_at - ios_child_ended[at].started >= IOS_RESPAWN_SHORT) continue;
+        if (ios_respawn_same_path( ios_child_ended[at].path, path )) fast++;
+    }
+    pthread_mutex_unlock( &ios_child_lock );
+    if (fast < IOS_RESPAWN_FAST) return 0;
+    pthread_mutex_lock( &ios_respawn_lock );
+    memcpy( ios_respawn_tripped, path, sizeof(path) );
+    if (!ios_respawn_logged) log = ios_respawn_logged = 1;
+    pthread_mutex_unlock( &ios_respawn_lock );
+    if (log) ERR( "[respawn-guard] image=%s stopped: %d copies of it ended within %.0f s of starting in the last %.0f s "
+                  "(MADEIRA_RESPAWN_GUARD=0 turns this off)\n", path, fast, IOS_RESPAWN_SHORT, IOS_RESPAWN_WINDOW );
+    return 1;
+}
+
+/* The image the guard stopped this session, "" when none. Read by the app at the session's end. */
+int madeira_respawn_guard_image( char *buf, int len )
+{
+    int n;
+    if (!buf || len <= 0) return 0;
+    pthread_mutex_lock( &ios_respawn_lock );
+    n = snprintf( buf, len, "%s", ios_respawn_tripped );
+    pthread_mutex_unlock( &ios_respawn_lock );
+    return n < 0 ? 0 : (n < len ? n : len - 1);
+}
+
+/* A new session starts with nothing counted (the app calls it as a game starts). */
+void madeira_respawn_guard_reset( void )
+{
+    pthread_mutex_lock( &ios_respawn_lock );
+    ios_respawn_tripped[0] = 0;
+    ios_respawn_logged = 0;
+    pthread_mutex_unlock( &ios_respawn_lock );
+}
+
 int madeira_child_report( char *buf, int len )
 {
     double now = ios_child_now();
@@ -926,7 +1064,17 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     args->pe_info = *pe_info;
     args->slot = ios_child_slot_take( &params->ImagePathName );
 
-    if (winedebug) putenv( winedebug );
+    /* Madeira: the child is a thread in THIS process, so putenv() would put the
+     * caller's malloc'd winedebug string itself into the app's shared environment,
+     * and create_process frees it as soon as we return: every later getenv() in
+     * the app (ImageIO, libxml2, ...) would then walk freed memory.  setenv()
+     * copies.  (Upstream does putenv in the forked child just before exec, where
+     * that is fine.) */
+    if (winedebug)
+    {
+        const char *val = strchr( winedebug, '=' );
+        if (val) setenv( "WINEDEBUG", val + 1, 1 );
+    }
 
     /* Madeira (log only): the Windows current directory the child is given. A game that looks up its data
      * relative to the current directory ended on its own "Asset could not be found" box, and no line of any
@@ -964,7 +1112,8 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     {
         if (!(pid = fork()))  /* grandchild */
         {
-            if ((peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
+            if ((peb && peb->ProcessParameters &&
+                 params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
                 params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
                 params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
                 params->ConsoleHandle == NULL)
@@ -1150,7 +1299,8 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
         {
             close( fd[0] );
 
-            if ((peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
+            if ((peb && peb->ProcessParameters &&
+                 params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
                 params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
                 params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
                 params->ConsoleHandle == NULL)
@@ -1683,6 +1833,82 @@ static int sc_browser_cmdline( const WCHAR *cl, int cl_len, int jitless, const c
 }
 #endif
 
+#ifdef WINE_IOS
+/* exe-window end-parent: a program that starts a copy of itself and keeps running.
+ *
+ * ios_exe_win_wait_for_handoff (virtual_ios.c) lets a new process whose main image has
+ * stripped relocations wait for the process holding the fixed base to exit, and the block
+ * in NtCreateUserProcess returns to that parent at once so it can exit. That covers a
+ * bootstrapper that starts its copy and quits. A GameMaker launcher does not quit at once:
+ * DELTARUNE's chapter select starts "DELTARUNE.exe -game data.win ..." in a chapter folder
+ * and keeps running its own frame loop (2026-11-04 player log: the launcher thread spun on
+ * GetCurrentThreadId/GetTickCount64 for 2+ minutes after the spawn). On Windows the two
+ * run side by side in their own address spaces; here they share one, so the chapter gave
+ * up after MADEIRA_EXE_WINDOW_WAIT_MS and failed c0000018, and the launcher sat on screen.
+ *
+ * So when the parent is still running some time after the spawn, and the child is still
+ * waiting for its base, the parent ends itself (exit code 0), on the thread that started
+ * the child, at its next server request made outside every uninterrupted section (no ntdll
+ * lock held). Ending it from another thread is not safe for the fixed-base owner (see
+ * ios_end_child_process_async in server_ios.c): only the owner's own thread can hand the
+ * image back. A parent that exits by itself within the grace time is not touched, and a
+ * child that already gave up disarms it.
+ *
+ * env.MADEIRA_EXE_WINDOW_END_PARENT_MS: grace time in ms after the spawn (default 2000);
+ * 0 never ends the parent (the behaviour before). Keep it below MADEIRA_EXE_WINDOW_WAIT_MS
+ * (default 10000), or the child gives up first. */
+volatile int ios_exewin_end_parent_armed;
+static void * volatile ios_exewin_end_parent_peb;
+static volatile DWORD ios_exewin_end_parent_tid;
+static volatile double ios_exewin_end_parent_at;
+
+static void ios_exe_win_arm_end_parent(void)
+{
+    static int grace_ms = -1;
+
+    if (grace_ms < 0)
+    {
+        /* how long a program that started a copy of itself may keep running while the copy waits
+         * for its fixed base, in milliseconds, before it is ended so the copy can start; 0 never ends it */
+        const char *e = getenv( "MADEIRA_EXE_WINDOW_END_PARENT_MS" );
+        grace_ms = e && *e ? atoi( e ) : 2000;
+        if (grace_ms < 0) grace_ms = 0;
+    }
+    if (!grace_ms) return;
+    ios_exewin_end_parent_peb = NtCurrentTeb()->Peb;
+    ios_exewin_end_parent_tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+    ios_exewin_end_parent_at = ios_child_now() + grace_ms / 1000.0;
+    __atomic_store_n( &ios_exewin_end_parent_armed, 1, __ATOMIC_RELEASE );
+    dprintf( 2, "[exe-window] end-parent armed: if this process (peb=%p tid=%04x) is still running "
+             "in %d ms while the new process waits, it ends itself so the new process gets the fixed "
+             "base (MADEIRA_EXE_WINDOW_END_PARENT_MS=0 turns this off)\n",
+             ios_exewin_end_parent_peb, (unsigned int)ios_exewin_end_parent_tid, grace_ms );
+}
+
+/* Called by wine_server_call (server_ios.c) while armed, only outside every uninterrupted
+ * section. Returns when nothing is to be done; does not return when it ends the process. */
+void ios_exe_win_end_parent_check(void)
+{
+    extern int ios_exe_win_handoff_waits_on( void *peb );
+    void *peb = NtCurrentTeb()->Peb;
+
+    if (peb != ios_exewin_end_parent_peb) return;
+    if (HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) != ios_exewin_end_parent_tid) return;
+    if (ios_child_now() < ios_exewin_end_parent_at) return;
+    if (!__atomic_exchange_n( &ios_exewin_end_parent_armed, 0, __ATOMIC_ACQ_REL )) return;
+    if (!ios_exe_win_handoff_waits_on( peb ))
+    {
+        dprintf( 2, "[exe-window] end-parent disarmed: no new process is waiting for this "
+                 "process's fixed base any more\n" );
+        return;
+    }
+    dprintf( 2, "[exe-window] end-parent: this process (peb=%p) is still running after the grace "
+             "time and its new copy is waiting for the fixed base; ending it with code 0 "
+             "(MADEIRA_EXE_WINDOW_END_PARENT_MS=0 turns this off)\n", peb );
+    NtTerminateProcess( NtCurrentProcess(), 0 );
+}
+#endif
+
 /**********************************************************************
  *           NtCreateUserProcess  (NTDLL.@)
  */
@@ -1704,7 +1930,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     ULONG startup_info_size, env_size;
     int unixdir, socketfd[2] = { -1, -1 };
     struct pe_image_info pe_info;
-    CLIENT_ID id;
+    ULONG process_id, thread_id;
     USHORT machine = 0;
     HANDLE parent = 0, debug = 0, token = 0;
     UNICODE_STRING nt_name, path = {0};
@@ -1764,6 +1990,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
 #ifdef WINE_IOS
     ERR("NtCreateUserProcess: image=%s cmdline=%s\n",
         debugstr_us( &params->ImagePathName ), madeira_debugstr_cmdline_us( &params->CommandLine ));
+    if (ios_respawn_guard_stop( &params->ImagePathName, &params->CommandLine )) return STATUS_ACCESS_DENIED;   /* respawn-guard */
 
     /* TEMP HACK (Steam S3 2026-07-10, task #29): refuse to spawn Steam's
      * minidump reporter. The reporter child hits the deep guest-exception-
@@ -1886,6 +2113,75 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                              madeira_debugstr_cmdline_us( &params->CommandLine ), appid );
                     wine_steam_run_requested( appid );
                     return STATUS_ACCESS_DENIED;
+                }
+            }
+        }
+
+        /* A game asks Windows to open a web page (ShellExecute starts winebrowser.exe <address>), for
+         * example DREDGE's Epic sign-in, https://www.epicgames.com/activate?userCode=... (Sentry
+         * GET-HELP-LOGS-133, 0.2.26): winebrowser found no browser here and ended with code 1 ("could not
+         * find a suitable app to open"), so the page was never shown. The address now also goes to the app
+         * (wine_open_link_requested, WineProcessBridge.m), which opens it in Safari. winebrowser.exe is
+         * still started exactly as before, so the game sees the same result it saw. Only http:// and
+         * https:// addresses. env.MADEIRA_OPEN_LINKS=0 does not hand the address to the app. */
+        {
+            extern void wine_open_link_requested( const char *url ) __attribute__((weak));
+            const char *ol = getenv( "MADEIRA_OPEN_LINKS" );
+            const WCHAR *cl = params->CommandLine.Buffer;
+            int cl_len = params->CommandLine.Length / sizeof(WCHAR);
+
+            const char *sb = getenv( "MADEIRA_SPAWN_BLOCK" );
+
+            if (wine_open_link_requested && cl && !(ol && ol[0] == '0' && !ol[1]) &&
+                !(sb && strcasestr( sb, "winebrowser" )) &&
+                ios_image_name_is( params->ImagePathName.Buffer, params->ImagePathName.Length / sizeof(WCHAR),
+                                   "winebrowser.exe" ))
+            {
+                static const char * const schemes[] = { "https://", "http://" };
+                char url[1024];
+                int k, j, n = 0, found = 0;
+                unsigned p;
+
+                for (p = 0; p < 2 && !found; p++)
+                {
+                    int pl = (int)strlen( schemes[p] );
+                    for (k = 0; k + pl <= cl_len && !found; k++)
+                    {
+                        if (k && cl[k - 1] != ' ' && cl[k - 1] != '\t' && cl[k - 1] != '"') continue;
+                        for (j = 0; j < pl; j++)
+                        {
+                            WCHAR c = cl[k + j];
+                            if (c >= 'A' && c <= 'Z') c += 32;
+                            if (c != (WCHAR)schemes[p][j]) break;
+                        }
+                        if (j < pl) continue;
+                        /* the address ends at a quote, a blank or the end; any character outside printable
+                         * ASCII ends the search for this one (the app would not open it anyway) */
+                        for (n = 0, j = k; j < cl_len && n < (int)sizeof(url) - 1; j++, n++)
+                        {
+                            if (cl[j] <= ' ' || cl[j] > '~' || cl[j] == '"') break;
+                            url[n] = (char)cl[j];
+                        }
+                        url[n] = 0;
+                        found = n > pl && (j == cl_len || cl[j] <= ' ' || cl[j] == '"');
+                    }
+                }
+                if (found)
+                {
+                    char shown[96];
+                    int q = 0;
+
+                    /* the log keeps only the host and path: a sign-in code after '?' stays out of it */
+                    while (url[q] && url[q] != '?' && url[q] != '#' && q < (int)sizeof(shown) - 1)
+                    {
+                        shown[q] = url[q];
+                        q++;
+                    }
+                    shown[q] = 0;
+                    dprintf( 2, "[open-link] winebrowser.exe asks to open %s (%d characters): handed to the app, "
+                             "which opens it in Safari (env.MADEIRA_OPEN_LINKS=0 does not hand it over)\n",
+                             shown, n );
+                    wine_open_link_requested( url );
                 }
             }
         }
@@ -2686,7 +2982,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         goto done;
     env_size = get_env_size( params, &winedebug );
 
-    if ((status = alloc_object_attributes( process_attr, &objattr, &attr_len ))) goto done;
+    if ((status = wine_server_alloc_object_attributes( process_attr, &objattr, &attr_len ))) goto done;
 
     if ((status = alloc_handle_list( handles_attr, &handles, &handles_size )))
     {
@@ -2743,7 +3039,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         if (!(status = wine_server_call( req )))
         {
             process_handle = wine_server_ptr_handle( reply->handle );
-            id.UniqueProcess = ULongToHandle( reply->pid );
+            process_id     = reply->pid;
         }
         process_info = wine_server_ptr_handle( reply->info );
     }
@@ -2768,7 +3064,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         goto done;
     }
 
-    if ((status = alloc_object_attributes( thread_attr, &objattr, &attr_len ))) goto done;
+    if ((status = wine_server_alloc_object_attributes( thread_attr, &objattr, &attr_len ))) goto done;
 
     SERVER_START_REQ( new_thread )
     {
@@ -2780,7 +3076,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         if (!(status = wine_server_call( req )))
         {
             thread_handle = wine_server_ptr_handle( reply->handle );
-            id.UniqueThread = ULongToHandle( reply->tid );
+            thread_id     = reply->tid;
         }
     }
     SERVER_END_REQ;
@@ -2822,6 +3118,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                      "returning from process creation without waiting for its start-up\n" );
             success = TRUE;
             status = STATUS_SUCCESS;
+            ios_exe_win_arm_end_parent();
         }
         else
         {
@@ -2854,8 +3151,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     }
 
     TRACE( "%s pid %04x tid %04x handles %p/%p\n", debugstr_us(&path),
-           HandleToULong(id.UniqueProcess), HandleToULong(id.UniqueThread),
-           process_handle, thread_handle );
+           process_id, thread_id, process_handle, thread_handle );
 
     /* update output attributes */
 
@@ -2865,6 +3161,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         {
         case PS_ATTRIBUTE_CLIENT_ID:
         {
+            CLIENT_ID id = make_client_id( process_id, thread_id );
             SIZE_T size = min( ps_attr->Attributes[i].Size, sizeof(id) );
             memcpy( ps_attr->Attributes[i].ValuePtr, &id, size );
             if (ps_attr->Attributes[i].ReturnLength) *ps_attr->Attributes[i].ReturnLength = size;
@@ -4085,17 +4382,20 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
         req->exit_code = exit_code;
         ret = wine_server_call( req );
         self = reply->self;
+        exit_code = reply->exit_code;
     }
     SERVER_END_REQ;
     if (self)
     {
 #ifdef WINE_IOS
-        if (!handle) *exiting_flag = TRUE;
-        else if (*exiting_flag) exit_process( exit_code );
+        /* Wine 11.22 order: a process already marked exiting exits with the code the
+         * server recorded, whatever handle this call used. */
+        if (*exiting_flag) exit_process( exit_code );
+        else if (!handle) *exiting_flag = TRUE;
         else abort_process( exit_code );
 #else
-        if (!handle) process_exiting = TRUE;
-        else if (process_exiting) exit_process( exit_code );
+        if (process_exiting) exit_process( exit_code );
+        else if (!handle) process_exiting = TRUE;
         else abort_process( exit_code );
 #endif
     }

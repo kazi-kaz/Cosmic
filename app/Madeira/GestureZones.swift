@@ -197,8 +197,9 @@ final class GestureZoneView: UIView {
     // ---- look ----
 
     private func look(_ f: inout Finger, _ p: CGPoint) {
-        carryX += Double(p.x - f.last.x) * 2 * zone.sensitivity
-        carryY += Double(p.y - f.last.y) * 2 * zone.sensitivity
+        let tuning = MouseTuning.current
+        carryX += Double(p.x - f.last.x) * 2 * zone.sensitivity * tuning.speed
+        carryY += Double(p.y - f.last.y) * 2 * zone.sensitivity * tuning.speed * tuning.yFactor
         let dx = carryX.rounded(.towardZero), dy = carryY.rounded(.towardZero)
         carryX -= dx; carryY -= dy
         if dx != 0 || dy != 0 { HardwareInput.shared.postRelative(Int32(dx), Int32(dy)) }
@@ -239,12 +240,16 @@ final class GestureZoneView: UIView {
         case .key(let vk):
             winios_post_key(vk, 1)
             DispatchQueue.main.asyncAfter(deadline: .now() + hold) { winios_post_key(vk, 0) }
-        case .mouseLeft:
-            winios_pointer(0, 0, 0x0002, 0)
-            DispatchQueue.main.asyncAfter(deadline: .now() + hold) { winios_pointer(0, 0, 0x0004, 0) }
-        case .mouseRight:
-            winios_pointer(0, 0, 0x0008, 0)
-            DispatchQueue.main.asyncAfter(deadline: .now() + hold) { winios_pointer(0, 0, 0x0010, 0) }
+        case .mouseLeft, .mouseRight:
+            let tuning = MouseTuning.current
+            let down = tuning.swapped(action == .mouseLeft ? 0x0002 : 0x0008), up = tuning.swapped(action == .mouseLeft ? 0x0004 : 0x0010)
+            winios_pointer(0, 0, down, 0)
+            DispatchQueue.main.asyncAfter(deadline: .now() + hold) { winios_pointer(0, 0, up, 0) }
+        case .mouseMiddle:
+            winios_pointer(0, 0, 0x0020, 0)
+            DispatchQueue.main.asyncAfter(deadline: .now() + hold) { winios_pointer(0, 0, 0x0040, 0) }
+        case .scrollUp, .scrollDown:
+            winios_pointer(0, 0, 0x0800, action.wheelDelta)
         case .keyboardToggle:
             MetalBackedView.toggleKeyboard()
         case .none, .joystickWASD, .joystickArrows:
@@ -366,7 +371,8 @@ struct GestureZonePanel: View {
         .pad("A"), .pad("B"), .pad("X"), .pad("Y"), .pad("LB"), .pad("RB"), .pad("LT"), .pad("RT"),
         .pad("L3"), .pad("R3"), .pad("Menu"), .pad("View"),
         .key(0x26), .key(0x28), .key(0x25), .key(0x27), .key(0x20), .key(0x0D), .key(0x1B), .key(0x09),
-        .key(0x10), .key(0x45), .key(0x51), .key(0x46), .mouseLeft, .mouseRight]
+        .key(0x10), .key(0x45), .key(0x51), .key(0x46), .mouseLeft, .mouseRight,
+        .mouseMiddle, .scrollUp, .scrollDown]
 
     static func name(_ a: ControlAction) -> String {
         switch a {
@@ -388,14 +394,17 @@ struct GestureZonePanel: View {
                 Button {
                     if let i { z.zones[i].locked = zone.locked == true ? nil : true }
                 } label: { Image(systemName: zone.locked == true ? "lock.fill" : "lock.open") }
+                .iconLabel(zone.locked == true ? "Unlock zone" : "Lock zone")
                 // A locked zone has no delete button.
                 if zone.locked != true {
                     Button(role: .destructive) {
                         if let i { z.zones.remove(at: i) }
                         z.selected = nil
                     } label: { Image(systemName: "trash") }
+                    .iconLabel("Delete zone")
                 }
                 Button { z.selected = nil } label: { Image(systemName: "xmark") }
+                .iconLabel("Close")
             }
             Picker("Kind", selection: binding(\.kind)) {
                 ForEach(GestureZoneKind.allCases, id: \.self) { Text($0.title) }
@@ -427,15 +436,25 @@ struct GestureZonePanel: View {
         .background(GlassShape())
         .clipShape(RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.18), lineWidth: 1))
+        // Panel gaps must not dismiss the selection beneath them: the editor's
+        // dismissal area leaves the panel's column out (GestureZonePanel.column).
         .contentShape(Rectangle())
-        .onTapGesture { } // Panel gaps must not dismiss the selection beneath them.
         .position(x: panelX, y: screen.height / 2)
     }
 
     /// The side of the screen the zone covers less of.
-    private var panelX: CGFloat {
+    private var panelX: CGFloat { Self.centerX(zone: zone, screen: screen) }
+
+    private static func centerX(zone: GestureZone, screen: CGSize) -> CGFloat {
         let half = min(340, screen.width - 32) / 2 + 16
         return zone.x + zone.w / 2 < 0.5 ? screen.width - half : half
+    }
+
+    /// The full-height column the panel is centred in (its height follows its
+    /// content), with a little slop, for the editor's dismissal area.
+    static func column(zone: GestureZone, screen: CGSize) -> CGRect {
+        let w = min(340, screen.width - 32) + 8
+        return CGRect(x: centerX(zone: zone, screen: screen) - w / 2, y: 0, width: w, height: screen.height)
     }
 
     private var directionsShown: [String] {

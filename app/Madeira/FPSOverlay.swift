@@ -13,7 +13,7 @@ import QuartzCore
 /// MAX and RAW, where the game is meant to run above 60, and for the 40 cap,
 /// whose 25ms spacing needs the 120Hz grid (at 60Hz it would land on 33.3ms).
 ///
-/// Opt-in `env.MADEIRA_PROMOTE = 1` (Settings > Display > Hold the display
+/// Opt-in `env.MADEIRA_PROMOTE = 1` (Settings > Display and Graphics > Hold the display
 /// at its maximum rate) also arms it in the 60 cap. The panel rate is the
 /// grid a present snaps to: the 60 cap is a minimum spacing between
 /// presentations (afterMinimumDuration), and a drawable becomes visible at
@@ -169,8 +169,8 @@ final class ProMotionIntent {
 
     private func kick() {
         if kickLayer == nil {
-            guard let window = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
-                .flatMap({ $0.windows }).first(where: { $0.isKeyWindow }) ?? UIApplication.shared.connectedScenes
+            guard let window = UIApplication.shared.phoneScenes.compactMap({ $0 as? UIWindowScene })
+                .flatMap({ $0.windows }).first(where: { $0.isKeyWindow }) ?? UIApplication.shared.phoneScenes
                 .compactMap({ $0 as? UIWindowScene }).flatMap({ $0.windows }).first else { return }
             let l = CALayer()
             l.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
