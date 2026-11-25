@@ -2815,9 +2815,22 @@ struct ContentView: View {
     /// (EpicLibrary.launchArguments), for this launch only. An EA game first gets its
     /// licence, the EA app's environment and Madeira's stand-in for the EA app's local
     /// service (EALibrary.prepareLaunch); every other launch starts without that environment.
-    private func startLibraryEntry(_ entry: LibraryEntry, epicReady: Bool = false, eaReady: Bool = false) {
+    private func startLibraryEntry(_ entry: LibraryEntry, epicReady: Bool = false, eaReady: Bool = false, saveSyncReady: Bool = false) {
         guard !EpicCloud.shared.isBusy else {
             library.error = "Wait for Epic Cloud save sync to finish before starting a game."
+            return
+        }
+        // Save sync (WebDAVSaveSync.swift): newer saves from the user's server arrive before the game starts.
+        // A server that cannot be reached never stops the launch.
+        if !saveSyncReady, SaveSync.shared.enabled {
+            guard !SaveSync.shared.busy else {
+                library.error = "Wait for save sync to finish before starting a game."
+                return
+            }
+            Task { @MainActor in
+                await SaveSync.shared.beforeLaunch()
+                startLibraryEntry(entry, epicReady: epicReady, eaReady: eaReady, saveSyncReady: true)
+            }
             return
         }
         if entry.eaOfferID == nil { EALibrary.clearEnvironment() }
@@ -2825,7 +2838,7 @@ struct ContentView: View {
             Task { @MainActor in
                 do {
                     try await EALibrary.shared.prepareLaunch(entry)
-                    startLibraryEntry(entry, epicReady: epicReady, eaReady: true)
+                    startLibraryEntry(entry, epicReady: epicReady, eaReady: true, saveSyncReady: true)
                 } catch {
                     LogStore.shared.log("[ea-launch] offer=\(offer) not started: \(error.localizedDescription)", level: .error)
                     library.error = "This EA game could not be prepared: \(error.localizedDescription)"
@@ -2838,7 +2851,7 @@ struct ContentView: View {
                 do {
                     let arguments = try await EpicLibrary.shared.launchArguments(appName: app)
                     LibraryEntry.setTransientArguments(arguments, for: entry.id)
-                    startLibraryEntry(entry, epicReady: true)
+                    startLibraryEntry(entry, epicReady: true, saveSyncReady: true)
                 } catch {
                     LogStore.shared.log("[epic-launch] app=\(app) not started: no sign-in arguments", level: .error)
                     library.error = "This Epic game could not get its sign-in from Epic: \(error.localizedDescription)"

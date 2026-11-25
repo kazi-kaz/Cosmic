@@ -2280,6 +2280,8 @@ final class LibraryModel: ObservableObject {
         if Thread.isMainThread { MainActor.assumeIsolated { LogTrail.backInLibrary() } }
         else { DispatchQueue.main.async { MainActor.assumeIsolated { LogTrail.backInLibrary() } } }
         LogSummary.writeLater(from: LogStore.shared.logURL, source: "madeira-log.txt (this session)")
+        // Save sync (WebDAVSaveSync.swift): what this session changed goes to the user's server.
+        Task { @MainActor in await SaveSync.shared.afterSession() }
     }
 }
 
