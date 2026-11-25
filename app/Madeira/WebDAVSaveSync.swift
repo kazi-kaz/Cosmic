@@ -182,7 +182,7 @@ enum SaveSyncError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notConfigured: return "Enter the server address first."
-        case .notHTTPS: return "The server address must start with https:// (iOS blocks plain http). Tailscale Serve gives your server one."
+        case .notHTTPS: return "Use https://, or http:// with a home-network address (192.168.x.x, a .local name). iOS blocks other plain http."
         case .http(401, _), .http(403, _): return "The server refused the user name or password."
         case .http(404, let what): return "The server has no \(what). Check the address."
         case .http(let code, let what): return "The server answered \(code) for \(what)."
@@ -200,7 +200,10 @@ struct WebDAVClient {
         let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return nil }
         guard let url = URL(string: trimmed), url.host != nil else { throw SaveSyncError.notConfigured }
-        guard url.scheme?.lowercased() == "https" else { throw SaveSyncError.notHTTPS }
+        // iOS refuses plain http except to the local network (Info.plist: NSAllowsLocalNetworking), which
+        // is what lets a server at home be used while LocalDevVPN holds the one VPN slot (no Tailscale).
+        let scheme = url.scheme?.lowercased()
+        guard scheme == "https" || (scheme == "http" && Self.isLocalHost(url.host ?? "")) else { throw SaveSyncError.notHTTPS }
         base = trimmed.hasSuffix("/") ? String(trimmed.dropLast()) : trimmed
         authorization = user.isEmpty ? nil
             : "Basic " + Data("\(user):\(password)".utf8).base64EncodedString()
@@ -208,6 +211,16 @@ struct WebDAVClient {
         configuration.timeoutIntervalForRequest = 20
         configuration.timeoutIntervalForResource = 600
         session = URLSession(configuration: configuration)
+    }
+
+    /// What NSAllowsLocalNetworking covers: private IPv4 addresses, .local names and one-word names.
+    static func isLocalHost(_ host: String) -> Bool {
+        let h = host.lowercased()
+        if h.hasSuffix(".local") || !h.contains(".") { return true }
+        let n = h.split(separator: ".").compactMap { Int($0) }
+        guard n.count == 4, h.split(separator: ".").count == 4 else { return false }
+        return n[0] == 10 || (n[0] == 172 && (16...31).contains(n[1])) || (n[0] == 192 && n[1] == 168)
+            || (n[0] == 169 && n[1] == 254)
     }
 
     private func request(_ path: String, _ method: String, _ headers: [String: String] = [:]) throws -> URLRequest {
@@ -478,7 +491,7 @@ struct SaveSyncSection: View {
     var body: some View {
         Section {
             Toggle("Sync saves with my server", isOn: $sync.enabled)
-            TextField("https://server.tailnet.ts.net/saves", text: $sync.address)
+            TextField("http://192.168.1.x:8090", text: $sync.address)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .keyboardType(.URL)

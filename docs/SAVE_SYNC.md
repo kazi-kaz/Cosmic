@@ -17,11 +17,17 @@ WebDAV server you run. Steam games keep using Steam Cloud. Code: `app/Madeira/We
   (and a local copy goes to Files › Cosmic › Save Sync Conflicts).
 * A file deleted on one device comes back at the next sync: deletes are not synced.
 * Both devices must use the same Windows user name in the prefix (the paths include it).
-* The address must be `https://`: the app has no App Transport Security exception for plain http.
+* JIT needs LocalDevVPN, and iOS allows one VPN at a time, so Tailscale cannot be on while you play.
+  LocalDevVPN only loops back to the device, so Wi-Fi and the home network keep working. At home,
+  use the server's home-network address. Away from home the sync fails quietly and the game starts
+  anyway; it catches up the next time you play at home (or Sync now with Tailscale on and LocalDevVPN off).
+* The address may be `http://` only for a home-network address (192.168.x.x, 10.x, a `.local` or
+  one-word name): Info.plist has `NSAllowsLocalNetworking` and nothing broader. Anything else must be
+  `https://`. Plain http sends the password unencrypted, which on your own Wi-Fi is the usual trade.
 
 ## Server
 
-Needs: WebDAV on a folder, behind HTTPS. A sketch with rclone and Tailscale Serve:
+Needs: a WebDAV server on a folder, reachable from the home network. With rclone in Docker:
 
 ```yaml
 # docker-compose.yml
@@ -30,21 +36,21 @@ services:
     image: rclone/rclone:latest
     restart: unless-stopped
     command: serve webdav /data --addr :8090 --user cosmic --pass CHANGE_ME
-    ports: ["127.0.0.1:8090:8090"]
+    ports: ["8090:8090"]
     volumes: ["/srv/cosmic-saves:/data"]
 ```
 
 ```sh
 mkdir -p /srv/cosmic-saves && docker compose up -d
-# HTTPS needs "HTTPS Certificates" turned on in the Tailscale admin console (DNS page).
-tailscale serve --bg --https=8443 http://127.0.0.1:8090
-tailscale serve status        # shows https://<host>.<tailnet>.ts.net:8443
+curl -u cosmic:CHANGE_ME -X MKCOL http://localhost:8090/blobs/   # optional check
 ```
 
-In Cosmic: address `https://<host>.<tailnet>.ts.net:8443`, user `cosmic`, the password from the
-compose file. Both devices need the Tailscale app connected. Any WebDAV server works (Apache
-`mod_dav` honours If-Match on the manifest; the rclone server may not, which only matters if two
-devices finish a sync at the same second).
+In Cosmic: address `http://<server LAN IP>:8090` (give the server a fixed address or DHCP
+reservation in your router), user `cosmic`, the password from the file. The first iOS "local network"
+prompt must be allowed. For use away from home, put it behind your own HTTPS (a Cloudflare Tunnel
+or a reverse proxy) and use that `https://` address instead; use a long password.
+The rclone server may ignore If-Match on the manifest, which only matters if two devices finish
+a sync at the same second; Apache `mod_dav` honours it.
 
 ## Pruning old versions
 
