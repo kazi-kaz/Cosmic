@@ -5,13 +5,21 @@ WebDAV server you run. Steam games keep using Steam Cloud. Code: `app/Madeira/We
 
 ## How it works
 
-* Play first compares this device with the server and fetches whatever is newer. When the game
-  ends, what changed is sent. Settings › Saves › Save sync has a Sync now button too.
-* What is synced is what Settings › Saves › Back up saves covers: every Windows user's
-  Documents, Saved Games and AppData under `C:\users` (caches left out), files up to 64 MB. The
-  registry and the rest of the Wine prefix are never synced.
-* The server keeps `manifest.json` and `blobs/<sha256>`. Blobs are never overwritten or deleted by
-  the app, so every earlier version of a save is still on the server until you prune it.
+* Cosmic finds a game's save files by watching what it changes: it scans the save folders (the ones
+  Settings › Saves › Back up saves covers: Documents, Saved Games and AppData under `C:\users`,
+  caches left out) before a game starts and again when it ends. The files that changed are that
+  game's. The list is kept per game, here and on the server, so a second device that has never run
+  the game knows what to fetch. A game is therefore synced from its first session on.
+* Play first brings the game's files up to date from the server. When the game ends, what changed
+  is sent. Settings › Saves › Save sync has a Sync now button for every game this device knows.
+* Two switches: the global one (Settings › Saves) and one per game (Game details › Save sync, shown
+  for games that are not Steam games). Steam games keep using Steam Cloud and are never synced.
+* A game that rewrites a settings or log file on every run adds that file to its list. It is
+  harmless, only a few extra kilobytes.
+* Files over 64 MB are skipped. The registry and the rest of the Wine prefix are never synced.
+* The server keeps `manifest.json` (every synced file, and each game's file list) and
+  `blobs/<sha256>`. Blobs are never overwritten or deleted by the app, so every earlier version of a
+  save is still on the server until you prune it.
 * Each file is compared three ways (this device, the server, and what both agreed on last time).
   One side changed: it wins. Both changed: the newer file wins, the older stays on the server
   (and a local copy goes to Files › Cosmic › Save Sync Conflicts).

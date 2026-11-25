@@ -2828,7 +2828,7 @@ struct ContentView: View {
                 return
             }
             Task { @MainActor in
-                await SaveSync.shared.beforeLaunch()
+                await SaveSync.shared.beforeLaunch(entry)
                 startLibraryEntry(entry, epicReady: epicReady, eaReady: eaReady, saveSyncReady: true)
             }
             return

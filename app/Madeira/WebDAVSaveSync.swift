@@ -6,19 +6,22 @@
 // on, Play first brings this device up to date with the server and, when the game ends, sends what
 // changed back: the Steam Cloud behaviour, for every game that is not a Steam one.
 //
-// What is synced is the same set of folders as Settings > Saves > Back up saves (SaveBackup.roots and
-// .skipped). Nothing outside C:\users is touched, so the registry and the rest of the prefix are
-// never synced.
+// Which files? Cosmic does not need a database of save locations: it scans the save folders (the same
+// ones as Settings > Saves > Back up saves: SaveBackup.roots and .skipped) before a game starts and
+// again when it ends, and the files that changed belong to that game. That list is remembered per game
+// and kept on the server too, so a second device that has never run the game knows what to fetch.
+// Only a game's own files are synced, and only while its "Sync this game's saves" switch (Game details)
+// and the global one (Settings > Saves) are on. Nothing outside C:\users is touched, so the registry
+// and the rest of the prefix are never synced. Steam games are left to Steam Cloud.
 //
 // The server holds two things under the URL you give:
-//   manifest.json   path -> sha256, size, modified time, for every synced file
+//   manifest.json   path -> sha256, size, modified time for every synced file, and each game's file list
 //   blobs/<sha256>  the file contents, named by their hash
 // Blobs are never overwritten or removed by the app, so an older save is always still on the server
-// until you clean it up there. A file is compared three ways: this device now, the server now, and
-// what both agreed on at the last sync (the baseline). Only one side changed: that side wins. Both
-// changed: the newer file wins and the other is kept (a local copy goes to Documents/Save Sync
-// Conflicts, which the Files app shows under Cosmic). Deleting a file is never synced: the next pass
-// brings it back from the server.
+// until you clear it there. A file is compared three ways: this device now, the server now, and what
+// both agreed on at the last sync (the baseline). Only one side changed: that side wins. Both changed:
+// the newer file wins and the other is kept (a local copy goes to Documents/Save Sync Conflicts, which
+// the Files app shows under Cosmic). Deleting a file is never synced: the next pass brings it back.
 
 import Foundation
 import SwiftUI
@@ -34,9 +37,27 @@ struct SaveSyncEntry: Codable, Equatable {
     var mtime: Double       // seconds since 1970
 }
 
+struct SaveSyncGameRecord: Codable, Equatable {
+    var title: String
+    var files: [String]
+}
+
 struct SaveSyncManifest: Codable, Equatable {
-    var version = 1
+    var version = 2
     var files: [String: SaveSyncEntry] = [:]
+    var games: [String: SaveSyncGameRecord] = [:]
+
+    init(files: [String: SaveSyncEntry] = [:], games: [String: SaveSyncGameRecord] = [:]) {
+        self.files = files
+        self.games = games
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 2
+        files = try c.decodeIfPresent([String: SaveSyncEntry].self, forKey: .files) ?? [:]
+        games = try c.decodeIfPresent([String: SaveSyncGameRecord].self, forKey: .games) ?? [:]
+    }
 }
 
 enum SaveSyncAction: Equatable {
@@ -81,6 +102,42 @@ struct SaveSyncCache: Codable, Equatable {
 struct SaveSyncState: Codable {
     var baseline: [String: String] = [:]
     var cache: [String: SaveSyncCache] = [:]
+    /// Game key -> the files that game has changed on this device (or the server said it has).
+    var games: [String: [String]] = [:]
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        baseline = try c.decodeIfPresent([String: String].self, forKey: .baseline) ?? [:]
+        cache = try c.decodeIfPresent([String: SaveSyncCache].self, forKey: .cache) ?? [:]
+        games = try c.decodeIfPresent([String: [String]].self, forKey: .games) ?? [:]
+    }
+}
+
+/// Which game a file list belongs to, the same on every device, and the per-game switch.
+enum SaveSyncGames {
+    private static let offKey = "madeira.saveSync.offGames"
+
+    static func key(for entry: LibraryEntry) -> String {
+        if let id = entry.gogProductID, !id.isEmpty { return "gog:" + id }
+        if let app = entry.epicAppName, !app.isEmpty { return "epic:" + app }
+        let words = entry.title.lowercased().split(whereSeparator: { $0.isWhitespace })
+        return "title:" + words.joined(separator: " ")
+    }
+
+    /// Steam games keep Steam Cloud, and a Steam launch through Madeira Dock never runs this.
+    static func isSynced(_ entry: LibraryEntry) -> Bool { entry.steamAppID == nil }
+
+    static func enabled(_ key: String) -> Bool {
+        !(UserDefaults.standard.stringArray(forKey: offKey) ?? []).contains(key)
+    }
+
+    static func setEnabled(_ on: Bool, key: String) {
+        var off = Set(UserDefaults.standard.stringArray(forKey: offKey) ?? [])
+        if on { off.remove(key) } else { off.insert(key) }
+        UserDefaults.standard.set(off.sorted(), forKey: offKey)
+    }
 }
 
 enum SaveSyncLocal {
@@ -138,6 +195,9 @@ enum SaveSyncLocal {
         }
         return (files, fresh, tooLarge)
     }
+
+    /// Path -> hash, for comparing two scans of the same device.
+    static func shas(_ files: [String: SaveSyncEntry]) -> [String: String] { files.mapValues { $0.sha } }
 
     /// The same checks as SaveBackup.restore: only users/<name>/..., nothing that climbs out of drive_c.
     static func safeURL(drive: URL, key: String) -> URL? {
@@ -335,6 +395,12 @@ private enum SaveSyncKeychain {
     @Published var password: String { didSet { SaveSyncKeychain.set(password) } }
     @Published private(set) var status = "Not synced yet."
     @Published private(set) var busy = false
+    /// Game key -> how many files that game is known to keep (for Game details).
+    @Published private(set) var tracked: [String: Int] = [:]
+
+    private var state = SaveSyncState()
+    /// The game that is running: its key and what the save folders held when it started.
+    private var running: (key: String, before: [String: String])?
 
     private init() {
         let d = UserDefaults.standard
@@ -342,45 +408,73 @@ private enum SaveSyncKeychain {
         address = d.string(forKey: Key.address) ?? ""
         user = d.string(forKey: Key.user) ?? ""
         password = SaveSyncKeychain.get() ?? ""
+        if let data = try? Data(contentsOf: Self.stateURL), let saved = try? JSONDecoder().decode(SaveSyncState.self, from: data) {
+            state = saved
+        }
+        tracked = state.games.mapValues { $0.count }
     }
 
     private func log(_ text: String, level: LogStore.LogEntry.Level = .info) { LogStore.shared.log("[save-sync] " + text, level: level) }
 
-    // What is remembered between runs.
     private static var stateURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("save-sync-state.json")
     }
-    private func loadState() -> SaveSyncState {
-        guard let data = try? Data(contentsOf: Self.stateURL),
-              let state = try? JSONDecoder().decode(SaveSyncState.self, from: data) else { return SaveSyncState() }
-        return state
-    }
-    private func saveState(_ state: SaveSyncState) {
+    private func saveState() {
+        tracked = state.games.mapValues { $0.count }
         guard let data = try? JSONEncoder().encode(state) else { return }
         try? FileManager.default.createDirectory(at: Self.stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? data.write(to: Self.stateURL, options: .atomic)
     }
 
+    private struct GameScope {
+        var key: String
+        var title: String
+    }
+
+    private func scanNow() async -> (files: [String: SaveSyncEntry], tooLarge: Int) {
+        let drive = LibraryModel.drive
+        let cache = state.cache
+        let scan = await Task.detached(priority: .utility) { SaveSyncLocal.scan(drive: drive, cache: cache) }.value
+        state.cache = scan.cache
+        return (scan.files, scan.tooLarge)
+    }
+
     // MARK: entry points
 
-    /// Settings > Saves > Sync now.
-    func syncNow() async { await perform("manual") }
+    /// Settings > Saves > Sync now: every game this device knows files for, with its switch on.
+    func syncNow() async { await perform("manual", game: nil) }
 
-    /// Play, before the game starts: the server's newer saves arrive first. A server that cannot be
-    /// reached costs one request timeout, and the game starts anyway.
-    func beforeLaunch() async {
-        guard enabled else { return }
-        await perform("before launch")
+    /// Play, before the game starts: remember what the save folders hold, then bring this game's files up
+    /// to date from the server. A server that cannot be reached costs one request timeout, and the game
+    /// starts anyway.
+    func beforeLaunch(_ entry: LibraryEntry) async {
+        guard enabled, SaveSyncGames.isSynced(entry) else { return }
+        let key = SaveSyncGames.key(for: entry)
+        guard SaveSyncGames.enabled(key) else { running = nil; return }
+        let scan = await scanNow()
+        running = (key, SaveSyncLocal.shas(scan.files))
+        await perform("before launch", game: GameScope(key: key, title: entry.title))
     }
 
-    /// The game has ended: send what changed.
-    func afterSession() async {
-        guard enabled else { return }
-        await perform("after session")
+    /// The game has ended: whatever changed in the save folders is this game's. Remember that, then send it.
+    func afterSession(_ entry: LibraryEntry) async {
+        guard enabled, SaveSyncGames.isSynced(entry) else { return }
+        let key = SaveSyncGames.key(for: entry)
+        guard SaveSyncGames.enabled(key), let before = running?.before, running?.key == key else { return }
+        running = nil
+        let scan = await scanNow()
+        let after = SaveSyncLocal.shas(scan.files)
+        let changed = after.filter { before[$0.key] != $0.value }.map { $0.key }
+        if !changed.isEmpty {
+            state.games[key] = Set(state.games[key] ?? []).union(changed).sorted()
+            saveState()   // kept even when the server cannot be reached below
+            log("\(entry.title): \(changed.count) files changed in the session")
+        }
+        await perform("after session", game: GameScope(key: key, title: entry.title))
     }
 
-    private func perform(_ reason: String) async {
+    private func perform(_ reason: String, game: GameScope?) async {
         guard !busy else { return }
         busy = true
         let background = UIApplication.shared.beginBackgroundTask(withName: "save-sync") {}
@@ -389,7 +483,7 @@ private enum SaveSyncKeychain {
             if background != .invalid { UIApplication.shared.endBackgroundTask(background) }
         }
         do {
-            let summary = try await runPass()
+            let summary = try await runPass(game: game)
             status = summary + " " + DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
             log("\(reason): \(summary)")
         } catch {
@@ -400,27 +494,48 @@ private enum SaveSyncKeychain {
 
     // MARK: one pass
 
-    private func runPass() async throws -> String {
+    private func runPass(game: GameScope?) async throws -> String {
         guard let client = try WebDAVClient(address: address, user: user, password: password) else {
             throw SaveSyncError.notConfigured
         }
         let drive = LibraryModel.drive
-        var state = loadState()
         let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
         var attempt = 0
         while true {
             attempt += 1
-            let cache = state.cache
-            let scan = await Task.detached(priority: .utility) { SaveSyncLocal.scan(drive: drive, cache: cache) }.value
-            state.cache = scan.cache
+            let scan = await scanNow()
             let (manifest, etag) = try await client.manifest()
             if manifest == nil { await client.ensureFolders() }
             let remote = manifest?.files ?? [:]
-            let actions = SaveSyncPlan.decide(local: scan.files, remote: remote, baseline: state.baseline)
+
+            // The files in play: each game's list here joined with the server's list for it.
+            let keys = game.map { [$0.key] } ?? state.games.keys.filter { SaveSyncGames.enabled($0) }.sorted()
+            var newGames = manifest?.games ?? [:]
+            var scope = Set<String>()
+            var listsChanged = false
+            for key in keys {
+                let joined = Set(state.games[key] ?? []).union(newGames[key]?.files ?? [])
+                    .filter { SaveSyncLocal.safeURL(drive: drive, key: $0) != nil }
+                guard !joined.isEmpty else { continue }
+                state.games[key] = joined.sorted()
+                if Set(newGames[key]?.files ?? []) != joined {
+                    newGames[key] = SaveSyncGameRecord(title: game?.title ?? newGames[key]?.title ?? key, files: joined.sorted())
+                    listsChanged = true
+                }
+                scope.formUnion(joined)
+            }
+            if scope.isEmpty {
+                saveState()
+                return game == nil ? "No games to sync yet." : "No saves tracked for this game yet; they are found after its first session."
+            }
+
+            let localScoped = scan.files.filter { scope.contains($0.key) }
+            let remoteScoped = remote.filter { scope.contains($0.key) }
+            let actions = SaveSyncPlan.decide(local: localScoped, remote: remoteScoped, baseline: state.baseline)
 
             var newRemote = remote
             var baseline = state.baseline
-            for (path, entry) in scan.files where remote[path]?.sha == entry.sha { baseline[path] = entry.sha }
+            for (path, entry) in localScoped where remote[path]?.sha == entry.sha { baseline[path] = entry.sha }
             var uploaded = 0, downloaded = 0, conflicts = 0, failed = 0
 
             for action in actions {
@@ -456,22 +571,22 @@ private enum SaveSyncKeychain {
                 }
             }
 
-            if uploaded > 0 {
+            if uploaded > 0 || listsChanged {
                 do {
-                    try await client.putManifest(SaveSyncManifest(files: newRemote), ifMatch: etag)
+                    try await client.putManifest(SaveSyncManifest(files: newRemote, games: newGames), ifMatch: etag)
                 } catch SaveSyncError.http(let code, _) where code == 412 && attempt < 2 {
                     // Another device wrote the manifest while this pass ran: compare again.
-                    saveState(state)
+                    saveState()
                     continue
                 }
             }
             state.baseline = baseline
-            saveState(state)
+            saveState()
 
             var parts: [String] = []
             if uploaded > 0 { parts.append("\(uploaded) sent") }
             if downloaded > 0 { parts.append("\(downloaded) received") }
-            var summary = parts.isEmpty ? "Up to date" : parts.joined(separator: ", ")
+            var summary = parts.isEmpty ? "Up to date (\(scope.count) files)" : parts.joined(separator: ", ")
             if conflicts > 0 {
                 summary += "; \(conflicts) changed on both devices (the newer kept; the older copy is on the server, and local ones are in Files > Cosmic > Save Sync Conflicts)"
             }
@@ -512,9 +627,43 @@ struct SaveSyncSection: View {
         } header: {
             Text("Save sync (WebDAV)")
         } footer: {
-            Text("With this on, Play first fetches newer saves from your server and, when the game ends, sends "
-                 + "what changed. Steam games keep using Steam Cloud. If both devices changed the same file, the "
-                 + "newer one wins and the older is kept. A file you delete here comes back at the next sync. See docs/SAVE_SYNC.md.")
+            Text("With this on, Play first fetches a game's newer saves from your server and, when the game ends, "
+                 + "sends what changed. Cosmic finds a game's save files by watching what it changes, so a game is "
+                 + "synced after its first session. Each game has its own switch in Game details. Steam games keep "
+                 + "using Steam Cloud. If both devices changed the same file, the newer one wins and the older is kept. "
+                 + "A file you delete here comes back at the next sync. See docs/SAVE_SYNC.md.")
+        }
+    }
+}
+
+/// Game details, for a game that is not a Steam game: its own switch and what is tracked for it.
+struct SaveSyncGameSection: View {
+    let entry: LibraryEntry
+    @ObservedObject private var sync = SaveSync.shared
+    @State private var on: Bool
+
+    init(entry: LibraryEntry) {
+        self.entry = entry
+        _on = State(initialValue: SaveSyncGames.enabled(SaveSyncGames.key(for: entry)))
+    }
+
+    var body: some View {
+        let key = SaveSyncGames.key(for: entry)
+        Section {
+            Toggle("Sync this game's saves", isOn: Binding(
+                get: { on },
+                set: { on = $0; SaveSyncGames.setEnabled($0, key: key) }))
+                .disabled(!sync.enabled)
+        } header: {
+            Text("Save sync")
+        } footer: {
+            if !sync.enabled {
+                Text("Turn on save sync in Settings › Saves first.")
+            } else if let n = sync.tracked[key], n > 0 {
+                Text("\(n) files tracked for this game.")
+            } else {
+                Text("Its save files are found after its first session.")
+            }
         }
     }
 }

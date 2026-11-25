@@ -2243,6 +2243,7 @@ final class LibraryModel: ObservableObject {
         }
     }
     private func finish() {
+        let syncEntry = activeEntry   // for save sync, below: the session's game
         if let note = RespawnGuard.finish(activeEntry) { error = note }   // respawn-guard
         else if sawProcess, let next = steamRunRequest() { restartNotice = next }
         else if let title = poolAutoTitle { error = JITPoolAuto.message(title) }
@@ -2281,7 +2282,7 @@ final class LibraryModel: ObservableObject {
         else { DispatchQueue.main.async { MainActor.assumeIsolated { LogTrail.backInLibrary() } } }
         LogSummary.writeLater(from: LogStore.shared.logURL, source: "madeira-log.txt (this session)")
         // Save sync (WebDAVSaveSync.swift): what this session changed goes to the user's server.
-        Task { @MainActor in await SaveSync.shared.afterSession() }
+        if let syncEntry { Task { @MainActor in await SaveSync.shared.afterSession(syncEntry) } }
     }
 }
 
@@ -3515,6 +3516,8 @@ struct LibraryDetail: View {
                 Text("Shortcuts › Open URLs › paste › Add to Home Screen.")
             }
         }
+        // Save sync (WebDAVSaveSync.swift): this game's own switch.
+        if entry.desktop != true, SaveSyncGames.isSynced(entry) { SaveSyncGameSection(entry: entry) }
         if entry.steamAppID == nil && entry.desktop != true {
             Section("Executable") { Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled) }
             if model.entries.contains(where: { $0.id == entry.id }) { GameMoveSection(entry: $entry) }
