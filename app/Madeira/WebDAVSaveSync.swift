@@ -344,7 +344,7 @@ private enum SaveSyncKeychain {
         password = SaveSyncKeychain.get() ?? ""
     }
 
-    private func log(_ text: String, level: LogEntry.Level = .info) { LogStore.shared.log("[save-sync] " + text, level: level) }
+    private func log(_ text: String, level: LogStore.LogEntry.Level = .info) { LogStore.shared.log("[save-sync] " + text, level: level) }
 
     // What is remembered between runs.
     private static var stateURL: URL {
