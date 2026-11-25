@@ -209,7 +209,9 @@ struct SettingsPageView: View {
         case .pointer: Section("Pointer") { LibraryPointerSettings() }
         case .jit: JITSettingsSection()
         case .signing: SigningSettingsSection()
-        case .saves: SavesSection()
+        case .saves:
+            SavesSection()
+            SaveSyncSection()
         case .drives: ExternalDrivesSection()
         case .appearance: appearance
         case .advanced:
