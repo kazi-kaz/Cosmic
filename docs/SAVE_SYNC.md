@@ -9,7 +9,9 @@ WebDAV server you run. Steam games keep using Steam Cloud. Code: `app/Madeira/We
   Settings › Saves › Back up saves covers: Documents, Saved Games and AppData under `C:\users`,
   caches left out) before a game starts and again when it ends. The files that changed are that
   game's. The list is kept per game, here and on the server, so a second device that has never run
-  the game knows what to fetch. A game is therefore synced from its first session on.
+  the game knows what to fetch. A game is therefore synced from its first session on. Files already
+  sitting in the same folder as a changed file (older save slots) are tracked too; a folder holding
+  more than 300 files is not, since it is likelier shared than a game's own.
 * Play first brings the game's files up to date from the server. When the game ends, what changed
   is sent. Settings › Saves › Save sync has a Sync now button for every game this device knows.
 * Two switches: the global one (Settings › Saves) and one per game (Game details › Save sync, shown

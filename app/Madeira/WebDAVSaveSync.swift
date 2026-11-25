@@ -196,6 +196,22 @@ enum SaveSyncLocal {
         return (files, fresh, tooLarge)
     }
 
+    /// The folder a file sits in, when that folder is below one of the save roots (users/<name>/AppData/Roaming/
+    /// RenPy/<game>/persistent -> users/<name>/AppData/Roaming/RenPy/<game>). nil for a file directly in a root,
+    /// such as Documents itself: that folder is shared by every game.
+    static func gameFolder(of key: String) -> String? {
+        let parts = key.split(separator: "/").map(String.init)
+        guard parts.count > 3, parts[0] == "users" else { return nil }
+        for root in SaveBackup.roots {
+            let rootParts = root.split(separator: "/").map(String.init)
+            let end = 2 + rootParts.count
+            if parts.count > end + 1, Array(parts[2..<end]) == rootParts {
+                return parts.dropLast().joined(separator: "/")
+            }
+        }
+        return nil
+    }
+
     /// Path -> hash, for comparing two scans of the same device.
     static func shas(_ files: [String: SaveSyncEntry]) -> [String: String] { files.mapValues { $0.sha } }
 
@@ -467,9 +483,20 @@ private enum SaveSyncKeychain {
         let after = SaveSyncLocal.shas(scan.files)
         let changed = after.filter { before[$0.key] != $0.value }.map { $0.key }
         if !changed.isEmpty {
-            state.games[key] = Set(state.games[key] ?? []).union(changed).sorted()
+            // A save slot made before this game was tracked does not change in a session, but it sits in the
+            // same folder as the files that did (Ren'Py: persistent changes on every quit, the slots beside
+            // it do not). Files already in a changed file's own folder are the game's too. A folder with
+            // hundreds of files is left out: it is more likely shared than a game's saves.
+            let folders = Set(changed.compactMap { SaveSyncLocal.gameFolder(of: $0) })
+            var beside: [String: [String]] = [:]
+            for path in after.keys {
+                if let folder = SaveSyncLocal.gameFolder(of: path), folders.contains(folder) { beside[folder, default: []].append(path) }
+            }
+            var found = Set(changed)
+            for (_, paths) in beside where paths.count <= 300 { found.formUnion(paths) }
+            state.games[key] = Set(state.games[key] ?? []).union(found).sorted()
             saveState()   // kept even when the server cannot be reached below
-            log("\(entry.title): \(changed.count) files changed in the session")
+            log("\(entry.title): \(changed.count) files changed in the session, \(found.count) tracked with the ones beside them")
         }
         await perform("after session", game: GameScope(key: key, title: entry.title))
     }
