@@ -1,0 +1,65 @@
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 9f695d09..d4f6d8bf 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -3572,6 +3572,42 @@ void d3d12_device_return_descriptor_heap_gpu_va(struct d3d12_device *device, uin
+     pthread_mutex_unlock(&device->mutex);
+ }
+ 
++/* madeira [kk-occlusion-pool] (env MADEIRA_KK_OCCLUSION_POOL = 0 turns it off;
++ * any other number from 64 to 4096 is used as the pool size).
++ *
++ * Every occlusion query pool is created with room for 4096 queries, and a
++ * command allocator keeps its current pool even when it used a handful of
++ * them.  KosmicKrisp backs all pools of a device from one fixed table of
++ * visibility slots that it reserves when a pool is created, so a few 4096-query
++ * pools use the table up and the next vkCreateQueryPool fails.  On that
++ * driver only, pools are created with 256 queries: an allocator that fills one
++ * asks for another, as it already does at 4096.  Other drivers are unchanged. */
++static uint32_t d3d12_device_occlusion_pool_size(struct d3d12_device *device)
++{
++    static bool logged;
++    uint32_t count = 4096;
++    char env[16];
++
++    if (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_KOSMICKRISP)
++    {
++        count = 256;
++        if (vkd3d_get_env_var("MADEIRA_KK_OCCLUSION_POOL", env, sizeof(env)))
++        {
++            unsigned long value = strtoul(env, NULL, 10);
++            if (!value)
++                count = 4096;
++            else if (value >= 64 && value <= 4096)
++                count = value;
++        }
++        if (!logged)
++        {
++            logged = true;
++            ERR("[kk-occlusion-pool] KosmicKrisp: occlusion query pools hold %u queries (MADEIRA_KK_OCCLUSION_POOL = 0 for 4096).\n", count);
++        }
++    }
++    return count;
++}
++
+ static HRESULT d3d12_device_create_query_pool(struct d3d12_device *device, uint32_t type_index, struct vkd3d_query_pool *pool)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+@@ -3591,7 +3627,7 @@ static HRESULT d3d12_device_create_query_pool(struct d3d12_device *device, uint3
+             /* Expect a large number of occlusion queries
+              * to be used within a single command list */
+             pool_info.queryType = VK_QUERY_TYPE_OCCLUSION;
+-            pool_info.queryCount = 4096;
++            pool_info.queryCount = d3d12_device_occlusion_pool_size(device);
+             break;
+ 
+         case VKD3D_QUERY_TYPE_INDEX_PIPELINE_STATISTICS:
+@@ -3643,7 +3679,7 @@ static HRESULT d3d12_device_create_query_pool(struct d3d12_device *device, uint3
+ 
+     if ((vr = VK_CALL(vkCreateQueryPool(device->vk_device, &pool_info, NULL, &pool->vk_query_pool))) < 0)
+     {
+-        ERR("Failed to create query pool, vr %d.\n", vr);
++        ERR("Failed to create query pool, vr %d (type index %u, %u queries).\n", vr, type_index, pool_info.queryCount);
+         return hresult_from_vk_result(vr);
+     }
+ 

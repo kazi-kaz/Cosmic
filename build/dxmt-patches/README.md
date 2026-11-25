@@ -11,7 +11,9 @@ patch that is already applied, and `apply.sh --revert` takes them out. The
 
 | Patch | What it fixes |
 |---|---|
-| `0001-d3d9-index-range-per-draw.patch` | A 32-bit Direct3D 9 indexed draw copies only the index bytes it reads, instead of the whole index buffer before every draw after a lock (Call of Duty: Black Ops drew at 2 to 20 FPS). `env.MADEIRA_D3D9_INDEX_RANGE = 0` goes back to the whole copy. Checked by `tests/host/check-d3d9-index-range.py` |
+| `0001-winemetal-arm64ec-wine-11.22-icall-helper.patch` | Cosmic, for Madeira 0.2.72 / Wine 11.22. The ARM64EC `winemetal.dll` failed to link with `duplicate symbol: __icall_helper_arm64ec`. Wine 11.22's `libwinecrt0` no longer carries the CHPE metadata, so the toolchain's `chpe.o` is linked as well, and both define the same helper. The ARM64EC link now allows that one duplicate (same routine; lld keeps `chpe.o`'s). |
+
+The two earlier patches (`d3d9-index-range-per-draw`, `d3d11-video-device-fallback`) are in the 0.2.72 `dxmt` pin itself.
 
 A patch must apply on the current `dxmt` pin. When the pin moves, rebase the
 patches onto it (or drop a patch the new pin already covers).

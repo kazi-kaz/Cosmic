@@ -9,6 +9,9 @@
 import Foundation
 import zlib
 import CommonCrypto
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Progress for one application install, across all of its depots.
 struct SteamDownloadProgress: Equatable, Sendable {
@@ -71,6 +74,9 @@ final class DepotDownloader {
     private let maxConcurrentChunks = 8
     private let attemptsPerChunk = 5
     private let hostPoolSize = 6
+    /// Whether a content server leaves the chunk rotation only after repeated
+    /// failures (ContentHostHealth). Set by the owner from its switch.
+    var rotatesContentServers = true
 
     private nonisolated static let http: URLSession = {
         let config = URLSessionConfiguration.ephemeral
@@ -127,7 +133,7 @@ final class DepotDownloader {
         report(state)
         let prepStarted = Date()
         manifestStats = ManifestStats()
-        let health = ContentHostHealth()
+        let health = ContentHostHealth(rotates: rotatesContentServers)
         let pool = Array(hosts.prefix(hostPoolSize))
         var plans: [DepotPlan] = []
         var licenseSkipped: [UInt32] = []
@@ -275,6 +281,9 @@ final class DepotDownloader {
         let started = Date()
         let resumedBytes = state.doneBytes
         var lastReport = Date.distantPast
+        // One [steam-depot] speed line every 10 s, with whether Madeira was in
+        // the background, so a log shows a background slowdown.
+        var speedMark = (time: Date(), bytes: state.doneBytes)
         for (index, plan) in plans.enumerated() {
             let journal = try JournalWriter(url: prepared.journals[index])
             defer { journal.close() }
@@ -289,7 +298,7 @@ final class DepotDownloader {
                     let item = work[next]; next += 1
                     let chunk = plan.manifest.files[item.file].chunks[item.chunk]
                     let path = paths[item.file]
-                    group.addTask {
+                    group.addTask(priority: .userInitiated) {
                         try await Self.fetchChunk(chunk, plan: plan, peer: peer, path: path, attempts: attempts, seed: item.file &+ item.chunk)
                         return (item.key, UInt64(chunk.compressedSize), false)
                     }
@@ -309,6 +318,12 @@ final class DepotDownloader {
                             state.pcDropped = !peer.usable
                         }
                         report(state)
+                    }
+                    if now.timeIntervalSince(speedMark.time) >= 10 {
+                        let window = now.timeIntervalSince(speedMark.time)
+                        let kbPerS = Int(Double(state.doneBytes &- speedMark.bytes) / window / 1024)
+                        speedMark = (now, state.doneBytes)
+                        SteamLog.event("[steam-depot] speed app=\(app.appID) kb-per-s=\(kbPerS) background=\(Self.inBackground ? 1 : 0) done-mb=\(state.doneBytes >> 20)")
                     }
                     enqueue()
                 }
@@ -377,7 +392,7 @@ final class DepotDownloader {
     }
 
     /// Whether a previous attempt left resumable progress for this app.
-    static func hasPartialDownload(appID: UInt32, steamApps: URL) -> Bool {
+    nonisolated static func hasPartialDownload(appID: UInt32, steamApps: URL) -> Bool {
         let dir = steamApps.appendingPathComponent("downloading/\(appID)", isDirectory: true)
         return ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).contains { $0.hasSuffix(".journal") }
     }
@@ -571,7 +586,7 @@ final class DepotDownloader {
             func enqueue() {
                 guard next < checks.count else { return }
                 let check = checks[next]; next += 1
-                group.addTask { (check, try Self.checkFile(check.path, chunks: check.chunks)) }
+                group.addTask(priority: .userInitiated) { (check, try Self.checkFile(check.path, chunks: check.chunks)) }
             }
             for _ in 0..<min(width, checks.count) { enqueue() }
             for try await (check, results) in group {
@@ -601,18 +616,35 @@ final class DepotDownloader {
         report(state)
     }
 
-    /// Reads one file once, front to back in 16 MB blocks, and compares each
+    /// Whether Madeira is in the background (for the speed line).
+    private static var inBackground: Bool {
+        #if canImport(UIKit)
+        return UIApplication.shared.applicationState == .background
+        #else
+        return false
+        #endif
+    }
+
+    /// Reads one file once, front to back in blocks of up to 16 MB, and compares each
     /// chunk (sorted by offset) with its SHA-1. A missing or short file fails
     /// the chunks it cannot supply.
     private nonisolated static func checkFile(_ path: String, chunks: [DepotManifest.ChunkEntry]) throws -> [Bool] {
         var results = [Bool](repeating: false, count: chunks.count)
+        guard !chunks.isEmpty else { return results }
         let fd = open(path, O_RDONLY)
         guard fd >= 0 else { return results }
         defer { close(fd) }
         _ = fcntl(fd, F_NOCACHE, 1)
         _ = fcntl(fd, F_RDAHEAD, 1)
-        let blockSize = 16 << 20
-        var block = [UInt8](repeating: 0, count: blockSize)
+        // The read buffer is only as big as this file's chunks need (most
+        // files are small), at most 16 MB, and is not zero-filled: a fresh
+        // zeroed 16 MB buffer per file made a resume check of a big game
+        // (18187 files) burn every core for minutes.
+        let maxBlock = 16 << 20
+        let span = chunks.reduce(UInt64(0)) { max($0, $1.offset + UInt64($1.uncompressedSize)) } &- chunks[0].offset
+        let blockSize = Int(min(UInt64(maxBlock), max(span, 1)))
+        let block = UnsafeMutableRawBufferPointer.allocate(byteCount: blockSize, alignment: 16)
+        defer { block.deallocate() }
         var blockStart: UInt64 = 0, blockLength = 0
         var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
         for (i, chunk) in chunks.enumerated() {
@@ -622,11 +654,11 @@ final class DepotDownloader {
             // Refill when this chunk is not wholly inside the block.
             if chunk.offset < blockStart || chunk.offset + UInt64(length) > blockStart + UInt64(blockLength) {
                 blockStart = chunk.offset
-                blockLength = block.withUnsafeMutableBytes { max(0, pread(fd, $0.baseAddress, blockSize, off_t(chunk.offset))) }
+                blockLength = max(0, pread(fd, block.baseAddress, blockSize, off_t(chunk.offset)))
                 if blockLength < length { continue }
             }
             let start = Int(chunk.offset - blockStart)
-            block.withUnsafeBytes { raw in _ = CC_SHA1(raw.baseAddress! + start, CC_LONG(length), &digest) }
+            _ = CC_SHA1(block.baseAddress! + start, CC_LONG(length), &digest)
             results[i] = Data(digest) == chunk.sha
         }
         return results
@@ -1163,7 +1195,15 @@ final class DepotDownloader {
     private func contentServers(appID: UInt32) async throws -> [String] {
         var hosts: [String] = []
         do {
-            guard let url = URL(string: "https://api.steampowered.com/IContentServerDirectoryService/GetServersForSteamPipe/v1/?cell_id=\(session.cellID)&max_servers=20") else {
+            // env.MADEIRA_STEAM_CELL_ID (madeira.cfg): a Steam cell id that replaces the
+            // one Steam picked from the sign-in. Unset or not a number: unchanged.
+            var cell = session.cellID
+            if let raw = MadeiraConfig.get("env.MADEIRA_STEAM_CELL_ID"),
+               let override = UInt32(raw.trimmingCharacters(in: .whitespaces)), override != 0 {
+                cell = override
+                SteamLog.event("[steam-cdn] cell id override \(override) (signed in as \(session.cellID))")
+            }
+            guard let url = URL(string: "https://api.steampowered.com/IContentServerDirectoryService/GetServersForSteamPipe/v1/?cell_id=\(cell)&max_servers=20") else {
                 throw SteamError.chunkDownloadFailed("Bad content directory URL")
             }
             let (data, response) = try await Self.http.data(from: url)
@@ -1285,26 +1325,49 @@ final class DepotDownloader {
 }
 
 /// Per-install content-server health. Chunks start on different servers
-/// (spreading load) and servers that keep failing move to the back of every
-/// chunk's rotation, instead of each chunk rediscovering a bad server.
+/// (spreading load); a server that keeps failing moves to the back of every
+/// chunk's rotation, instead of each chunk rediscovering a bad server. A server
+/// with only an occasional failure stays in the rotation: moving it back after
+/// one failure would send every first attempt to the servers with none, and
+/// since only a server that is tried can recover, the install would end up
+/// on one server.
 final class ContentHostHealth: @unchecked Sendable {
+    /// Failures after which a server is demoted: it goes behind every server
+    /// that has fewer, and the log says so.
+    static let demoteAfter = 3
+
     private let lock = NSLock()
     private var failures: [String: Int] = [:]
     private var reported = 0
+    private let rotates: Bool
+
+    /// `rotates: false` orders by failure count first, as before: one failure
+    /// sends a server behind every server with none.
+    init(rotates: Bool = true) {
+        self.rotates = rotates
+    }
 
     func order(_ hosts: [String], seed: Int) -> [String] {
         guard !hosts.isEmpty else { return hosts }
         let rotated = (0..<hosts.count).map { hosts[($0 + seed) % hosts.count] }
         lock.lock(); let counts = failures; lock.unlock()
+        let demoteAfter = Self.demoteAfter
+        // Sort key: servers below the demotion point keep the seed rotation;
+        // demoted ones follow, fewest failures first, then in rotation order.
+        func key(_ entry: (offset: Int, element: String)) -> (Int, Int, Int) {
+            let count = counts[entry.element] ?? 0
+            if !rotates { return (count, entry.offset, 0) }
+            return count >= demoteAfter ? (1, count, entry.offset) : (0, 0, entry.offset)
+        }
         return rotated.enumerated()
-            .sorted { ((counts[$0.element] ?? 0), $0.offset) < ((counts[$1.element] ?? 0), $1.offset) }
+            .sorted { key($0) < key($1) }
             .map(\.element)
     }
 
     func recordFailure(_ host: String, reason: String) {
         lock.lock()
         failures[host, default: 0] += 1
-        let report = failures[host] == 3 && reported < 8
+        let report = failures[host] == Self.demoteAfter && reported < 8
         if report { reported += 1 }
         lock.unlock()
         if report {
@@ -1409,7 +1472,7 @@ extension DepotDownloader {
         let pool = Array(hosts.prefix(hostPoolSize))
         let auth = await cdnAuthFragments(depotID: appID, appID: appID, hosts: pool)
         let plan = DepotPlan(depotID: appID, manifestGID: manifestGID, key: key, manifest: manifest, hosts: pool, auth: auth,
-                             declaredSize: manifest.totalUncompressedSize, health: ContentHostHealth(), installURL: folder)
+                             declaredSize: manifest.totalUncompressedSize, health: ContentHostHealth(rotates: rotatesContentServers), installURL: folder)
         let prepared = try await Task.detached(priority: .userInitiated) {
             try Self.prepare(plans: [plan], journalDir: journalDir)
         }.value

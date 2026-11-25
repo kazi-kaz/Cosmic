@@ -81,9 +81,6 @@
 #else
   extern char **environ;
 #endif
-#ifdef __ANDROID__
-# include <jni.h>
-#endif
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -105,7 +102,7 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(module);
 
-#if defined __i386__ || defined __x86_64__
+#if (defined __i386__ || defined __x86_64__) && !defined __APPLE__
 #define SO_DLLS_SUPPORTED
 #endif
 
@@ -138,6 +135,11 @@ const char *wineloader = NULL;
 const char **dll_paths = NULL;
 const char **system_dll_paths = NULL;
 const char *user_name = NULL;
+/* Madeira (ml1122): Wine 11.22 keeps the main image base in this global. It is defined only
+ * because unix_private.h declares it; nothing on iOS reads it. Every pseudo-process loads
+ * its own main image in this one shared library, so the base travels through the `module`
+ * argument of load_main_exe()/load_start_exe() to env_ios.c init_peb() instead. */
+void *main_module = NULL;
 SECTION_IMAGE_INFORMATION main_image_info = { NULL };
 
 /* die on a fatal error; use only during initialization */
@@ -811,21 +813,22 @@ static NTSTATUS loader_exec( char **argv, WORD machine )
 NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info )
 {
     WORD machine = pe_info->machine;
-    ULONGLONG res_start = pe_info->base;
-    ULONGLONG res_end = pe_info->base + pe_info->map_size;
     char preloader_reserve[64], socket_env[64];
 
-    if (pe_info->wine_fakedll) res_start = res_end = 0;
-    if (pe_info->image_flags & IMAGE_FLAGS_ComPlusNativeReady) machine = native_machine;
+    if (pe_info->image_flags & IMAGE_FLAGS_ComPlusNativeReady)
+        machine = is_machine_64bit( native_machine ) ? IMAGE_FILE_MACHINE_AMD64 : native_machine;
 
     signal( SIGPIPE, SIG_DFL );
 
     snprintf( socket_env, sizeof(socket_env), "WINESERVERSOCKET=%u", socketfd );
-    snprintf( preloader_reserve, sizeof(preloader_reserve), "WINEPRELOADRESERVE=%x%08x-%x%08x",
-             (UINT)(res_start >> 32), (UINT)res_start, (UINT)(res_end >> 32), (UINT)res_end );
-
-    putenv( preloader_reserve );
     putenv( socket_env );
+
+    if (!is_machine_64bit( pe_info->machine ) && pe_info->base && !pe_info->wine_fakedll)
+    {
+        snprintf( preloader_reserve, sizeof(preloader_reserve), "WINEPRELOADRESERVE=%x-%x",
+                  (UINT)pe_info->base, (UINT)(pe_info->base + pe_info->map_size) );
+        putenv( preloader_reserve );
+    }
 
     return loader_exec( argv, machine );
 }
@@ -1006,19 +1009,8 @@ static NTSTATUS map_so_dll( const IMAGE_NT_HEADERS *nt_descr, HMODULE module )
 
     delta      = (const BYTE *)nt_descr - addr;
     data_start = delta & ~align_mask;
-#ifdef __APPLE__
-    {
-        Dl_info dli;
-        unsigned long data_size;
-        /* need the mach_header, not the PE header, to give to getsegmentdata(3) */
-        dladdr(addr, &dli);
-        code_end   = getsegmentdata(dli.dli_fbase, "__DATA", &data_size) - addr;
-        data_end   = (code_end + data_size + align_mask) & ~align_mask;
-    }
-#else
     code_end   = data_start;
     data_end   = (nt->OptionalHeader.SizeOfImage + delta + align_mask) & ~align_mask;
-#endif
 
     fixup_rva_ptrs( &nt->OptionalHeader.AddressOfEntryPoint, addr, 1 );
 
@@ -1174,6 +1166,9 @@ static NTSTATUS dlopen_dll( const char *so_name, UNICODE_STRING *nt_name, void *
         dlclose( handle );
         return STATUS_NO_MEMORY;
     }
+#ifdef __x86_64__
+    signal_disable_syscall_dispatch();
+#endif
     *ret_module = module;
     return STATUS_SUCCESS;
 }
@@ -1194,7 +1189,7 @@ static NTSTATUS load_so_dll( void *args )
     NTSTATUS status;
     DWORD len;
 
-    if (get_load_order( nt_name ) == LO_DISABLED) return STATUS_DLL_NOT_FOUND;
+    if (get_load_order( nt_name, FALSE, NULL ) == LO_DISABLED) return STATUS_DLL_NOT_FOUND;
     InitializeObjectAttributes( &attr, nt_name, OBJ_CASE_INSENSITIVE, 0, 0 );
     if (!get_nt_and_unix_names( &attr, &true_nt_name, &unix_name, FILE_OPEN, FALSE ))
     {
@@ -1215,18 +1210,6 @@ static NTSTATUS load_so_dll( void *args )
 /* only returns false for a valid library of the wrong arch */
 static int check_library_arch( int fd )
 {
-#ifdef __APPLE__
-    struct  /* Mach-O header */
-    {
-        unsigned int magic;
-        unsigned int cputype;
-    } header;
-
-    if (read( fd, &header, sizeof(header) ) != sizeof(header)) return 1;
-    if (header.magic != 0xfeedface) return 1;
-    if (sizeof(void *) == sizeof(int)) return !(header.cputype >> 24);
-    else return (header.cputype >> 24) == 1; /* CPU_ARCH_ABI64 */
-#else
     struct  /* ELF header */
     {
         unsigned char magic[4];
@@ -1245,7 +1228,6 @@ static int check_library_arch( int fd )
 #endif
     if (sizeof(void *) == sizeof(int)) return header.class == 1; /* ELFCLASS32 */
     else return header.class == 2; /* ELFCLASS64 */
-#endif
 }
 
 /***********************************************************************
@@ -1935,10 +1917,9 @@ done:
  * Load the builtin dll if specified by load order configuration.
  * Return STATUS_IMAGE_ALREADY_LOADED if we should keep the native one that we have found.
  */
-NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *nt_name,
-                       ANSI_STRING *exp_name, USHORT machine, SECTION_IMAGE_INFORMATION *info,
-                       void **module, SIZE_T *size, ULONG_PTR limit_low, ULONG_PTR limit_high,
-                       off_t offset )
+NTSTATUS load_builtin( struct pe_mapping_info *pe_mapping, USHORT machine,
+                       SECTION_IMAGE_INFORMATION *info, void **module, SIZE_T *size,
+                       ULONG_PTR limit_low, ULONG_PTR limit_high, off_t offset )
 {
 #ifdef WINE_IOS
     /* iOS: still respect WINEDLLOVERRIDES=name= (LO_DISABLED) so users can
@@ -1946,10 +1927,12 @@ NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *n
      * blows up Wine's loader). The original short-circuit below skips the
      * builtin .so search; we keep that, just gate it on the override. */
     {
-        enum loadorder lo = get_load_order( nt_name );
+        USHORT ios_sysdir_machine;
+        BOOL ios_is_system_dir = is_system_dir_path( &pe_mapping->nt_name, &ios_sysdir_machine );
+        enum loadorder lo = get_load_order( &pe_mapping->nt_name, ios_is_system_dir, pe_mapping );
         if (lo == LO_DISABLED)
         {
-            TRACE( "iOS: %s disabled by WINEDLLOVERRIDES\n", debugstr_us(nt_name) );
+            TRACE( "iOS: %s disabled by WINEDLLOVERRIDES\n", debugstr_us(&pe_mapping->nt_name) );
             return STATUS_DLL_NOT_FOUND;
         }
     }
@@ -1959,25 +1942,31 @@ NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *n
     return STATUS_IMAGE_ALREADY_LOADED;
 #else
     NTSTATUS status;
-    USHORT search_machine = image_info->machine;
-    enum loadorder loadorder = get_load_order( nt_name );
+    USHORT sysdir_machine, search_machine = pe_mapping->image.machine;
+    BOOL is_system_dir = is_system_dir_path( &pe_mapping->nt_name, &sysdir_machine );
+    enum loadorder loadorder = get_load_order( &pe_mapping->nt_name, is_system_dir, pe_mapping );
 
     if (loadorder == LO_DISABLED) return STATUS_DLL_NOT_FOUND;
 
-    if (image_info->wine_builtin)
+    if (pe_mapping->image.wine_builtin)
     {
         if (loadorder == LO_NATIVE) return STATUS_DLL_NOT_FOUND;
         loadorder = LO_BUILTIN_NATIVE;  /* load builtin, then fallback to the file we found */
     }
-    else if (image_info->wine_fakedll)
+    else if (pe_mapping->image.wine_fakedll)
     {
-        TRACE( "%s is a fake Wine dll\n", debugstr_us(nt_name) );
+        TRACE( "%s is a fake Wine dll\n", debugstr_us(&pe_mapping->nt_name) );
         if (loadorder == LO_NATIVE) return STATUS_DLL_NOT_FOUND;
         loadorder = LO_BUILTIN;  /* builtin with no fallback since mapping a fake dll is not useful */
     }
 
-    if (ios_is_arm64ec_cur() && image_info->is_hybrid && search_machine == IMAGE_FILE_MACHINE_AMD64)
-        search_machine = current_machine;
+    if (current_machine == IMAGE_FILE_MACHINE_ARM64 && search_machine == IMAGE_FILE_MACHINE_AMD64)
+    {
+        /* force loading the x64 version of the builtin */
+        if (!pe_mapping->image.is_hybrid && !machine) machine = IMAGE_FILE_MACHINE_AMD64;
+        /* but make sure we load from the aarch64 builtin directory */
+        search_machine = IMAGE_FILE_MACHINE_ARM64;
+    }
 
     switch (loadorder)
     {
@@ -1985,11 +1974,12 @@ NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *n
     case LO_NATIVE_BUILTIN:
         return STATUS_IMAGE_ALREADY_LOADED;
     case LO_BUILTIN:
-        return find_builtin_dll( nt_name, exp_name, module, size, info, limit_low, limit_high,
-                                 search_machine, machine, FALSE, offset );
+        return find_builtin_dll( &pe_mapping->nt_name, &pe_mapping->exp_name, module, size, info,
+                                 limit_low, limit_high, search_machine, machine, FALSE, offset );
     default:
-        status = find_builtin_dll( nt_name, exp_name, module, size, info, limit_low, limit_high,
-                                   search_machine, machine, (loadorder == LO_DEFAULT), offset );
+        status = find_builtin_dll( &pe_mapping->nt_name, &pe_mapping->exp_name, module, size, info,
+                                   limit_low, limit_high, search_machine, machine,
+                                   (loadorder == LO_DEFAULT), offset );
         if (status == STATUS_DLL_NOT_FOUND || status == STATUS_NOT_SUPPORTED)
             return STATUS_IMAGE_ALREADY_LOADED;
         return status;
@@ -2003,7 +1993,7 @@ NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *n
  */
 NTSTATUS load_unixlib_by_name( const UNICODE_STRING *nt_name, void **handle_ret )
 {
-    unsigned int i, pos, namepos, maxlen = 0;
+    unsigned int i, pos, maxlen = 0;
     unsigned int len = nt_name->Length / sizeof(WCHAR);
     const char *so_dir = get_so_dir( current_machine );
     char *ptr = NULL, *file, *ext = NULL;
@@ -2011,8 +2001,7 @@ NTSTATUS load_unixlib_by_name( const UNICODE_STRING *nt_name, void **handle_ret 
 
     if (!len) return STATUS_DLL_NOT_FOUND;
 
-    for (i = namepos = 0; i < len; i++)
-        if (nt_name->Buffer[i] == '/' || nt_name->Buffer[i] == '\\') break;
+    for (i = 0; i < len; i++) if (nt_name->Buffer[i] == '/' || nt_name->Buffer[i] == '\\') break;
 
     if (i < len)  /* explicit path */
     {
@@ -2032,17 +2021,17 @@ NTSTATUS load_unixlib_by_name( const UNICODE_STRING *nt_name, void **handle_ret 
     if (!(file = malloc( maxlen ))) return STATUS_NO_MEMORY;
 
     pos = maxlen - len - 4;
+    ext = file + pos + len;
     /* we don't want to depend on the current codepage here */
     for (i = 0; i < len; i++)
     {
-        if (nt_name->Buffer[namepos + i] > 127) goto done;
-        file[pos + i] = (char)nt_name->Buffer[namepos + i];
+        if (nt_name->Buffer[i] > 127) goto done;
+        file[pos + i] = (char)nt_name->Buffer[i];
         if (file[pos + i] >= 'A' && file[pos + i] <= 'Z') file[pos + i] += 'a' - 'A';
         else if (file[pos + i] == '.') ext = file + pos + i;
     }
     file[pos + len] = 0;
     file[--pos] = '/';
-    if (!ext) ext = file + pos + len;
 
     if (build_dir)
     {
@@ -2094,18 +2083,15 @@ static const WCHAR *get_machine_wow64_dir( WORD machine )
 
 
 /***************************************************************************
- *	is_builtin_path
+ *	is_system_dir_path
  *
  * Check if path is inside a system directory, to support loading builtins
  * when the corresponding file doesn't exist yet.
  */
-BOOL is_builtin_path( const UNICODE_STRING *path, WORD *machine )
+BOOL is_system_dir_path( const UNICODE_STRING *path, WORD *machine )
 {
     unsigned int i, len = path->Length / sizeof(WCHAR), dirlen;
     const WCHAR *sysdir, *p = path->Buffer;
-
-    /* only fake builtin existence during prefix bootstrap */
-    if (!is_prefix_bootstrap) return FALSE;
 
     for (i = 0; i < supported_machines_count; i++)
     {
@@ -2122,6 +2108,13 @@ BOOL is_builtin_path( const UNICODE_STRING *path, WORD *machine )
     return FALSE;
 }
 
+
+/* Madeira (ml1122): Wine 11.22 replaced virtual_map_module() with virtual_map_main_module(),
+ * which fills the main_module global. virtual_ios.c keeps the 11.4 function so each
+ * pseudo-process gets its own image base back; it is no longer in unix_private.h. */
+extern NTSTATUS virtual_map_module( HANDLE mapping, void **module, SIZE_T *size,
+                                    SECTION_IMAGE_INFORMATION *info, ULONG_PTR limit_low,
+                                    ULONG_PTR limit_high, USHORT machine );
 
 /***********************************************************************
  *           open_main_image
@@ -2154,7 +2147,7 @@ static NTSTATUS open_main_image( UNICODE_STRING *nt_name, void **module, SECTION
                 (unsigned)status, info->Machine, info->ImageCharacteristics);
         if (status == STATUS_IMAGE_MACHINE_TYPE_MISMATCH && info->ComPlusNativeReady)
         {
-            info->Machine = native_machine;
+            info->Machine = is_machine_64bit( native_machine ) ? IMAGE_FILE_MACHINE_AMD64 : native_machine;
             status = STATUS_SUCCESS;
         }
         NtClose( mapping );
@@ -2174,16 +2167,20 @@ static NTSTATUS open_main_image( UNICODE_STRING *nt_name, void **module, SECTION
  */
 NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine, void **module )
 {
-    enum loadorder loadorder = get_load_order( nt_name );
     unsigned int status;
     SIZE_T size;
     USHORT search_machine;
+    BOOL is_system_dir = is_system_dir_path( nt_name, &search_machine );
+    enum loadorder loadorder = get_load_order( nt_name, is_system_dir, NULL );
 
     status = open_main_image( nt_name, module, &main_image_info, loadorder, load_machine );
-    if (status != STATUS_DLL_NOT_FOUND) return status;
+    /* Wine 11.22 also retries a system-dir builtin after these two failures */
+    if (status != STATUS_DLL_NOT_FOUND && status != STATUS_INVALID_IMAGE_FORMAT &&
+        status != STATUS_NOT_SUPPORTED) return status;
 
-    /* if path is in system dir, we can load the builtin even if the file itself doesn't exist */
-    if (loadorder != LO_NATIVE && is_builtin_path( nt_name, &search_machine ))
+    /* if path is in system dir, we can load the builtin even if the file itself doesn't exist
+     * (only while the prefix is being created; 11.4 had that test inside is_builtin_path) */
+    if (loadorder != LO_NATIVE && is_prefix_bootstrap && is_system_dir)
     {
         status = find_builtin_dll( nt_name, NULL, module, &size, &main_image_info, 0, 0,
                                    search_machine, load_machine, FALSE, 0 );
@@ -2209,7 +2206,8 @@ NTSTATUS load_start_exe( UNICODE_STRING *nt_name, void **module )
     wcscpy( image, get_machine_wow64_dir( current_machine ));
     wcscat( image, startW );
     init_unicode_string( nt_name, image );
-    status = find_builtin_dll( nt_name, NULL, module, &size, &main_image_info, 0, 0, current_machine, 0, FALSE, 0 );
+    status = find_builtin_dll( nt_name, NULL, module, &size,
+                               &main_image_info, 0, 0, current_machine, 0, FALSE, 0 );
     if (!NT_SUCCESS(status))
     {
         MESSAGE( "wine: failed to load start.exe: %x\n", status );
@@ -2245,7 +2243,7 @@ static ULONG_PTR find_named_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY
     return 0;
 }
 
-static inline void *get_rva( void *module, ULONG_PTR addr )
+static inline void *get_rva( void *module, ULONG addr )
 {
     return (BYTE *)module + addr;
 }
@@ -3326,9 +3324,15 @@ static void start_main_thread(void)
             dprintf( STDERR_FILENO, "[wow-window] main-process window reserved (i386 main image)\n" );
     }
 #endif
-    WINE_IOS_LOG("virtual_alloc_first_teb...");
-    TEB *teb = virtual_alloc_first_teb();
-    WINE_IOS_LOG("virtual_alloc_first_teb done");
+    /* Wine 11.22: the per-thread unix data (server fds, signal stack, kernel stack) is its
+     * own block and comes first. Upstream creates the first TEB/PEB much later (after the
+     * main image is loaded); Madeira still creates the pair right here, inside
+     * virtual_alloc_first_thread_data() (virtual_ios.c), because the guest window bind,
+     * the TEB slot probe below and the image load all need the TEB/PEB. */
+    WINE_IOS_LOG("virtual_alloc_first_thread_data...");
+    struct thread_data *data = virtual_alloc_first_thread_data();
+    TEB *teb = data->teb;
+    WINE_IOS_LOG("virtual_alloc_first_thread_data done");
 #ifdef WINE_IOS
     /* the PEB now exists (virtual_alloc_first_teb set the global `peb` and
      * teb->Peb); bind the window so every later ios_wow_base() lookup resolves
@@ -3403,12 +3407,13 @@ static void start_main_thread(void)
         }
     }
 #endif
-    WINE_IOS_LOG("signal_init_threading...");
-    signal_init_threading();
+    /* Wine 11.22 dropped signal_init_threading() (it only created the TEB pthread key;
+     * the thread data key is created in virtual_init now). dbg_init() stays early: the
+     * PEB it writes the channel table into already exists here. */
     WINE_IOS_LOG("dbg_init...");
     dbg_init();
     WINE_IOS_LOG("server_init_process...");
-    startup_info_size = server_init_process();
+    server_init_process( data );   /* sets startup_info_size and session_id (server_ios.c) */
     WINE_IOS_LOG("server_init_process done");
     WINE_IOS_LOG("virtual_map_user_shared_data...");
     virtual_map_user_shared_data();
@@ -3475,128 +3480,6 @@ static void start_main_thread(void)
     server_init_process_done();
 }
 
-#ifdef __ANDROID__
-
-#ifndef WINE_JAVA_CLASS
-#define WINE_JAVA_CLASS "org/winehq/wine/WineActivity"
-#endif
-
-DECLSPEC_EXPORT JavaVM *java_vm = NULL;
-DECLSPEC_EXPORT jobject java_object = 0;
-DECLSPEC_EXPORT unsigned short java_gdt_sel = 0;
-
-/* main Wine initialisation */
-static jstring wine_init_jni( JNIEnv *env, jobject obj, jobjectArray cmdline, jobjectArray environment )
-{
-    char **argv;
-    char *str;
-    char error[1024];
-    int i, argc, length;
-
-    /* get the command line array */
-
-    argc = (*env)->GetArrayLength( env, cmdline );
-    for (i = length = 0; i < argc; i++)
-    {
-        jobject str_obj = (*env)->GetObjectArrayElement( env, cmdline, i );
-        length += (*env)->GetStringUTFLength( env, str_obj ) + 1;
-    }
-
-    argv = malloc( (argc + 1) * sizeof(*argv) + length );
-    str = (char *)(argv + argc + 1);
-    for (i = 0; i < argc; i++)
-    {
-        jobject str_obj = (*env)->GetObjectArrayElement( env, cmdline, i );
-        length = (*env)->GetStringUTFLength( env, str_obj );
-        (*env)->GetStringUTFRegion( env, str_obj, 0,
-                                    (*env)->GetStringLength( env, str_obj ), str );
-        argv[i] = str;
-        str[length] = 0;
-        str += length + 1;
-    }
-    argv[argc] = NULL;
-
-    /* set the environment variables */
-
-    if (environment)
-    {
-        int count = (*env)->GetArrayLength( env, environment );
-        for (i = 0; i < count - 1; i += 2)
-        {
-            jobject var_obj = (*env)->GetObjectArrayElement( env, environment, i );
-            jobject val_obj = (*env)->GetObjectArrayElement( env, environment, i + 1 );
-            const char *var = (*env)->GetStringUTFChars( env, var_obj, NULL );
-
-            if (val_obj)
-            {
-                const char *val = (*env)->GetStringUTFChars( env, val_obj, NULL );
-                setenv( var, val, 1 );
-                if (!strcmp( var, "LD_LIBRARY_PATH" ))
-                {
-                    void (*update_func)( const char * ) = dlsym( RTLD_DEFAULT,
-                                                                 "android_update_LD_LIBRARY_PATH" );
-                    if (update_func) update_func( val );
-                }
-                else if (!strcmp( var, "WINEDEBUGLOG" ))
-                {
-                    int fd = open( val, O_WRONLY | O_CREAT | O_APPEND, 0666 );
-                    if (fd != -1)
-                    {
-                        dup2( fd, 2 );
-                        close( fd );
-                    }
-                }
-                (*env)->ReleaseStringUTFChars( env, val_obj, val );
-            }
-            else unsetenv( var );
-
-            (*env)->ReleaseStringUTFChars( env, var_obj, var );
-        }
-    }
-
-    java_object = (*env)->NewGlobalRef( env, obj );
-
-    main_argc = argc;
-    main_argv = argv;
-
-    init_paths();
-    init_environment();
-
-#ifdef __i386__
-    {
-        unsigned short java_fs;
-        __asm__( "mov %%fs,%0" : "=r" (java_fs) );
-        if (!(java_fs & 4)) java_gdt_sel = java_fs;
-        __asm__( "mov %0,%%fs" :: "r" (0) );
-        start_main_thread();
-        __asm__( "mov %0,%%fs" :: "r" (java_fs) );
-    }
-#else
-    start_main_thread();
-#endif
-    return (*env)->NewStringUTF( env, error );
-}
-
-jint JNI_OnLoad( JavaVM *vm, void *reserved )
-{
-    static const JNINativeMethod method =
-    {
-        "wine_init", "([Ljava/lang/String;[Ljava/lang/String;)Ljava/lang/String;", wine_init_jni
-    };
-
-    JNIEnv *env;
-    jclass class;
-
-    virtual_init();
-
-    java_vm = vm;
-    if ((*vm)->AttachCurrentThread( vm, &env, NULL ) != JNI_OK) return JNI_ERR;
-    if (!(class = (*env)->FindClass( env, WINE_JAVA_CLASS ))) return JNI_ERR;
-    (*env)->RegisterNatives( env, class, &method, 1 );
-    return JNI_VERSION_1_6;
-}
-
-#endif  /* __ANDROID__ */
 
 #ifdef __APPLE__
 static void *apple_wine_thread( void *arg )
@@ -3918,6 +3801,7 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
     extern _Thread_local const char *ios_child_boot_stage;
     extern _Thread_local WORD ios_child_main_machine;
     TEB *teb;
+    struct thread_data *data;
     PEB *child_peb;
     NTSTATUS status;
 
@@ -3967,6 +3851,10 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
         if (child_is_i386)
         {
             CHILD_STAGE( "guest-window-reserve" );
+            {
+                extern void ios_x64_child_no_window_mark( int on );
+                ios_x64_child_no_window_mark( 0 );   /* a 32-bit child needs its window; never inherit a stale flag */
+            }
             status = ios_wow_window_reserve();
             dprintf(STDERR_FILENO, "[Wine child] i386 image %s machine=0x%x window=%p reserve=0x%x\n",
                     argc > 1 ? argv[1] : "(none)", ios_child_main_machine,
@@ -3981,15 +3869,30 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
                                  (unsigned)status );
         }
         else
+        {
+            extern void ios_x64_child_no_window_mark( int on );
+
             dprintf(STDERR_FILENO, "[Wine child] 64-bit image %s machine=0x%x (no guest window)\n",
                     argc > 1 ? argv[1] : "(none)", ios_child_main_machine);
+            /* x64-child-no-window: this thread's TEB/PEB must never come out of a 32-bit window,
+             * even if its pthread_t matches a recycled owner of a live parent's window. */
+            if (ios_child_main_machine) ios_x64_child_no_window_mark( 1 );
+        }
     }
 
     /* Allocate a new TEB for this child "process" thread */
+    /* Wine 11.22: thread data block first, then the TEB that hangs off it */
+    CHILD_STAGE( "virtual_alloc_thread_data" );
+    if (!(data = virtual_alloc_thread_data()))
+        CHILD_BOOT_FAIL( "virtual_alloc_thread_data failed (no room for the thread data block)\n" );
     CHILD_STAGE( "virtual_alloc_teb" );
-    status = virtual_alloc_teb( &teb );
+    status = virtual_alloc_teb( data );
     if (status)
+    {
+        virtual_free_thread_data( data );
         CHILD_BOOT_FAIL( "virtual_alloc_teb returned 0x%x\n", (unsigned)status );
+    }
+    teb = data->teb;
 
     /* Allocate a SEPARATE PEB for this child "process".
      * Without this, parent and child share peb->Ldr (module list),
@@ -4101,7 +4004,7 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
             teb, child_peb, peb);
 
     /* Set TEB key so NtCurrentTeb() works on this thread */
-    pthread_setspecific( teb_key, teb );
+    pthread_setspecific( thread_data_key, data );   /* 11.22: NtCurrentTeb() is data->teb */
 
     /* Store TEB in patcher TLS slot so TPIDRRO_EL0-based trampolines work */
     {

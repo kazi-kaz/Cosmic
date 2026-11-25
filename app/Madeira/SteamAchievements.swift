@@ -322,8 +322,8 @@ final class AchievementWatcher {
     private static func next() {
         guard !waiting.isEmpty else { window?.isHidden = true; window = nil; return }
         let (achievement, appID) = waiting.removeFirst()
-        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
-            .first(where: { $0.activationState == .foregroundActive }) ?? UIApplication.shared.connectedScenes.first as? UIWindowScene else { return }
+        guard let scene = UIApplication.shared.phoneScenes.compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive }) ?? UIApplication.shared.phoneScenes.first as? UIWindowScene else { return }
         let host = UIHostingController(rootView: AchievementBannerView(achievement: achievement, appID: appID))
         host.view.backgroundColor = .clear
         let banner = PassthroughWindow(windowScene: scene)

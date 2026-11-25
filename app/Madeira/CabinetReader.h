@@ -2,10 +2,11 @@
 // Copyright 2026 125hz
 // Madeira Converter Exception: see LICENSE-EXCEPTION.md
 //
-// A reader for Microsoft Cabinet files held in memory: stored and MSZIP folders, which is
+// A reader for Microsoft Cabinet files held in memory: stored, MSZIP and LZX folders, which is
 // what Microsoft's own installers carry (VCRedist.swift takes the Visual C++ runtime DLLs out
-// of vc_redist.x64.exe and vc_redist.x86.exe with it). Written from the Cabinet File Format
-// specification; LZX and Quantum folders are refused. tests/host/check-vcredist.py compiles
+// of vc_redist.x64.exe and vc_redist.x86.exe, and XAudio2 out of the DirectX June 2010
+// package, with it). Written from the Cabinet File Format specification; Quantum folders
+// are refused. tests/host/check-vcredist.py compiles
 // it on the host and runs it over the real installers.
 
 #ifndef MADEIRA_CABINET_READER_H
@@ -24,7 +25,7 @@ enum {
     MADEIRA_CAB_OK = 0,
     MADEIRA_CAB_BAD_HEADER = 1,       /* not a cabinet, or a header the reader does not understand */
     MADEIRA_CAB_TRUNCATED = 2,        /* the cabinet claims more than the bytes given */
-    MADEIRA_CAB_UNSUPPORTED = 3,      /* a folder compressed with LZX or Quantum */
+    MADEIRA_CAB_UNSUPPORTED = 3,      /* a folder compressed with Quantum, or LZX with an odd window */
     MADEIRA_CAB_BAD_DATA = 4,         /* a data block that does not inflate, or lies about its size */
     MADEIRA_CAB_NO_MEMORY = 5,
     MADEIRA_CAB_BAD_INDEX = 6,        /* no such file, or the output buffer is too small */

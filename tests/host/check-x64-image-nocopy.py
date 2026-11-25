@@ -50,7 +50,8 @@ assert flag > 0x0800, 'above the per-mapping flags that exist'
 # --- the mark in map_image_into_view ------------------------------------------
 mapper = function(native, 'static NTSTATUS map_image_into_view(')
 mark = mapper.index('view->protect |= VPROT_X64DATA;')
-cond_start = mapper.rindex('if (ios_x64_image_nocopy_enabled()', 0, mark)
+# x64-image-auto: the switch OR an image larger than the free pool marks the image
+cond_start = mapper.rindex('if ((ios_x64_image_nocopy_enabled() || ios_x64_image_auto_nocopy( total_size ))', 0, mark)
 cond = mapper[cond_start:mark]
 for need in ('!ios_map_resource_view', '!ios_wow_base()', 'nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64',
              'nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC', '!(view->protect & VPROT_ARM64EC)',
@@ -77,7 +78,10 @@ assert 'ios_jit_copy_refused' not in block, 'a dropped bit is not a refusal'
 assert '!ios_in_mach_exc' in block, 'silent on the Mach exception thread (ml374)'
 
 helper = function(native, 'static int ios_x64_image_is_host_data(')
-assert 'ios_x64_image_nocopy_enabled()' in helper
+# x64-image-auto: VPROT_X64DATA is set only under the switch or by x64-image-auto, so the flag alone decides
+assert 'ios_x64_image_nocopy_enabled()' not in helper
+auto = function(native, 'static int ios_x64_image_auto_nocopy(')
+assert 'MADEIRA_X64_IMAGE_NOCOPY_AUTO' in auto and 'image_size > pool - used - tail' in auto
 # build 423: a host-page rounded request for the last section runs past a 4 KB
 # aligned SizeOfImage; the view must be found by its start, not by the range
 assert 'find_view( base, 0 )' in helper and 'find_view( base, size )' not in helper

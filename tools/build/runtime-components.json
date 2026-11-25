@@ -70,6 +70,7 @@
       "aarch64-windows/wow64.dll",
       "aarch64-windows/wow64win.dll",
       "aarch64-windows/xtajit.dll",
+      "aarch64-windows/d3dcompiler_47.dll",
       "vulkan/arm64ec-windows/winevulkan.dll",
       "vulkan/arm64ec-windows/vulkan-1.dll",
       "compat/love/lua51.dll",

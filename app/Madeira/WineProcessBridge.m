@@ -3,9 +3,14 @@
 // to the already-running wineserver thread.
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <os/log.h>
 #import <pthread.h>
 #import "WineProcessBridge.h"
+
+/* quit-ends-children: set by wine_session_quit_asked() (Quit game), cleared per launch. */
+static int g_madeira_quit_asked;
+void wine_session_quit_asked(void) { __atomic_store_n(&g_madeira_quit_asked, 1, __ATOMIC_RELEASE); }
 /* AVFoundation: AVAudioSession activation for the Tier-2 audio driver
  * (audio_null_ios.c RemoteIO backend). AudioToolbox: pulls the framework
  * in via autolink — the static-lib driver code can't autolink itself. */
@@ -19,6 +24,8 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <dirent.h>
+#include <string.h>
+#include <strings.h>
 #include "../../build/madeira_cfg.h"   /* ml1095: one config file */
 #include "../../build/madeira_redact.h"   /* the arguments are logged with credential-like values redacted */
 #include <sys/stat.h>
@@ -365,8 +372,59 @@ static uint64_t g_launch_exit = 0;
  * (steam://run/<App ID>); ntdll's process gate (build/ntdll-unix/process_ios.c)
  * refuses steam.exe and reports the App ID here. 0: none since the last reset. */
 static uint32_t g_steam_run_app = 0;
+/* The session's own program ended while a steam.exe it started still ran: a Steam
+ * game started without Madeira Dock (Start with: The game, or added as its own
+ * program) that hands itself to Steam (SteamAPI_RestartAppIfNecessary) and quits.
+ * The library then says how to start it (LibraryModel.steamNeededHint). */
+static int g_handed_to_steam = 0;
+int wine_handed_to_steam(void) { return __atomic_load_n(&g_handed_to_steam, __ATOMIC_ACQUIRE); }
+static void madeira_note_handed_to_steam(const char *names) {
+    /* names: the live children's file names, space-separated (madeira_live_game_children). */
+    for (const char *p = names; p && *p; ) {
+        while (*p == ' ') p++;
+        const char *end = strchr(p, ' ');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len == 9 && strncasecmp(p, "steam.exe", 9) == 0) {
+            __atomic_store_n(&g_handed_to_steam, 1, __ATOMIC_RELEASE);
+            dprintf(STDERR_FILENO, "[steam-needed] the game started steam.exe and ended: it runs only when Steam starts it\n");
+            return;
+        }
+        p += len;
+    }
+}
 void wine_steam_run_requested(unsigned int appid) {
     __atomic_store_n(&g_steam_run_app, appid, __ATOMIC_RELEASE);
+}
+/* A game asked Windows to open a web page (DREDGE's Epic sign-in, for one): winebrowser.exe finds no
+ * browser here, so ntdll hands the address over and the app opens it in Safari. Only http and https.
+ * A game may ask again (each Epic sign-in request has a new code), so at most 3 pages per app run and
+ * never within 15 s of the last one; a dropped request is logged. */
+void wine_open_link_requested(const char *url) {
+    @autoreleasepool {
+        if (!url) return;
+        NSString *text = [NSString stringWithUTF8String:url];
+        NSURL *target = text.length ? [NSURL URLWithString:text] : nil;
+        NSString *scheme = target.scheme.lowercaseString;
+        if (!target || target.host.length == 0 ||
+            !([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"])) return;
+        static int opened;
+        static CFAbsoluteTime lastAt;
+        BOOL allow;
+        @synchronized ([NSProcessInfo processInfo]) {
+            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+            allow = opened < 3 && (opened == 0 || now - lastAt >= 15.0);
+            if (allow) { opened++; lastAt = now; }
+        }
+        if (!allow) {
+            dprintf(2, "[open-link] not opened again (3 per run, 15 s apart): %s\n", target.host.UTF8String);
+            return;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[UIApplication sharedApplication] openURL:target options:@{} completionHandler:^(BOOL ok) {
+                dprintf(2, "[open-link] Safari %s for %s\n", ok ? "opened" : "refused", target.host.UTF8String);
+            }];
+        });
+    }
 }
 int wine_steam_run_request(uint32_t *appid) {
     uint32_t value = __atomic_load_n(&g_steam_run_app, __ATOMIC_ACQUIRE);
@@ -374,13 +432,25 @@ int wine_steam_run_request(uint32_t *appid) {
     if (appid) *appid = value;
     return 1;
 }
+/* madeira-log-trail: the launched program's exit status, whatever it is (0, a game's own
+ * code, an NTSTATUS), for the log's [game-end] line. Same rules as g_launch_exit: stored only. */
+static uint64_t g_launch_exit_any = 0;
 void wine_launched_process_did_exit(int status) {
+    __atomic_store_n(&g_launch_exit_any, (UINT64_C(1) << 32) | (uint32_t)status, __ATOMIC_RELEASE);
     if ((uint32_t)status >= 0xC0000000u)
         __atomic_store_n(&g_launch_exit, (UINT64_C(1) << 32) | (uint32_t)status, __ATOMIC_RELEASE);
 }
+int wine_launched_exit_code(uint32_t *status) {
+    uint64_t value = __atomic_load_n(&g_launch_exit_any, __ATOMIC_ACQUIRE);
+    if (!(value >> 32)) return 0;
+    if (status) *status = (uint32_t)value;
+    return 1;
+}
 void wine_exit_status_reset(void) {
+    __atomic_store_n(&g_launch_exit_any, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_launch_exit, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_steam_run_app, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_handed_to_steam, 0, __ATOMIC_RELEASE);
 }
 int wine_crash_exit_status(uint32_t *status) {
     uint64_t value = __atomic_load_n(&g_launch_exit, __ATOMIC_ACQUIRE);
@@ -741,13 +811,35 @@ static uint16_t madeira_pe_machine(const char *unix_path)
  *    links the 64-bit farms; the first farm copy's PE header is probed. Otherwise it is looked up in the bundle's i386-windows. To
  *    launch the 32-bit build of a name both sets carry (explorer.exe, cmd.exe),
  *    give its full path, C:\windows\syswow64\<name>.
+ *  - "C:\windows\system32\<name>" (any case, no subfolder): a name one of the
+ *    64-bit farms carries is probed there, in the bare-name order. The prefix's
+ *    system32 entry is a link the farm step below rewrites only after this
+ *    probe, so it still points at the last session's farm, or nowhere after a
+ *    reinstall moved the bundle: a .bat start (cmd.exe /c) probed 0, the path
+ *    rule picked arm64ec, and the aarch64 cmd.exe failed to load kernel32.dll
+ *    (c000007b). Any other name is the prefix's own file, as below.
  *  - any other form (another drive, a relative Win32 path) is not probed. */
 static uint16_t madeira_target_machine(const char *exe, const char *prefix, NSString *bundle)
 {
     static const char * const farms64[] = { "aarch64-windows", "arm64ec-windows" };
+    static const char sys32[] = "C:\\windows\\system32\\";
     char probe[PATH_MAX];
     size_t skip;
 
+    /* env.MADEIRA_SYS32_FARM_PROBE = 0 skips this and reads the prefix's link, as before. */
+    const char *sys32_off = getenv("MADEIRA_SYS32_FARM_PROBE");
+    if (!(sys32_off && sys32_off[0] == '0' && !sys32_off[1]) &&
+        !strncasecmp(exe, sys32, sizeof(sys32) - 1) && exe[sizeof(sys32) - 1] &&
+        !strchr(exe + sizeof(sys32) - 1, '\\'))
+    {
+        for (size_t i = 0; i < sizeof(farms64) / sizeof(farms64[0]); i++)
+        {
+            if (snprintf(probe, sizeof(probe), "%s/%s/%s", bundle.fileSystemRepresentation, farms64[i],
+                         exe + sizeof(sys32) - 1) >= (int)sizeof(probe))
+                return 0;
+            if (access(probe, R_OK) == 0) return madeira_pe_machine(probe);
+        }
+    }
     if ((exe[0] == 'C' || exe[0] == 'c') && exe[1] == ':' && exe[2] == '\\')
     {
         skip = strlen(prefix) + strlen("/drive_c/");
@@ -818,6 +910,214 @@ static void madeira_overlay_vcruntime32(NSFileManager *fm, NSString *prefix)
         if ([fm createSymbolicLinkAtPath:dst withDestinationPath:[source stringByAppendingPathComponent:f] error:nil]) linked++;
     }
     dprintf(STDERR_FILENO, "[WineProc] Symlinked %d MS VC++ x86 runtime DLLs over i386 builtins (Documents/vcruntime32; MADEIRA_VCREDIST_X86=0 leaves them out)\n", linked);
+}
+
+/* Microsoft's XAudio2 2.7, taken out of the DirectX June 2010 package by the app
+ * (VCRedist.swift, XAudio2Model) into Documents/xaudio2 (x64) and Documents/xaudio2-32
+ * (x86): linked into system32 / syswow64 each session, and set to load before Wine's own
+ * through WINEDLLOVERRIDES unless the game's config names that DLL itself. With the folder
+ * gone, the links it left are removed and Wine's builtin answers again. */
+static void madeira_overlay_xaudio2(NSFileManager *fm, NSString *prefix, BOOL x86)
+{
+    NSString *source = [[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject
+                         stringByAppendingPathComponent:x86 ? @"xaudio2-32" : @"xaudio2"] copy];
+    NSString *farmDir = [prefix stringByAppendingPathComponent:x86 ? @"drive_c/windows/syswow64" : @"drive_c/windows/system32"];
+    int linked = 0;
+    for (NSString *f in @[@"xaudio2_7.dll", @"xapofx1_5.dll"]) {
+        NSString *src = [source stringByAppendingPathComponent:f];
+        NSString *dst = [farmDir stringByAppendingPathComponent:f];
+        if ([fm fileExistsAtPath:src]) {
+            [fm removeItemAtPath:dst error:nil];
+            if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil]) linked++;
+        } else {
+            NSString *old = [fm destinationOfSymbolicLinkAtPath:dst error:nil];
+            if (old && [old containsString:@"/xaudio2"]) [fm removeItemAtPath:dst error:nil];   /* removed in Settings */
+        }
+    }
+    if (!linked) return;
+    const char *have = getenv("WINEDLLOVERRIDES");
+    NSString *current = have ? [NSString stringWithUTF8String:have] : @"";
+    if (![current.lowercaseString containsString:@"xaudio2_7"]) {   /* the game's own entry wins */
+        NSString *add = @"xaudio2_7=n,b;xapofx1_5=n,b";
+        setenv("WINEDLLOVERRIDES", (current.length ? [current stringByAppendingFormat:@";%@", add] : add).UTF8String, 1);
+    }
+    dprintf(STDERR_FILENO, "[WineProc] Symlinked %d Microsoft XAudio2 2.7 DLLs (%s) over Wine's builtins (Documents/%s)\n",
+            linked, x86 ? "x86" : "x64", x86 ? "xaudio2-32" : "xaudio2");
+}
+
+/* [bepinex-auto] A game folder modded with BepInEx (Unity Doorstop): the Doorstop proxy
+ * (winhttp.dll; version.dll, winmm.dll or dinput8.dll in other builds) sits beside the
+ * program with a BepInEx folder or doorstop_config.ini. Wine takes its own builtin of
+ * those names before a copy in the program's folder, so without "name=n,b" the proxy
+ * is never loaded and BepInEx never starts. The scan is pure C (host-tested,
+ * tests/host/check-bepinex-auto.py). It adds "name=n,b" for each proxy found, to the end
+ * of WINEDLLOVERRIDES, only when the game's own list does not name that DLL already
+ * (the Mods page's winhttp=n,b, or a line the player wrote, wins). A folder with a
+ * MelonLoader folder is left alone (MelonLoader has its own list). Off:
+ * env.MADEIRA_BEPINEX_AUTO = 0 in madeira.cfg, or in one game's own config for that
+ * game only. NOT device-tested. */
+/* bepinex-auto begin */
+static int madeira_bi_names(const char *list, const char *dll)
+{
+    size_t n = strlen(dll);
+    const char *p = list;
+    while (p && *p) {
+        const char *end = strchr(p, ';');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        const char *eq = memchr(p, '=', len);
+        size_t nl = eq ? (size_t)(eq - p) : len, i = 0;
+        while (i <= nl) {
+            size_t j = i, a = i, z;
+            while (j < nl && p[j] != ',') j++;
+            z = j;
+            while (a < z && p[a] == ' ') a++;           /* "video64= ; winhttp=d" */
+            while (z > a && p[z - 1] == ' ') z--;
+            if (z - a == n + 4 && !strncasecmp(p + a + n, ".dll", 4)) z -= 4;   /* "winhttp.dll=d" */
+            if (z - a == n && !strncasecmp(p + a, dll, n)) return 1;
+            i = j + 1;
+        }
+        p = end ? end + 1 : NULL;
+    }
+    return 0;
+}
+
+/* dir: the program's folder (host path). current: WINEDLLOVERRIDES now (may be NULL).
+ * Returns how many names were added (out = the new value); 0 = nothing to do (out = current).
+ * found: the proxy names in the folder ("winhttp version"), "" when it is not a BepInEx folder. */
+static int madeira_bepinex_scan(const char *dir, const char *current, char *out, size_t outsz, char *found, size_t foundsz)
+{
+    static const char *const proxies[] = { "winhttp", "version", "winmm", "dinput8" };
+    int has[4] = { 0, 0, 0, 0 }, bep = 0, ds = 0, melon = 0, added = 0;
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    snprintf(out, outsz, "%s", current ? current : "");
+    if (foundsz) found[0] = 0;
+    if (!d) return 0;
+    while ((e = readdir(d))) {
+        if (!strcasecmp(e->d_name, "BepInEx")) bep = 1;
+        else if (!strcasecmp(e->d_name, "doorstop_config.ini")) ds = 1;
+        else if (!strcasecmp(e->d_name, "MelonLoader")) melon = 1;
+        else for (int i = 0; i < 4; i++) {
+            size_t n = strlen(proxies[i]);
+            if (strlen(e->d_name) == n + 4 && !strncasecmp(e->d_name, proxies[i], n) && !strcasecmp(e->d_name + n, ".dll")) has[i] = 1;
+        }
+    }
+    closedir(d);
+    if (!(bep || ds) || melon) return 0;
+    for (int i = 0; i < 4; i++) {
+        if (!has[i] || (i > 0 && has[0])) continue;   /* winhttp.dll present: the other names are some other mod's, left as they are */
+        size_t fl = strlen(found);
+        if (fl + strlen(proxies[i]) + 2 < foundsz) snprintf(found + fl, foundsz - fl, "%s%s", fl ? " " : "", proxies[i]);
+        if (madeira_bi_names(out, proxies[i])) continue;
+        size_t ol = strlen(out);
+        if (ol + strlen(proxies[i]) + 6 >= outsz) continue;
+        snprintf(out + ol, outsz - ol, "%s%s=n,b", ol ? ";" : "", proxies[i]);
+        added++;
+    }
+    return added;
+}
+/* bepinex-auto end */
+
+/* The value WINEDLLOVERRIDES had before this launch's addition, put back at the session's end
+ * so a later game in the same app run does not inherit winhttp=n,b. */
+static int g_bepinex_added = 0;
+static char *g_bepinex_saved = NULL;
+
+static void madeira_bepinex_restore(void)
+{
+    if (!g_bepinex_added) return;
+    if (g_bepinex_saved) setenv("WINEDLLOVERRIDES", g_bepinex_saved, 1); else unsetenv("WINEDLLOVERRIDES");
+    free(g_bepinex_saved);
+    g_bepinex_saved = NULL;
+    g_bepinex_added = 0;
+}
+
+/* One folder: when it is a BepInEx folder, add the names (unless the switch is off) and log it.
+ * Returns 1 for a BepInEx folder, whether or not anything was added. */
+static int madeira_bepinex_folder(const char *dir)
+{
+    char out[1024], found[128];
+    const char *cur = getenv("WINEDLLOVERRIDES");
+    int added = madeira_bepinex_scan(dir, cur, out, sizeof(out), found, sizeof(found));
+    if (!found[0]) return 0;
+    const char *sw = getenv("MADEIRA_BEPINEX_AUTO");   /* 0: a game folder with BepInEx (Doorstop proxy winhttp.dll, or version/winmm/dinput8.dll when there is no winhttp.dll, + a BepInEx folder or doorstop_config.ini) is not given name=n,b in WINEDLLOVERRIDES; default on; put it in one game's own config to turn it off for that game only */
+    if (madeira_cfg_off_word(sw)) {
+        dprintf(STDERR_FILENO, "[WineProc] [bepinex-auto] BepInEx folder (%s) left alone: MADEIRA_BEPINEX_AUTO=%s\n", found, sw);
+        return 1;
+    }
+    if (added) {
+        madeira_bepinex_restore();
+        g_bepinex_saved = cur ? strdup(cur) : NULL;
+        g_bepinex_added = 1;
+        setenv("WINEDLLOVERRIDES", out, 1);
+    }
+    dprintf(STDERR_FILENO, "[WineProc] [bepinex-auto] BepInEx folder (%s) in %s: WINEDLLOVERRIDES=%s (%d added; MADEIRA_BEPINEX_AUTO=0 turns it off)\n",
+            found, dir, out, added);
+    return 1;
+}
+
+static void madeira_bepinex_auto(const char *prefix, const char *exe)
+{
+    /* A Madeira Dock start: its program is explorer.exe, and Valve's client starts the game later from its own
+     * folder, so the app names the game's folders (host paths, one per line) for this one start. */
+    char dirs[2048] = "";
+    const char *given = getenv("MADEIRA_BEPINEX_DIRS");   /* set by the app for one Dock start; not a setting */
+    if (given) snprintf(dirs, sizeof(dirs), "%s", given);
+    unsetenv("MADEIRA_BEPINEX_DIRS");
+    if (!exe) return;
+    if ((exe[0] == 'C' || exe[0] == 'c') && exe[1] == ':' && exe[2] == '\\') {
+        /* A C:\ program ("C:\dir\game.exe"): its own folder. */
+        const char *last = strrchr(exe, '\\');
+        char dir[1024];
+        if (!last || last <= exe + 2) return;
+        int n = snprintf(dir, sizeof(dir), "%s/drive_c/", prefix);
+        size_t len = (size_t)(last - (exe + 3));
+        if (n < 0 || (size_t)n + len + 1 > sizeof(dir)) return;
+        memcpy(dir + n, exe + 3, len);
+        dir[n + len] = 0;
+        for (char *p = dir + n; *p; p++) if (*p == '\\') *p = '/';
+        madeira_bepinex_folder(dir);
+        return;
+    }
+    if (strcasecmp(exe, "explorer.exe")) return;   /* anything else that is not a path: left alone */
+    char *save = NULL;
+    for (char *line = strtok_r(dirs, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
+        if (line[0] == '/' && madeira_bepinex_folder(line)) return;
+}
+
+/* C:\windows\<farm>: links whose bundle file is gone. Each session relinks
+ * every file the bundle has by its own name, but a link whose name the bundle
+ * no longer has stays behind, pointing at nothing. Wine's file lookup ignores
+ * case and takes the first name that matches, so a dead WLDAP32.dll beside
+ * the live wldap32.dll can still win and fail with c0000135. Only dead links
+ * into an app bundle are removed; links into Documents are left alone. */
+static void madeira_prune_dead_farm_links(NSString *dir)
+{
+    DIR *d = opendir(dir.fileSystemRepresentation);
+    struct dirent *e;
+    int pruned = 0;
+
+    if (!d) return;
+    while ((e = readdir(d)))
+    {
+        char path[PATH_MAX], target[PATH_MAX];
+        struct stat st;
+        ssize_t n;
+
+        if (e->d_name[0] == '.') continue;
+        if (snprintf(path, sizeof(path), "%s/%s", dir.fileSystemRepresentation, e->d_name) >= (int)sizeof(path))
+            continue;
+        if (lstat(path, &st) != 0 || !S_ISLNK(st.st_mode)) continue;
+        if (stat(path, &st) == 0) continue;   /* the link still resolves */
+        n = readlink(path, target, sizeof(target) - 1);
+        if (n <= 0) continue;
+        target[n] = 0;
+        if (!strstr(target, ".app/")) continue;
+        if (unlink(path) == 0) pruned++;
+    }
+    closedir(d);
+    if (pruned)
+        dprintf(STDERR_FILENO, "[farm-names] removed %d dead bundle links from %s\n", pruned, dir.UTF8String);
 }
 
 /* C:\windows\syswow64: the i386 farm, the Windows name for this pattern. A
@@ -1668,7 +1968,13 @@ static void *wine_process_thread(void *arg) {
         {
             NSError *aerr = nil;
             AVAudioSession *session = [AVAudioSession sharedInstance];
-            [session setCategory:AVAudioSessionCategoryPlayback error:&aerr];
+            /* Mixes with other apps' audio, so a Discord voice call or music keeps
+             * playing while a game runs (players asked after 0.2.0: Madeira cut both
+             * off). env.MADEIRA_AUDIO_MIX = 0 is applied once the config lines are
+             * exported (the [audio-mix] step below). */
+            [session setCategory:AVAudioSessionCategoryPlayback
+                     withOptions:AVAudioSessionCategoryOptionMixWithOthers
+                           error:&aerr];
             if (aerr) LOG("AVAudioSession setCategory failed: %{public}s",
                           aerr.localizedDescription.UTF8String);
             aerr = nil;
@@ -2008,6 +2314,19 @@ static void *wine_process_thread(void *arg) {
                     fprintf(stderr, "[japanese] LC_ALL=%s MADEIRA_NLS_EXTRA=1: Japanese system locale, code page 932\n",
                             getenv("LC_ALL"));
                 }
+                {   /* Audio with other apps (the session became active above, mixing): default on,
+                     * so a Discord voice call or music keeps playing while a game runs.
+                     * MADEIRA_AUDIO_MIX=0 (madeira.cfg or the game's config, exported above):
+                     * Madeira's audio stops the others, as it did in 0.2.0. */
+                    const char *mix = getenv("MADEIRA_AUDIO_MIX");
+                    BOOL mixes = !(mix && !strcmp(mix, "0"));
+                    NSError *merr = nil;
+                    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback
+                                                     withOptions:mixes ? AVAudioSessionCategoryOptionMixWithOthers : 0
+                                                           error:&merr];
+                    fprintf(stderr, "[audio-mix] mix with other apps=%d (MADEIRA_AUDIO_MIX)%s%s\n", mixes ? 1 : 0,
+                            merr ? ": refused, " : "", merr ? merr.localizedDescription.UTF8String : "");
+                }
                 {   /* madeira-bcd: the server's per-launch switches (fd_ios.c, request_ios.c) */
                     const char *ef = getenv("MADEIRA_SRV_ECO_FOLLOW");   /* 1: the server thread runs at utility QoS while ECO is on */
                     const char *dr = getenv("MADEIRA_SRV_DIRECT");       /* 1 or 2: listed requests run on the calling thread */
@@ -2230,10 +2549,26 @@ static void *wine_process_thread(void *arg) {
             NSFileManager *fm = [NSFileManager defaultManager];
 
             [fm createDirectoryAtPath:sys32Dir withIntermediateDirectories:YES attributes:nil error:nil];
+            for (NSString *farm in @[ @"system32", @"sysx64", @"sysaa64", @"syswow64" ])
+                madeira_prune_dead_farm_links([prefix stringByAppendingPathComponent:
+                    [@"drive_c/windows" stringByAppendingPathComponent:farm]]);
 
             NSArray *dlls = [fm contentsOfDirectoryAtPath:dllSource error:nil];
             int linked = 0;
+            // BeamNG.drive's native ARM64 exe imports d3dcompiler_47.dll; the aarch64 farm had none, so
+            // system32 kept an arm64ec link and the load failed c000007b. The aarch64 copy is linked only for a
+            // native ARM64 target (not WoW64 i386 ones). env.MADEIRA_AARCH64_D3DCOMPILER = 0 (or off/no) leaves
+            // it out and clears the system32 link so the cross-link pass below relinks the arm64ec file (old behaviour).
+            const BOOL skip_aa64_d3dc = !use_arm64ec &&
+                (is_i386_target || madeira_cfg_off_word(getenv("MADEIRA_AARCH64_D3DCOMPILER")));
             for (NSString *dll in dlls) {
+                if (skip_aa64_d3dc && [dll caseInsensitiveCompare:@"d3dcompiler_47.dll"] == NSOrderedSame) {
+                    // only our own symlink: a real file there (an installer's or a redist's) stays
+                    NSString *oldLink = [sys32Dir stringByAppendingPathComponent:dll];
+                    if ([[[fm attributesOfItemAtPath:oldLink error:nil] fileType] isEqualToString:NSFileTypeSymbolicLink])
+                        [fm removeItemAtPath:oldLink error:nil];
+                    continue;
+                }
                 NSString *src = [dllSource stringByAppendingPathComponent:dll];
                 NSString *dst = [sys32Dir stringByAppendingPathComponent:dll];
                 // Remove stale symlinks and re-create (bundle path changes on reinstall)
@@ -2323,6 +2658,7 @@ static void *wine_process_thread(void *arg) {
                 madeira_link_syswow64_wbem(fm, prefix, bundlePath);
                 madeira_seed_winsxs_x86(fm, prefix, bundlePath);
                 madeira_overlay_vcruntime32(fm, prefix);   /* VCRedist.swift's Microsoft x86 runtime */
+                madeira_overlay_xaudio2(fm, prefix, YES);   /* VCRedist.swift's XAudio2 2.7 */
             }
             madeira_ensure_wine_inf_dirs(fm, prefix, has_i386_set);
             madeira_link_wine_mono(fm, prefix, bundlePath);
@@ -2330,6 +2666,7 @@ static void *wine_process_thread(void *arg) {
             if (madeira_d3d9_wined3d_wanted())
                 madeira_link_d3d9_wined3d(fm, prefix, bundlePath, has_i386_set);
             madeira_setup_vulkan(fm, prefix, bundlePath, use_arm64ec);
+            if (use_arm64ec) madeira_overlay_xaudio2(fm, prefix, NO);
 
             /* ml719: REPAIR THE SHELL FOLDERS. They ship as symlinks to the BUILD
              * MACHINE's home directory.
@@ -2691,6 +3028,8 @@ static void *wine_process_thread(void *arg) {
             }
         }
 
+        madeira_bepinex_auto(g_prefix_path, madeira_exe);   /* [bepinex-auto] winhttp=n,b for a BepInEx folder */
+
         // Record this thread so wine_ios_exit knows where to longjmp
         wine_ios_main_thread = pthread_self();
         wine_ios_exit_initialized = 1;
@@ -2732,6 +3071,7 @@ static void *wine_process_thread(void *arg) {
             const char *wc = getenv("MADEIRA_WAIT_CHILDREN");
             char names[256];
             int n = madeira_live_game_children(names, sizeof names, 60.0);
+            if (n > 0) madeira_note_handed_to_steam(names);
             if (n > 0 && !(wc && wc[0] == '1')) {
                 dprintf(STDERR_FILENO, "[WineProc] the main process exited while %d child process(es) it started "
                         "still run (%s); the session ends with it (MADEIRA_WAIT_CHILDREN=1 keeps it while they run)\n",
@@ -2740,9 +3080,18 @@ static void *wine_process_thread(void *arg) {
                 dprintf(STDERR_FILENO, "[WineProc] the main process exited but %d child process(es) "
                         "it started still run (%s) -- a launcher started the game; the session goes on until "
                         "they exit (MADEIRA_WAIT_CHILDREN=1)\n", n, names);
-                unsigned ticks = 0;
+                unsigned ticks = 0, quitTicks = 0;
                 while ((n = madeira_live_game_children(names, sizeof names, -1.0)) > 0) {
                     usleep(200 * 1000);
+                    /* quit-ends-children: the player quit and the desktop was closed, but a
+                     * game that ignores the close (Stardew Valley, Nov 8) kept the session,
+                     * and with it Steam downloads and Repair, held forever. 10 s after
+                     * Quit the wait ends; wineserver_stop below closes what is left. */
+                    if (__atomic_load_n(&g_madeira_quit_asked, __ATOMIC_ACQUIRE) && ++quitTicks >= 50) {
+                        dprintf(STDERR_FILENO, "[WineProc] quit-ends-children: Quit was asked; %d child process(es) (%s) "
+                                "still run 10 s later, ending the session\n", n, names);
+                        break;
+                    }
                     if ((++ticks % 300) == 0)
                         dprintf(STDERR_FILENO, "[WineProc] still running: %d child process(es) (%s), %u s\n",
                                 n, names, ticks / 5);
@@ -2758,6 +3107,8 @@ static void *wine_process_thread(void *arg) {
         unsetenv("MADEIRA_CPU_COUNT"); unsetenv("DXMT_D9_ANISO_LIMIT");
         unsetenv("FEX_X87REDUCEDPRECISION");   /* ml1184 */
         unsetenv("MADEIRA_DINPUT_PAD");        /* ml1240 */
+        madeira_bepinex_restore();             /* [bepinex-auto] WINEDLLOVERRIDES as it was before this launch */
+        unsetenv("MADEIRA_BEPINEX_AUTO");      /* a game's own off line must not reach the next game */
         unsetenv("MADEIRA_DESKTOP");           /* each launch chooses its own presentation mode */
         unsetenv("MADEIRA_DIRECT_WINDOW_SIZE"); /* a game's opt-in must not resize the next game */
         /* madeira-bcd: Horizon Zero Dawn's per-game switches must not reach a later game
@@ -2800,6 +3151,7 @@ int wine_process_start(const char *prefix_path) {
         LOG("Wine process already running");
         return 0;
     }
+    __atomic_store_n(&g_madeira_quit_asked, 0, __ATOMIC_RELEASE);   /* quit-ends-children */
 
     if (g_prefix_path) free(g_prefix_path);
     g_prefix_path = strdup(prefix_path);
@@ -2882,6 +3234,7 @@ int madeira_write_continue_flag(void) {
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
+
 static void mc_sample(const char *mode, const char *phase, uint64_t *fp_out) {
     task_vm_info_data_t v; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
     memset(&v, 0, sizeof v);

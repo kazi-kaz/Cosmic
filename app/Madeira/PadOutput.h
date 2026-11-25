@@ -24,4 +24,8 @@ void madeira_pad_output_set_slot(int slot, GCController *_Nullable controller);
 /// adaptive triggers go off. 1 re-applies what the game last asked for.
 void madeira_pad_output_set_active(int active);
 
+/// The game session ended (exit or crash): stops every motor and trigger effect
+/// and clears the stored motor speeds.
+void madeira_pad_output_session_end(void);
+
 NS_ASSUME_NONNULL_END

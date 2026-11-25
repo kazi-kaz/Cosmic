@@ -368,6 +368,9 @@ enum SteamDirectStart {
     /// The beta branch each of those install records names (`BetaKey`); none for public.
     @Published private(set) var branches: [Int: String] = [:]
     private var scanning = false
+    /// (new-look) The install records were read at least once since Madeira started: until then an
+    /// empty list means "not read yet", not "nothing installed".
+    @Published private(set) var scanned = false
     /// A refresh was asked for while a scan ran (an install record was just
     /// written): scan again once it ends.
     private var rescan = false
@@ -409,8 +412,15 @@ enum SteamDirectStart {
             let recordedBranches = branches
             await MainActor.run {
                 self.scanning = false
+                if !self.scanned { self.scanned = true }
                 let again = self.rescan
                 self.rescan = false
+                let lost = self.games.filter { old in !found.contains { $0.id == old.id } }
+                if !lost.isEmpty {
+                    // Which installed games disappeared from a scan, and the library each one was in (a drive that
+                    // could not be read leaves no other trace).
+                    LogStore.shared.log("[steam-games] scan found \(found.count), was \(self.games.count); missing: " + lost.prefix(20).map { "\($0.name) (\($0.library))" }.joined(separator: "; "))
+                }
                 if self.games != found { self.games = found }
                 if self.builds != recorded { self.builds = recorded }
                 if LibraryGridArm.enabled {
@@ -463,16 +473,28 @@ struct SteamGamesSection: View {
     @ObservedObject private var model = SteamGamesModel.shared
     @ObservedObject private var steam = SteamOwnedLibrary.shared
     @ObservedObject private var library = LibraryModel.shared
+    /// Select mode and the batch uninstall (BatchUninstall.swift); its state lives in that singleton.
+    @ObservedObject private var batch = BatchUninstall.shared
+    @State private var confirmBatch = false
     @Environment(\.scenePhase) private var scenePhase
     // Collapsed state of the installed games (the Steam title) and of Not installed.
+
     @AppStorage("madeiraLibraryHideInstalled") private var hideInstalled = false
     @AppStorage("madeiraSteamShowUninstalled") private var showUninstalled = true
+    /// (new-look) The store's page lists games to install first; the installed ones fold away under them (closed at first).
+    @AppStorage("madeiraNewLookSteamShowInstalled") private var showInstalled = false
     @State private var selected: SteamGameSelection?
     @State private var showSignIn = false
     @State private var showWorkshop = false
+    /// Add a Free Game: the alert that asks for the app ID or link, and Steam's answer.
+    @State private var askingFree = false
+    @State private var freeText = ""
+    @State private var addingFree = false
+    @State private var freeResult: String?
 
     /// MADEIRA_LIBRARY_COLLAPSE=0: the section titles do not collapse.
-    static var collapsible: Bool { MadeiraConfig.flag("MADEIRA_LIBRARY_COLLAPSE") }
+    /// (new-look) Never in the new look: a store's page always shows its games.
+    static var collapsible: Bool { false }
     private var libraryEnabled: Bool { SteamOwnedLibrary.enabled }
 
     /// Whether the library shows this section, and with it the sectioned
@@ -538,6 +560,10 @@ struct SteamGamesSection: View {
         let items = SteamGamesRules.items(installed: model.games, owned: owned, search: search)
         let groups = SteamGamesRules.groups(items, downloading: Set(steam.downloads.keys))
         let installed = SteamGamesRules.sorted(groups.installed, by: sort, recorded: recorded)
+        // (new-look) Games to install come first (the Library tab already has the installed ones): what is
+        // downloading stays on top, the installed games go under Not installed in a group that starts closed.
+        let fold = part == .all
+        let top = fold ? groups.downloading : groups.downloading + installed
         let collapsible = Self.collapsible
         Group {
             if Self.shown {
@@ -552,6 +578,7 @@ struct SteamGamesSection: View {
                                 Label("Workshop", systemImage: "square.stack.3d.up").font(.subheadline)
                             }
                             .accessibilityLabel("Steam Workshop")
+                            .padItem("steam-workshop", cornerRadius: 12) { showWorkshop = true }
                         }
                     }
                     // Signed out: the account's games need a sign-in; say so here rather
@@ -575,18 +602,18 @@ struct SteamGamesSection: View {
                     }
                     if hideInstalled && collapsible {
                         EmptyView()
-                    } else if !groups.downloading.isEmpty || !installed.isEmpty {
-                        LibraryCells(items: groups.downloading + installed, layout: layout, width: width) { item, list, dense in
+                    } else if !top.isEmpty {
+                        LibraryCells(items: top, layout: layout, width: width) { item, list, dense in
                             cell(item, list: list, dense: dense)
                         }
-                    } else if signedIn && !steam.refreshing && groups.notInstalled.isEmpty && search.isEmpty {
+                    } else if signedIn && !steam.refreshing && groups.notInstalled.isEmpty && installed.isEmpty && search.isEmpty {
                         Text(steam.libraryUpdated == nil ? "Pull down to load your Steam library."
                              : "No Windows games were found in this Steam library.").foregroundStyle(.secondary)
                     }
                     }
                     if part != .installed && signedIn && !groups.notInstalled.isEmpty {
                         Button {
-                            withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.2)) { showUninstalled.toggle() }
+                            var instant = Transaction(); instant.disablesAnimations = true; withTransaction(instant) { showUninstalled.toggle() }   // at once (Cameron, Nov 7)
                         } label: {
                             HStack {
                                 Text("Not installed").font(.headline)
@@ -597,11 +624,42 @@ struct SteamGamesSection: View {
                             }.contentShape(Rectangle()).frame(minHeight: 44)
                         }.buttonStyle(.plain)
                             .accessibilityValue(showUninstalled ? "Shown" : "Hidden")
+                            .padItem("steam-not-installed", cornerRadius: 16) { showUninstalled.toggle() }
                         if showUninstalled {
                             LibraryCells(items: groups.notInstalled, layout: layout, width: width) { item, list, dense in
                                 cell(item, list: list, dense: dense)
                             }
                         }
+                    }
+                    if fold && !installed.isEmpty {
+                        // Nothing to install or download: the installed games just show, with a plain title.
+                        let only = top.isEmpty && !(signedIn && !groups.notInstalled.isEmpty)
+                        // Select: the installed games Madeira's downloads own can be removed together.
+                        let removable = installed.compactMap { item in item.installed.flatMap { BatchUninstall.eligible($0) ? item.id : nil } }
+                        HStack(spacing: 8) {
+                            NewLookInstalledHeader(id: "steam-installed", count: installed.count, open: only ? nil : $showInstalled)
+                            if BatchUninstall.enabled, !batch.selecting, !batch.running, !removable.isEmpty {
+                                Button(L("Select")) { showInstalled = true; batch.begin() }
+                                    .padItem("batch-select", cornerRadius: 12) { showInstalled = true; batch.begin() }
+                            }
+                        }
+                        BatchUninstallBar(eligible: removable, confirm: $confirmBatch)
+                        if only || showInstalled || batch.selecting {
+                            LibraryCells(items: installed, layout: layout, width: width) { item, list, dense in
+                                cell(item, list: list, dense: dense)
+                            }
+                        }
+                    }
+                    // (store page) A free game (TF2 and the like) shows only once the account has
+                    // added it on Steam; this asks Steam for its free license from here.
+                    if fold && signedIn {
+                        NewLookSheetButton(id: "steam-add-free", title: addingFree ? L("Adding…") : L("Add a Free Game"),
+                                           symbol: "plus") {
+                            guard !addingFree else { return }
+                            freeText = ""; askingFree = true
+                        }
+                        .frame(maxWidth: 360)
+                        .disabled(addingFree)
                     }
                 }
             } else {
@@ -628,14 +686,67 @@ struct SteamGamesSection: View {
         }
         .sheet(isPresented: $showSignIn) { SteamSignInView() }
         .sheet(isPresented: $showWorkshop) { SteamWorkshopHub() }
+        // (new-look) Search's "In your stores": this game's sheet, once the Steam page shows.
+        .onReceive(LibraryStoreSheets.shared.$steamGame) { game in
+            guard let game else { return }
+            LibraryStoreSheets.shared.steamGame = nil
+            selected = SteamGameSelection(id: game.id)
+        }
+        .alert(L("Add a Free Game"), isPresented: $askingFree) {
+            TextField(L("App ID or store link"), text: $freeText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button(L("Add")) {
+                let text = freeText
+                addingFree = true
+                Task { @MainActor in
+                    freeResult = await steam.addFreeGame(text)
+                    addingFree = false
+                }
+            }
+            Button(L("Cancel"), role: .cancel) {}
+        } message: {
+            Text(L("A free-to-play Steam game you have never added, such as Team Fortress 2 (440). Steam adds it to your account."))
+        }
+        .alert(L("Add a Free Game"), isPresented: Binding(get: { freeResult != nil }, set: { if !$0 { freeResult = nil } })) {
+            Button(L("OK"), role: .cancel) { freeResult = nil }
+        } message: { Text(freeResult ?? "") }
         .alert("Steam", isPresented: Binding(get: { steam.error != nil }, set: { if !$0 { steam.error = nil } })) {
             Button("OK", role: .cancel) { steam.error = nil }
         } message: { Text(steam.error ?? "") }
+        // One question for the whole batch (Apple's confirmation dialog, destructive button, Cancel).
+        .confirmationDialog(batch.selected.count == 1 ? L("Uninstall 1 game?") : String(format: L("Uninstall %d games?"), batch.selected.count),
+                            isPresented: $confirmBatch, titleVisibility: .visible) {
+            Button(batch.selected.count == 1 ? L("Uninstall 1 Game") : String(format: L("Uninstall %d Games"), batch.selected.count),
+                   role: .destructive) { batch.uninstallSelected() }
+            Button(L("Cancel"), role: .cancel) {}
+        } message: {
+            Text(batch.freesSentence + L("Cloud saves stay in Steam. You can install them again later."))
+        }
+        .sheet(item: $batch.result) { BatchResultSheet(result: $0) }
     }
 
     private func cell(_ item: SteamGamesRules.Item, list: Bool, dense: Bool) -> some View {
-        Button { select(item) } label: { SteamGameCell(item: item, list: list, dense: dense) }
-            .libraryCardButtonStyle(grid: !list)
+        // Select mode: a tap marks or unmarks a game Uninstall can remove; the others dim. No disk is read here.
+        let selectable = batch.selecting && (item.installed.map { BatchUninstall.eligible($0) } ?? false)
+        return Button {
+            if batch.selecting { if selectable { batch.toggle(item.id) } } else { select(item) }
+        } label: {
+            SteamGameCell(item: item, list: list, dense: dense)
+                .overlay(alignment: .topTrailing) {
+                    if selectable {
+                        let marked = batch.selected.contains(item.id)
+                        Image(systemName: marked ? "checkmark.circle.fill" : "circle")
+                            .font(.title2)
+                            .foregroundStyle(marked ? Color.accentColor : Color.secondary)
+                            .background(Circle().fill(.background))
+                            .padding(8)
+                            .accessibilityLabel(marked ? L("Selected") : L("Not selected"))
+                    }
+                }
+                .opacity(batch.selecting && !selectable ? 0.4 : 1)
+        }
+        .libraryCardButtonStyle(grid: !list, pad: "steam:\(item.id)")
     }
 
     /// An installed game (by Madeira's download or by Steam's client) opens its
@@ -666,6 +777,7 @@ struct SteamSignInCard: View {
             }.padding(14)
                 .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
         }.buttonStyle(.plain)
+            .padItem("signin:steam", cornerRadius: 16, press: signIn)
     }
 }
 
@@ -682,6 +794,21 @@ struct SteamGameArtwork: View {
     @State private var index = 0
 
     var body: some View {
+        if LibraryCachedArtwork.enabled {
+            // The cache's copy, the blur spot baked in for a not-downloaded game as the zoomable grid draws it (LibraryCoverCache.swift).
+            LibraryCachedArtwork(source: cachedSource, glyph: notDownloaded ? nil : "gamecontroller.fill")
+        } else {
+            asyncArtwork
+        }
+    }
+
+    private var cachedSource: LibraryCoverCache.Source {
+        var source = LibraryCoverCache.Source.steam(appID)
+        source.spot = notDownloaded
+        return source
+    }
+
+    @ViewBuilder private var asyncArtwork: some View {
         let urls = SteamGamesRules.artwork(appID: appID) { steam.game($0) }
         GeometryReader { geometry in
             ZStack {
@@ -814,10 +941,7 @@ struct SteamGameCell: View {
                         .overlay { overlay(download) }
                         .overlay { if notDownloaded { notDownloadedFace(.largeTitle) } }
                         .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .modifier(LibraryCardArtworkPress { pressed, bounds in
-                            AmbientGlowItem(id: "steam-\(item.id)", seed: item.id, art: .steam(item.id), dimmed: notDownloaded,
-                                            pressed: pressed, bounds: bounds)
-                        })
+                        .modifier(LibraryCardArtworkPress())
                     Text(item.name).font(.subheadline.weight(.semibold)).lineLimit(2)
                     pills(status, entry)
                     if let played = steam.playtime[item.id]?.played {
@@ -1157,6 +1281,8 @@ struct SteamGameSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var freeSpace: Int64?
     @State private var partial = false
+    /// False until the partial-download check has answered (it runs off the main thread).
+    @State private var partialKnown = false
     @State private var confirmCancel = false
     @ObservedObject private var drives = ExternalDrives.shared
     /// Where a new download goes (Install on); the setting's choice by default.
@@ -1178,6 +1304,7 @@ struct SteamGameSheet: View {
                                     Text(summary).font(.subheadline).foregroundStyle(.secondary)
                                 }
                                 primaryAction(item)
+                                    .padSheet { primaryPress(item)?() }
                             }
                         }.padding(.vertical, 24)
                             .listRowBackground(
@@ -1202,7 +1329,7 @@ struct SteamGameSheet: View {
                             Picker("Install on", selection: Binding(get: { target ?? steam.library(for: appID) }, set: { target = $0 })) {
                                 ForEach(choices, id: \.library) { Text($0.name).tag($0.library) }
                             }
-                            .disabled(steam.downloads[appID] != nil || partial)
+                            .disabled(steam.downloads[appID] != nil || partial || !partialKnown)
                         }
                         if item.installed == nil { SteamGameLanguagePicker(appID: appID) }
                         if item.installed == nil { SteamBranchPicker(appID: appID) }
@@ -1244,7 +1371,9 @@ struct SteamGameSheet: View {
             .navigationTitle("Steam").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
             .task(id: "\(String(describing: steam.downloads[appID]?.state))\(target ?? "")") {
-                partial = steam.hasPartialDownload(appID)
+                let found = await steam.hasPartialDownloadAsync(appID)
+                if Task.isCancelled { return }   // a newer run owns the answer
+                partial = found; partialKnown = true
                 freeSpace = SteamOwnedLibrary.drive.appendingPathComponent(target ?? steam.library(for: appID)).freeSpace
             }
             .task(id: appID) { await steam.refreshBranches(appID) }
@@ -1277,14 +1406,34 @@ struct SteamGameSheet: View {
                 Button { steam.install(appID) } label: { steamActionLabel("Resume", symbol: "arrow.down.circle.fill") }
                     .buttonStyle(.borderedProminent)
             case .failed:
-                Button { steam.install(appID) } label: { steamActionLabel("Try again", symbol: "arrow.clockwise") }
+                Button { steam.install(appID) } label: { steamActionLabel("Try Again", symbol: "arrow.clockwise") }
                     .buttonStyle(.borderedProminent)
             }
         } else if item.owned != nil {
             Button { steam.install(appID, library: partial ? nil : target) } label: {
                 steamActionLabel(partial ? "Resume download" : "Install", symbol: "arrow.down.circle.fill")
-            }.buttonStyle(.borderedProminent).disabled(!steam.signedIn)
+            }.buttonStyle(.borderedProminent).disabled(!steam.signedIn || !partialKnown)
         }
+    }
+
+    /// What A on a controller does on this sheet (PadHighlight.swift): the same as the button above.
+    private func primaryPress(_ item: SteamGamesRules.Item) -> (() -> Void)? {
+        if let installed = item.installed {
+            // The download finished (or Steam's client installed the game): its Game details page.
+            return { let entry = LibraryModel.shared.steamEntry(installed, title: item.name); dismiss(); open(entry) }
+        } else if let download = steam.downloads[appID] {
+            switch download.state {
+            case .active, .queued:
+                return { steam.pause(appID) }
+            case .paused:
+                return { steam.install(appID) }
+            case .failed:
+                return { steam.install(appID) }
+            }
+        } else if item.owned != nil {
+            return steam.signedIn && partialKnown ? { steam.install(appID, library: partial ? nil : target) } : nil
+        }
+        return nil
     }
 }
 
@@ -1306,6 +1455,9 @@ func steamActionLabel(_ title: String, symbol: String) -> some View {
 /// The session menu's "Upload saves and close Madeira" (SteamOwnedLibrary.uploadForQuit).
 struct SteamCloudQuitRow: View {
     let appID: Int
+    /// The Session menu's Quit game button: drawn beside Upload saves, or alone when
+    /// the upload is not offered (not signed in).
+    var beside: AnyView? = nil
     @ObservedObject private var steam = SteamOwnedLibrary.shared
     @State private var confirmReplace = false
 
@@ -1324,8 +1476,20 @@ struct SteamCloudQuitRow: View {
     var body: some View {
         if SteamOwnedLibrary.cloudQuitEnabled, steam.signedIn {
             VStack(alignment: .leading, spacing: 8) {
-                Button("Upload saves and close Madeira", systemImage: "icloud.and.arrow.up") { run(replaceCloud: false) }
-                    .disabled(working)
+                if let beside {
+                    HStack(spacing: 10) {
+                        Button { run(replaceCloud: false) } label: {
+                            VStack(spacing: 2) {
+                                Label("Upload saves", systemImage: "icloud.and.arrow.up")
+                                Text("and close").font(.caption2).foregroundStyle(.secondary)
+                            }.frame(maxWidth: .infinity)
+                        }.buttonStyle(.bordered).tint(.gray).foregroundStyle(.primary).disabled(working)
+                        beside
+                    }
+                } else {
+                    Button("Upload saves and close Madeira", systemImage: "icloud.and.arrow.up") { run(replaceCloud: false) }
+                        .disabled(working)
+                }
                 switch steam.cloudQuit {
                 case .working(let text):
                     HStack(spacing: 10) { ProgressView(); Text(text).font(.callout) }
@@ -1345,9 +1509,11 @@ struct SteamCloudQuitRow: View {
                 case nil:
                     EmptyView()
                 }
-                Text("Save in the game first. Uploads this game's saves to Steam Cloud, then closes Madeira; Steam in this session is signed out when the upload starts.")
+                Text("Save in the game first. Steam signs out when the upload starts.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+        } else if let beside {
+            beside
         }
     }
 }
@@ -1407,7 +1573,7 @@ struct SteamCloudSection: View {
                 ProgressView(value: Double(done), total: Double(max(total, 1))) { Text("Uploading \(done) of \(total)") }
             case .failed(let message):
                 Text(message).font(.callout).foregroundStyle(.orange)
-                Button("Try again") { Task { await steam.syncCloud(appID) } }
+                Button("Try Again") { Task { await steam.syncCloud(appID) } }
             case .ready:
                 ready(state)
             }
@@ -1489,6 +1655,38 @@ struct SteamCloudSection: View {
 struct InstalledDLC: Identifiable, Equatable {
     let id: Int
     let bytes: Int64
+}
+
+/// Uninstall on the game's own page, under its settings: players looked for it there and
+/// did not find it on the Steam page below Repair (about eight asked after 0.2.0). The same
+/// rule and question as the Steam page's button: only a game Madeira downloaded into Dock's
+/// own library folder, and not while a download runs.
+struct SteamUninstallSection: View {
+    let entry: LibraryEntry
+    /// The game was uninstalled: the page closes without saving.
+    var uninstalled: () -> Void
+    @ObservedObject private var steam = SteamOwnedLibrary.shared
+    @ObservedObject private var games = SteamGamesModel.shared
+    @State private var confirmUninstall = false
+
+    var body: some View {
+        let appID = entry.steamAppID ?? 0
+        let installed = games.games.first { $0.id == appID }
+        let managed = installed.map { SteamInstallPaths.isManaged(library: $0.library) } ?? false
+        if appID != 0, managed, steam.downloads[appID] == nil {
+            Section {
+                Button("Uninstall", systemImage: "trash", role: .destructive) { confirmUninstall = true }
+                    .foregroundStyle(.red)
+            }
+            .confirmationDialog("Uninstall \(entry.title)? Its downloaded files are deleted from where it is installed. Saves stored elsewhere are kept.",
+                                isPresented: $confirmUninstall, titleVisibility: .visible) {
+                Button("Uninstall", role: .destructive) {
+                    if let installed { steam.uninstall(installed) }
+                    uninstalled()
+                }
+            }
+        }
+    }
 }
 
 struct SteamEntrySection: View {

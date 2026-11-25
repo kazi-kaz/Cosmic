@@ -86,7 +86,16 @@ struct endpoint {
     unsigned int device;
 };
 
-struct main_loop_params { HANDLE event; };
+/* Wine 11.22: main_loop became main_loop_start / main_loop_stop (no arguments,
+ * the driver runs its own main loop if it needs one), release_stream no longer
+ * carries a timer thread and timer_loop left the table: upstream drivers now
+ * run the timer on a TEB-less "system thread" they create themselves. Here the
+ * timer stays on a real Wine thread that mmdevapi creates, as before: start
+ * answers MADEIRA_S_PE_TIMER the first time and mmdevapi (Madeira's patch in
+ * dlls/mmdevapi/client.c) then starts that thread into the extra call at the
+ * end of the table (MADEIRA_UNIX_TIMER_LOOP == funcs_count). Both values are
+ * defined in wine/dlls/mmdevapi/unixlib.h; keep them in step. */
+#define IOS_MADEIRA_S_PE_TIMER ((HRESULT)0x004d5054)
 
 struct get_endpoint_ids_params {
     EDataFlow flow;
@@ -127,7 +136,6 @@ struct stream_handle_only { stream_handle stream; };
 
 struct release_stream_params {
     stream_handle stream;
-    HANDLE timer_thread;
     HRESULT result;
 };
 
@@ -335,6 +343,10 @@ static const char IOS_DEVICE_NAME[] = "ios-null";
 struct ios_stream {
     int valid;
     int started;
+    /* Wine 11.22 timer thread bookkeeping (see the top of the file): start has
+     * asked mmdevapi for the thread / it has not entered the loop yet / it is
+     * in the loop. release_stream waits on the last two. */
+    _Atomic int timer_asked, timer_pending, timer_running;
     uint64_t start_mach;        /* mach_absolute_time() at start() (null-mode clock) */
     uint64_t accumulated_frames; /* null-mode: frames "played" before last stop */
     UINT32 sample_rate;
@@ -564,7 +576,7 @@ extern NTSTATUS NtSetEvent( HANDLE handle, void *prev_state );
 /* Per-function call counters. Print every 1000 calls so we can confirm
  * FMOD is actually exercising the driver. Cheap atomic increments. */
 #include <stdatomic.h>
-#define NULL_AUDIO_FN_COUNT 37
+#define NULL_AUDIO_FN_COUNT 40
 static _Atomic uint32_t g_call_counter[NULL_AUDIO_FN_COUNT];
 #define LOG_FN_CALL(idx, name) do { \
     uint32_t n = atomic_fetch_add_explicit(&g_call_counter[idx], 1, memory_order_relaxed) + 1; \
@@ -1421,6 +1433,20 @@ static NTSTATUS ios_process_detach(void *args) {
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS ios_main_loop_start(void *args) {
+    /* Wine 11.22: nothing waits on an event any more and this driver has no
+     * main loop of its own. */
+    (void)args;
+    LOG_FN_CALL(2, "main_loop_start");
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ios_main_loop_stop(void *args) {
+    (void)args;
+    return STATUS_SUCCESS;
+}
+
+#if 0   /* Wine 11.4 main_loop, kept for reference */
 static NTSTATUS ios_main_loop(void *args) {
     /* CONTRACT (mmdevapi client.c main_loop_start): the PE side blocks
      * WaitForSingleObject(event, INFINITE) until the driver signals this
@@ -1433,6 +1459,7 @@ static NTSTATUS ios_main_loop(void *args) {
     NtSetEvent(p->event, NULL);
     return STATUS_SUCCESS;
 }
+#endif
 
 static NTSTATUS ios_get_endpoint_ids(void *args) {
     LOG_FN_CALL(3, "get_endpoint_ids");
@@ -1583,9 +1610,20 @@ static NTSTATUS ios_release_stream(void *args) {
      * about to free. Nothing here touches another client's stream. */
     s->valid = 0;
     s->started = 0;
-    if (p->timer_thread) {
-        NtWaitForSingleObject(p->timer_thread, FALSE, NULL);
-        NtClose(p->timer_thread);
+    /* Wine 11.22: no thread handle to join any more. Wait for the timer loop
+     * to leave instead; one that was asked for but has not arrived yet gets
+     * two seconds (mmdevapi failed to create it), a running one wakes within
+     * 10 ms. */
+    {
+        unsigned int waited_ms = 0;
+        while (atomic_load_explicit(&s->timer_running, memory_order_acquire) ||
+               (atomic_load_explicit(&s->timer_pending, memory_order_acquire) && waited_ms < 2000)) {
+            usleep(1000);
+            if (++waited_ms == 5000) {
+                fprintf(stderr, "[ios_audio] release: stream=%p timer loop still running after 5 s, releasing anyway\n", (void *)s);
+                break;
+            }
+        }
     }
     ios_dev_detach(s);
     ios_dev_stop_if_idle();
@@ -1611,6 +1649,11 @@ static NTSTATUS ios_start(void *args) {
         ios_dev_start();
     }
     p->result = S_OK;
+    /* once per stream: ask mmdevapi for the timer thread (see the top of the file) */
+    if (!atomic_exchange_explicit(&s->timer_asked, 1, memory_order_acq_rel)) {
+        atomic_store_explicit(&s->timer_pending, 1, memory_order_release);
+        p->result = IOS_MADEIRA_S_PE_TIMER;
+    }
     return STATUS_SUCCESS;
 }
 
@@ -1711,6 +1754,8 @@ static NTSTATUS ios_timer_loop(void *args) {
     uint64_t pad_min = UINT64_MAX, pad_max = 0, late_max_ns = 0;
 
     if (!s) return STATUS_SUCCESS;
+    atomic_store_explicit(&s->timer_running, 1, memory_order_release);
+    atomic_store_explicit(&s->timer_pending, 0, memory_order_release);
     LOG_FN_CALL(9, "timer_loop");
     if (ios_audio_lead_ms()) ios_audio_timer_thread_rt();
     while (s->valid) {
@@ -1793,6 +1838,8 @@ static NTSTATUS ios_timer_loop(void *args) {
         t = mach_absolute_time();
         if (t > deadline && mach_to_ns(t - deadline) > late_max_ns) late_max_ns = mach_to_ns(t - deadline);
     }
+    /* last touch of the stream: release_stream frees it once this is clear */
+    atomic_store_explicit(&s->timer_running, 0, memory_order_release);
     return STATUS_SUCCESS;
 }
 
@@ -2250,14 +2297,14 @@ static NTSTATUS ios_aux_message(void *args) {
 const void *audio_null_ios_unix_call_funcs[] = {
     ios_process_attach,                /* process_attach */
     ios_process_detach,                /* process_detach */
-    ios_main_loop,                     /* main_loop */
+    ios_main_loop_start,               /* main_loop_start (args == NULL) */
+    ios_main_loop_stop,                /* main_loop_stop  (args == NULL) */
     ios_get_endpoint_ids,              /* get_endpoint_ids */
     ios_create_stream,                 /* create_stream */
     ios_release_stream,                /* release_stream */
     ios_start,                         /* start */
     ios_stop,                          /* stop */
     ios_reset,                         /* reset */
-    ios_timer_loop,                    /* timer_loop */
     ios_get_render_buffer,             /* get_render_buffer */
     ios_release_render_buffer,         /* release_render_buffer */
     ios_get_capture_buffer,            /* get_capture_buffer */
@@ -2285,6 +2332,7 @@ const void *audio_null_ios_unix_call_funcs[] = {
     ios_midi_message,                  /* midi_in_message */
     ios_midi_notify_wait,              /* midi_notify_wait */
     ios_aux_message,                   /* aux_message */
+    ios_timer_loop,                    /* MADEIRA_UNIX_TIMER_LOOP (== funcs_count), Madeira only */
 };
 
 /* The MIDI/aux blocks carry pointers too, and a 32-bit mmdevapi builds them
@@ -2379,15 +2427,6 @@ static NTSTATUS ios_wow64_aux_message(void *args)
  * not in the window.
  */
 
-static NTSTATUS ios_wow64_main_loop(void *args)
-{
-    struct {
-        PTR32 event;
-    } *params32 = args;
-    struct main_loop_params params = { .event = IOS_WOW_HANDLE(params32->event) };
-    return ios_main_loop(&params);
-}
-
 static NTSTATUS ios_wow64_get_endpoint_ids(void *args)
 {
     struct {
@@ -2447,21 +2486,8 @@ static NTSTATUS ios_wow64_create_stream(void *args)
     return status;
 }
 
-static NTSTATUS ios_wow64_release_stream(void *args)
-{
-    struct {
-        stream_handle stream;
-        PTR32 timer_thread;
-        HRESULT result;
-    } *params32 = args;
-    struct release_stream_params params = {
-        .stream = params32->stream,
-        .timer_thread = IOS_WOW_HANDLE(params32->timer_thread),
-    };
-    NTSTATUS status = ios_release_stream(&params);
-    params32->result = params.result;
-    return status;
-}
+/* Wine 11.22: { stream, result } only, the same layout for both bitnesses. */
+#define ios_wow64_release_stream ios_release_stream
 
 static NTSTATUS ios_wow64_get_render_buffer(void *args)
 {
@@ -2793,14 +2819,14 @@ static NTSTATUS ios_wow64_get_prop_value(void *args)
 const void *audio_null_ios_unix_call_wow64_funcs[] = {
     ios_process_attach,                /* process_attach  (args == NULL) */
     ios_process_detach,                /* process_detach  (args == NULL) */
-    ios_wow64_main_loop,               /* main_loop */
+    ios_main_loop_start,               /* main_loop_start (args == NULL) */
+    ios_main_loop_stop,                /* main_loop_stop  (args == NULL) */
     ios_wow64_get_endpoint_ids,        /* get_endpoint_ids */
     ios_wow64_create_stream,           /* create_stream */
     ios_wow64_release_stream,          /* release_stream */
     ios_start,                         /* start           { stream, result } */
     ios_stop,                          /* stop            { stream, result } */
     ios_reset,                         /* reset           { stream, result } */
-    ios_timer_loop,                    /* timer_loop      { stream } */
     ios_wow64_get_render_buffer,       /* get_render_buffer */
     ios_release_render_buffer,         /* release_render_buffer (no pointers) */
     ios_wow64_get_capture_buffer,      /* get_capture_buffer */
@@ -2828,4 +2854,6 @@ const void *audio_null_ios_unix_call_wow64_funcs[] = {
     ios_wow64_midi_message,            /* midi_in_message */
     ios_wow64_midi_notify_wait,        /* midi_notify_wait */
     ios_wow64_aux_message,             /* aux_message */
+    ios_timer_loop,                    /* MADEIRA_UNIX_TIMER_LOOP (== funcs_count), Madeira only;
+                                        * { stream } is a UINT64, same layout for a 32-bit caller */
 };

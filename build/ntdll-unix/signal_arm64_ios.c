@@ -127,6 +127,26 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
 #define NTDLL_DWARF_H_NO_UNWINDER
 #include "dwarf.h"
 
+/* Madeira (ml1122): teb_data.cpu_data[] slot where virtual_ios.c init_teb() stores the
+ * address of the thread's own thread data block (Wine 11.22 keeps no TEB -> data link). */
+#define IOS_TEB_THREAD_DATA_SLOT 15
+
+/* Madeira (ml1122): Wine 11.22 replaced is_ec_code() (unix_private.h) with
+ * is_emulated_code() (virtual_ios.c). This file keeps Madeira's 11.4 resume and
+ * exception paths, which are written against is_ec_code(), so the 11.4 iOS body
+ * lives here: "is this address ARM64EC code of THIS thread's process". The thread's
+ * PEB comes from the unix thread data, good even when x18 is clobbered in a signal. */
+static inline BOOL is_ec_code( ULONG_PTR ptr )
+{
+    struct thread_data *ec_data = get_thread_data();
+    PEB *cur_peb = (ec_data && ec_data->teb) ? (PEB *)ec_data->teb->Peb : peb;
+    const UINT64 *map = cur_peb ? (const UINT64 *)cur_peb->EcCodeBitMap : NULL;
+    ULONG_PTR page = ptr / page_size;
+
+    if (!map) return FALSE;
+    return (map[page / 64] >> (page & 63)) & 1;
+}
+
 /* ml649: runtime diagnostic switch, defined in virtual_ios.c. Default OFF.
  * Gate the WORK, not the print — several probes do expensive reads first. */
 extern volatile int madeira_diag_enabled;
@@ -277,6 +297,28 @@ static struct ios_fgr_bsd_slot *ios_fgr_bsd_slot_get( void )
         s->t0 = 0;
     }
     return s;
+}
+
+/* madeira-bcd [segv-loop-thread]: env.MADEIRA_SEGV_LOOP_SAME_THREAD = 0 turns it off (default on). Without
+ * MADEIRA_FAULT_GUARD_RATE the BSD loop guard used statics shared by every thread, so five ordinary faults at one pc
+ * from DIFFERENT threads counted as a loop. Overwatch 2 hit that in every run (0.2.60-0.2.64): FEX's deliberate
+ * guest-signal fault (pc ...000598, addr 0, the NoExec path the game's loader relies on) on threads 0680/0694/06a8
+ * seconds apart -> "SEGV LOOP FATAL" -> x0 (guest rcx) = 0xDEAD0001 -> the game wrote to DEAD0211 and died.
+ * With this on, the default mode counts in the per-thread slots too (no time window: that stays
+ * MADEIRA_FAULT_GUARD_RATE's job), so a real storm on any one thread still ends after 5 repeats. */
+static int ios_segv_loop_same_thread = -1;
+
+static int ios_segv_loop_same_thread_on( void )
+{
+    int v = __atomic_load_n( &ios_segv_loop_same_thread, __ATOMIC_RELAXED );
+
+    if (v < 0)
+    {
+        const char *e = getenv( "MADEIRA_SEGV_LOOP_SAME_THREAD" );
+        v = (e && e[0] == '0') ? 0 : 1;
+        __atomic_store_n( &ios_segv_loop_same_thread, v, __ATOMIC_RELAXED );
+    }
+    return v;
 }
 
 /* [anon-cas]: env.MADEIRA_ANON_CAS_FLUSH = 1, off by default (see the anonymous-alias CAS branch of the Mach handler).
@@ -616,8 +658,22 @@ unsigned long long ios_get_real_usd(void)
  * boot one-shot VAs alone overflowed 64 slots, and the two-cube DXMT
  * fault storm's VA (child winemetal IAT → child EC ntdll map VA,
  * 315K faults) arrived late and was silently dropped — never tracked,
- * never healed. */
-#define IOS_STALE_VA_MAX 256
+ * never healed.
+ * 256 flat → 4096 hashed (2026-11-06): one Mach handler serves every
+ * pseudo-process, and a queued VA keeps its slot for good (so it is never
+ * healed twice). After Steam's dockhost had queued 155 VAs and filled the
+ * rest with cold ones, Slay the Spire 2's main thread called into its
+ * ucrtbase copy through dozens of stale PE VAs in turn. Each new VA evicted
+ * the coldest entry, which was always the previous newcomer at 1 hit, so
+ * none of them ever reached the threshold: 3.3 million exec faults in 35 s
+ * (one VA alone ~480K), nothing healed, the game crawled at ~1/20 speed
+ * and never showed a window. Now each VA hashes to its own short probe
+ * window in a 4096-slot table, so a newcomer only competes with the few
+ * VAs that share its window, and the cold entries it pushes out are old
+ * ones, not the VA that faulted a moment ago. */
+#define IOS_STALE_VA_MAX 4096                 /* table slots, power of two */
+#define IOS_STALE_VA_PROBE 16                 /* slots searched per VA */
+#define IOS_STALE_VA_QUEUE 256                /* heal requests in flight */
 /* Only heal a VA once it has exec-faulted this many times. Boot-time
  * one-shot redirects (thread entry points, DLL entry calls) fault a
  * handful of times and must NOT be healed — pool slots legitimately hold
@@ -626,48 +682,68 @@ unsigned long long ios_get_real_usd(void)
  * livelock). The pathological stale pointers fault thousands of times per
  * second; a threshold cleanly separates the two populations. */
 #define IOS_STALE_VA_HEAL_THRESHOLD 256
-static uint64_t ios_stale_va_seen[IOS_STALE_VA_MAX];
+static uint64_t ios_stale_va_seen[IOS_STALE_VA_MAX];   /* 0 = empty */
 static uint32_t ios_stale_va_hits[IOS_STALE_VA_MAX];
+static uint32_t ios_stale_va_clock[IOS_STALE_VA_MAX];  /* last fault, in enqueue calls */
+static uint32_t ios_stale_va_now = 0;
 static volatile int ios_stale_va_seen_count = 0;
-static uint64_t ios_stale_va_queue[IOS_STALE_VA_MAX];
+static uint64_t ios_stale_va_queue[IOS_STALE_VA_QUEUE];
 static volatile int ios_stale_va_head = 0;   /* written by scanner */
 static volatile int ios_stale_va_tail = 0;   /* written by exc handler */
 
+static inline unsigned ios_stale_va_slot( uint64_t va )
+{
+    return (unsigned)(((va >> 2) * 0x9E3779B97F4A7C15ull) >> 52) & (IOS_STALE_VA_MAX - 1);
+}
+
+/* Only the single mach-handler thread calls this, so the read-modify-writes
+ * are safe; the scanner thread reads only the queue. */
 static void ios_stale_va_enqueue( uint64_t va )
 {
-    int i, n = ios_stale_va_seen_count;
-    for (i = 0; i < n; i++)
+    unsigned start = ios_stale_va_slot( va ), i, victim = IOS_STALE_VA_MAX;
+    uint32_t now = ++ios_stale_va_now, victim_age = 0;
+    if (!va) return;
+    for (i = 0; i < IOS_STALE_VA_PROBE; i++)
     {
-        if (ios_stale_va_seen[i] == va)
+        unsigned s = (start + i) & (IOS_STALE_VA_MAX - 1);
+        if (ios_stale_va_seen[s] == va)
         {
-            if (++ios_stale_va_hits[i] == IOS_STALE_VA_HEAL_THRESHOLD)
+            ios_stale_va_clock[s] = now;
+            if (ios_stale_va_hits[s] >= IOS_STALE_VA_HEAL_THRESHOLD) return;   /* already queued */
+            if (++ios_stale_va_hits[s] == IOS_STALE_VA_HEAL_THRESHOLD)
             {
-                ios_stale_va_queue[ios_stale_va_tail % IOS_STALE_VA_MAX] = va;
+                if (ios_stale_va_tail - ios_stale_va_head >= IOS_STALE_VA_QUEUE)
+                {
+                    /* Queue full: try again on a later fault, don't lose it. */
+                    ios_stale_va_hits[s] = IOS_STALE_VA_HEAL_THRESHOLD - 1;
+                    return;
+                }
+                ios_stale_va_queue[ios_stale_va_tail % IOS_STALE_VA_QUEUE] = va;
                 ios_stale_va_tail++;
                 fprintf( stderr, "[stale-heal] 0x%llx crossed %d faults — queued for heal\n",
                          (unsigned long long)va, IOS_STALE_VA_HEAL_THRESHOLD );
             }
             return;
         }
+        if (!ios_stale_va_seen[s])
+        {
+            if (victim == IOS_STALE_VA_MAX || victim_age != 0xffffffffu)
+            { victim = s; victim_age = 0xffffffffu; }   /* an empty slot beats any eviction */
+            continue;
+        }
+        /* Eviction candidate: the not-yet-queued entry that faulted longest ago. */
+        if (ios_stale_va_hits[s] < IOS_STALE_VA_HEAL_THRESHOLD && victim_age != 0xffffffffu &&
+            (victim == IOS_STALE_VA_MAX || now - ios_stale_va_clock[s] > victim_age))
+        {
+            victim = s;
+            victim_age = now - ios_stale_va_clock[s];
+        }
     }
-    if (n >= IOS_STALE_VA_MAX)
-    {
-        /* Table full: evict the coldest entry (boot one-shots sit at a
-         * handful of hits) so pathological late-comers — a new child's
-         * DXMT IAT — still get tracked. Only the single mach-handler
-         * thread calls this, so the read-modify-write is safe. */
-        int min_i = 0;
-        uint32_t min_h = ios_stale_va_hits[0];
-        for (i = 1; i < n; i++)
-            if (ios_stale_va_hits[i] < min_h) { min_h = ios_stale_va_hits[i]; min_i = i; }
-        if (min_h >= IOS_STALE_VA_HEAL_THRESHOLD) return;  /* everything hot — drop */
-        ios_stale_va_seen[min_i] = va;
-        ios_stale_va_hits[min_i] = 1;
-        return;
-    }
-    ios_stale_va_seen[n] = va;
-    ios_stale_va_hits[n] = 1;
-    ios_stale_va_seen_count = n + 1;
+    if (victim == IOS_STALE_VA_MAX) return;   /* window holds only queued VAs — drop */
+    if (!ios_stale_va_seen[victim]) ios_stale_va_seen_count++;
+    ios_stale_va_seen[victim] = va;
+    ios_stale_va_hits[victim] = 1;
+    ios_stale_va_clock[victim] = now;
 }
 
 static void *ios_stale_va_scanner( void *arg )
@@ -682,13 +758,15 @@ static void *ios_stale_va_scanner( void *arg )
      * MADEIRA_NO_HEAL=1 reverts to dry-run reporting. */
     int do_heal = getenv( "MADEIRA_NO_HEAL" ) == NULL;
     pthread_setname_np( "wine-stale-heal" );
+    fprintf( stderr, "[stale-heal] table %d slots hashed, probe %d, LRU eviction (stale-heal-table)\n",
+             IOS_STALE_VA_MAX, IOS_STALE_VA_PROBE );
     { extern void ios_eco_native_self( const char *who ); ios_eco_native_self( "wine-stale-heal" ); }   /* madeira-bcd eco-native */
     for (;;)
     {
         usleep( 100000 );
         while (ios_stale_va_head != ios_stale_va_tail)
         {
-            uint64_t va = ios_stale_va_queue[ios_stale_va_head % IOS_STALE_VA_MAX];
+            uint64_t va = ios_stale_va_queue[ios_stale_va_head % IOS_STALE_VA_QUEUE];
             ios_stale_va_head++;
             if (do_heal)
                 ios_jit_patch_stale_pointer( va );
@@ -786,7 +864,7 @@ void ios_watch_after_protect( const void *base, size_t size, const char *why )
 /* ml1205: dump a thread's block-entry ring (FEX writes it when MADEIRA_BLOCK_RING is set and
  * publishes the pointer at TEB+0x1710). Oldest first, newest last, 16 x86 bytes per entry so a
  * one-instruction fragment decodes from the line. Checked reads throughout. */
-static void ios_block_ring_dump( uintptr_t teb, unsigned max_entries, const char *why )
+void ios_block_ring_dump( uintptr_t teb, unsigned max_entries, const char *why )   /* not static: bo3-ring-sample calls it from server_ios.c */
 {
     enum { RING_N = 4096 };
     uint64_t ring = 0, idx = 0, *ents = NULL;
@@ -2218,6 +2296,18 @@ static int ios_alias_write_is_trapped( uintptr_t addr )
     return prot >= 0 && !(prot & PROT_WRITE);
 }
 
+/* Base writeback for the GPR STR/STRB/STRH (immediate, 9-bit) cases of the
+ * write-fault store emulator: post-index (bits 11:10 = 01) and pre-index (11)
+ * add the signed imm9 to Rn once the store has landed. Rn 31 is SP and 29/30
+ * are FP/LR, which live outside __x[] (it has 29 entries). */
+static void ios_store_imm9_writeback( arm_thread_state64_t *st, int rn, int imm9 )
+{
+    if (rn == 31) st->__sp = (uint64_t)((int64_t)st->__sp + imm9);
+    else if (rn == 30) st->__lr = (uint64_t)((int64_t)st->__lr + imm9);
+    else if (rn == 29) st->__fp = (uint64_t)((int64_t)st->__fp + imm9);
+    else st->__x[rn] = (uint64_t)((int64_t)st->__x[rn] + imm9);
+}
+
 /* Adjacent guest pages need not occupy adjacent pool slots. Validate every
  * fragment before writing anything, then route each through its own alias.
  * Only ordinary stores use this; atomic RMW operations must remain atomic. */
@@ -3221,10 +3311,19 @@ static inline void ios_note_guest_delivery( uint64_t thread )
  * Returns 1 (written), -1 (refused: a page of the store has no alias) or 0
  * (not a crossing store this helper decodes; the per-encoding cases run).
  * ml1292: also called by the thread sampler (server_ios.c) to complete a store
- * the kernel keeps faulting on, with the thread suspended. */
+ * the kernel keeps faulting on, with the thread suspended.
+ *
+ * When it refuses because a page of the store still has FEX's write
+ * protection (it holds translated code), *blocked (if given) names that page,
+ * so the caller can hand FEX that page's fault. The host reports the store's
+ * first byte as the fault address, so without this FEX only ever sees the
+ * first page, which is already writable: it "handles" the fault, the store
+ * retries, and the thread loops on it forever. Slay the Spire 2 sat on its
+ * first frame that way (2.1 million retries of one STUR at ...fffc) with
+ * env.MADEIRA_SMC_HOT_PAGE = 0, where no page ever stops being protected. */
 int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,
                                      const arm_neon_state64_t *neon,
-                                     uintptr_t rx, uintptr_t rw, size_t sz )
+                                     uintptr_t rx, uintptr_t rw, size_t sz, uintptr_t *blocked )
 {
     extern uintptr_t ios_jit_anon_alias_lookup( uintptr_t fault_addr );
     extern void ios_jit_anon_alias_note_write( unsigned long long );
@@ -3283,6 +3382,7 @@ int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,
     }
     else return 0;
 
+    if (blocked) *blocked = 0;
     if (ea > UINTPTR_MAX - (bytes - 1)) return -1;
     if (((ea ^ (ea + bytes - 1)) & ~(uint64_t)0x3fff) == 0) return 0;   /* within one page */
     if (v && !neon) return 0;
@@ -3307,9 +3407,21 @@ int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,
         if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
         part_rw[parts] = (rx && rw && len <= sz && a >= rx && a - rx <= sz - len)
                          ? rw + (a - rx) : ios_write_alias( (uintptr_t)a );
-        if (part_rw[parts] && (ios_write_alias( a + len - 1 ) != part_rw[parts] + len - 1 ||
-            (honor_guest_prot && (ios_alias_write_is_trapped( a ) || ios_alias_write_is_trapped( a + len - 1 )))))
+        if (part_rw[parts] && ios_write_alias( a + len - 1 ) != part_rw[parts] + len - 1)
             return -1;
+        if (part_rw[parts] && honor_guest_prot)
+        {
+            /* A part is at most 32 bytes, so its two ends cover every 4 KB
+             * protection page it touches. Name the protected one. */
+            uintptr_t trap = ios_alias_write_is_trapped( a ) ? (uintptr_t)a
+                           : ios_alias_write_is_trapped( a + len - 1 ) ? (uintptr_t)(a + len - 1) & ~(uintptr_t)0xfff
+                           : 0;
+            if (trap)
+            {
+                if (blocked) *blocked = trap;
+                return -1;
+            }
+        }
         if (!part_rw[parts])
         {
             /* A page with no alias that is plain writable memory (the aliased page is
@@ -3870,6 +3982,22 @@ static void *ios_mach_exception_thread( void *arg )
                                         c_ok ? "" : "<unreadable>", caller,
                                         NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueProcess : 0,
                                         NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0);
+                                /* BeamNG.drive (2026-11-01): the same int3 is PartitionAlloc's
+                                 * deliberate stop when its pool reservation was refused, which
+                                 * the [jumbo#] lines above show. Name that cause here so a
+                                 * new Chromium game is diagnosed from one log. */
+                                {
+                                    extern unsigned ios_jumbo_fail_count(void);
+                                    unsigned jf = ios_jumbo_fail_count();
+                                    if (jf)
+                                        dprintf(STDERR_FILENO,
+                                                "[brp-contain] likely cause: %u large (>= 1 GB) reservation(s) failed "
+                                                "earlier in this session (see the [jumbo#] lines). Chromium's "
+                                                "PartitionAlloc stops on this int3 when its 32 GB pool is refused. "
+                                                "A program that runs Chromium in its own process needs "
+                                                "env.MADEIRA_SC_PA_POOLS = 2 and env.MADEIRA_CEF_PA_EXES = <its exe>\n",
+                                                jf);
+                                }
                             }
                         }
                     }
@@ -5446,11 +5574,26 @@ static void *ios_mach_exception_thread( void *arg )
                      * 16-byte copies are correct. Rn==31 is SP, never __x[31]. */
                     /* ml1289: a store that crosses a 16 KB page is written per page here;
                      * every other store goes on to its per-encoding case below. */
+                    uintptr_t split_blocked = 0;
                     const int split_r = ios_store_split_crossing( insn, &state, have_neon ? &neon_state : NULL,
-                                                                  rx, rw, sz );
+                                                                  rx, rw, sz, &split_blocked );
                     if (split_r)
                     {
                         if (split_r > 0) emulated = 1;
+                        /* A later page of the store still holds FEX's write
+                         * protection: give FEX that page's fault (it invalidates
+                         * the page and restores write), and the retried store
+                         * then completes here. PC and registers are untouched. */
+                        else if (split_blocked && honor_guest_prot)
+                        {
+                            static unsigned split_blocked_logs;
+                            if (split_blocked_logs++ < 16)
+                                dprintf( STDERR_FILENO, "[split-store] dispatching the protected page 0x%llx "
+                                         "of a crossing store (insn=0x%08x fault=0x%llx)\n",
+                                         (unsigned long long)split_blocked, insn, (unsigned long long)fault_addr );
+                            fault_addr = split_blocked;
+                            goto dispatch_guest_fault;
+                        }
                     }
                     else if (have_neon && (insn & 0xFE400000) == 0xAC000000)
                     {
@@ -5611,7 +5754,7 @@ static void *ios_mach_exception_thread( void *arg )
                         emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                     }
                     /* STR (immediate, post/pre-index, 64-bit): 1111 1000 00 0imm9 0[10]1 Rn Rt */
-                    else if ((insn & 0xffe00000) == 0xf8000000 && (insn & 0x800) == 0)
+                    else if ((insn & 0xffe00000) == 0xf8000000 && ((insn >> 10) & 3) != 2)
                     {
                         int rt = insn & 0x1f;
                         uint64_t value = IOS_STORE_SRC(rt);
@@ -5625,11 +5768,11 @@ static void *ios_mach_exception_thread( void *arg )
                             int rn = (insn >> 5) & 0x1f;
                             int imm9 = (insn >> 12) & 0x1ff;
                             if (imm9 & 0x100) imm9 |= ~0x1ff;  // sign-extend 9-bit
-                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                            ios_store_imm9_writeback( &state, rn, imm9 );
                         }
                     }
                     /* STR (immediate, post/pre-index, 32-bit): 1011 1000 00 0imm9 0[10]1 Rn Rt */
-                    else if ((insn & 0xffe00000) == 0xb8000000 && (insn & 0x800) == 0)
+                    else if ((insn & 0xffe00000) == 0xb8000000 && ((insn >> 10) & 3) != 2)
                     {
                         int rt = insn & 0x1f;
                         uint32_t value = (uint32_t)IOS_STORE_SRC(rt);
@@ -5640,14 +5783,14 @@ static void *ios_mach_exception_thread( void *arg )
                             int rn = (insn >> 5) & 0x1f;
                             int imm9 = (insn >> 12) & 0x1ff;
                             if (imm9 & 0x100) imm9 |= ~0x1ff;
-                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                            ios_store_imm9_writeback( &state, rn, imm9 );
                         }
                     }
                     /* STRB (immediate, post/pre-index, 8-bit): 0011 1000 00 0imm9 0[10]1 Rn Rt
                      * Hits when iOS memcpy handles the trailing bytes after the
                      * 8-byte D-store loop completes (660 bytes = 82*8 + 4 bytes
                      * tail; the tail is byte-by-byte). */
-                    else if ((insn & 0xffe00000) == 0x38000000 && (insn & 0x800) == 0)
+                    else if ((insn & 0xffe00000) == 0x38000000 && ((insn >> 10) & 3) != 2)
                     {
                         int rt = insn & 0x1f;
                         uint8_t value = (uint8_t)IOS_STORE_SRC(rt);
@@ -5658,11 +5801,11 @@ static void *ios_mach_exception_thread( void *arg )
                             int rn = (insn >> 5) & 0x1f;
                             int imm9 = (insn >> 12) & 0x1ff;
                             if (imm9 & 0x100) imm9 |= ~0x1ff;
-                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                            ios_store_imm9_writeback( &state, rn, imm9 );
                         }
                     }
                     /* STRH (immediate, post/pre-index, 16-bit): 0111 1000 00 0imm9 0[10]1 Rn Rt */
-                    else if ((insn & 0xffe00000) == 0x78000000 && (insn & 0x800) == 0)
+                    else if ((insn & 0xffe00000) == 0x78000000 && ((insn >> 10) & 3) != 2)
                     {
                         int rt = insn & 0x1f;
                         uint16_t value = (uint16_t)IOS_STORE_SRC(rt);
@@ -5673,7 +5816,7 @@ static void *ios_mach_exception_thread( void *arg )
                             int rn = (insn >> 5) & 0x1f;
                             int imm9 = (insn >> 12) & 0x1ff;
                             if (imm9 & 0x100) imm9 |= ~0x1ff;
-                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                            ios_store_imm9_writeback( &state, rn, imm9 );
                         }
                     }
                     /* SIMD/FP STR (immediate, post/pre-index, D-reg = 64-bit):
@@ -8949,7 +9092,7 @@ static void restore_context( const CONTEXT *context, ucontext_t *sigcontext )
 NTSTATUS signal_set_full_context( CONTEXT *context )
 {
     extern int ios_is_arm64ec_cur(void);
-    struct syscall_frame *frame = get_syscall_frame();
+    struct syscall_frame *frame = get_syscall_frame( get_thread_data() );
     ULONG_PTR ml944_req_pc = context->Pc, ml944_req_sp = context->Sp;
     DWORD ml944_req_flags = context->ContextFlags;
     NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
@@ -9161,7 +9304,7 @@ void *get_wow_context( CONTEXT *context )
     /* Owner-aware (X3): the CPU area machine follows the current thread's
      * pseudo-process, not the session's main exe. */
     extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
-    return get_cpu_area( ios_cur_image_info()->Machine );
+    return get_cpu_area( get_thread_data(), ios_cur_image_info()->Machine );
 }
 
 
@@ -9171,7 +9314,7 @@ void *get_wow_context( CONTEXT *context )
  */
 NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
 {
-    struct syscall_frame *frame = get_syscall_frame();
+    struct syscall_frame *frame = get_syscall_frame( get_thread_data() );
     NTSTATUS ret = STATUS_SUCCESS;
     BOOL self = (handle == GetCurrentThread());
     DWORD flags = context->ContextFlags & ~CONTEXT_ARM64;
@@ -9327,7 +9470,7 @@ static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD n
  */
 NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
 {
-    struct syscall_frame *frame = get_syscall_frame();
+    struct syscall_frame *frame = get_syscall_frame( get_thread_data() );
     DWORD needed_flags = context->ContextFlags & ~CONTEXT_ARM64;
     BOOL self = (handle == GetCurrentThread());
 
@@ -9389,7 +9532,7 @@ NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
         if (ret || !self) return ret;
     }
 
-    if (!(frame = get_cpu_area( machine ))) return STATUS_INVALID_PARAMETER;
+    if (!(frame = get_cpu_area( get_thread_data(), machine ))) return STATUS_INVALID_PARAMETER;
 
     switch (machine)
     {
@@ -9513,7 +9656,7 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
         if (ret || !self) return ret;
     }
 
-    if (!(frame = get_cpu_area( machine ))) return STATUS_INVALID_PARAMETER;
+    if (!(frame = get_cpu_area( get_thread_data(), machine ))) return STATUS_INVALID_PARAMETER;
 
     switch (machine)
     {
@@ -9642,6 +9785,88 @@ static void ios_log_guest_exception( const char *via, const EXCEPTION_RECORD *re
             rec->ExceptionAddress, (unsigned long long)pc, (unsigned int)rec->NumberParameters,
             rec->NumberParameters > 0 ? (unsigned long long)rec->ExceptionInformation[0] : 0,
             rec->NumberParameters > 1 ? (unsigned long long)rec->ExceptionInformation[1] : 0);
+    /* rev=illegal-insn-words: an illegal-instruction exception (c000001d) raised from FEX code
+     * names a host pc inside the JIT pool. The report's [guest-insn] line cannot say what executed
+     * there (it needs a registered x64 text window, and the terminate path reads the emulator's
+     * rip, not the faulting one), so print the ARM words around that pc: the faulting word and
+     * 8 before / 7 after. mach_vm_read_overwrite cannot fault. First 6 per session.
+     * Off: env MADEIRA_ILLEGAL_INSN_WORDS=0. Reads only. */
+    if (rec->ExceptionCode == 0xc000001d)
+    {
+        static volatile int words_n;
+        const char *off = getenv( "MADEIRA_ILLEGAL_INSN_WORDS" );
+        if ((!off || off[0] != '0') && __sync_add_and_fetch( &words_n, 1 ) <= 6)
+        {
+            uint32_t w[16];
+            char line[16 * 9 + 1];
+            mach_vm_size_t got = 0;
+            mach_vm_address_t at = ((mach_vm_address_t)pc & ~(mach_vm_address_t)3) - 8 * 4;
+            unsigned i, have = 0;
+            memset( w, 0, sizeof(w) );
+            if (pc >= 32 && mach_vm_read_overwrite( mach_task_self(), at, sizeof(w), (mach_vm_address_t)w, &got ) == KERN_SUCCESS)
+                have = (unsigned)(got / 4);
+            for (i = 0; i < 16; i++)
+                if (i < have) snprintf( line + i * 9, 10, "%08x ", w[i] );
+                else memcpy( line + i * 9, "???????? ", 9 );
+            line[16 * 9] = 0;
+            dprintf(2, "[illegal-insn] c000001d pc=%llx ec-addr=%p words(-8..+7, pc is 9th)=%s rev=illegal-insn-words\n",
+                    (unsigned long long)pc, rec->ExceptionAddress, line);
+        }
+    }
+    /* rev=illegal-x64-bytes: the [illegal-insn] line above shows only the ARM words at the pool pc
+     * (a fixed stub, "...50c" in every run), never the x64 instruction the game ran. Read the FEX
+     * State.rip of this thread (teb+0x1788 -> cpuarea+0x30 -> state+0x18, the same chain the
+     * [fault_rip] probe uses) and print 16 bytes before and 32 bytes from it. A rip in the JIT
+     * pool would mean a leaked host pc (the bytes are then ARM, not x64).
+     * Every read goes through mach_vm_read_overwrite, which cannot fault. First 6 per session.
+     * Off: env MADEIRA_ILLEGAL_X64_BYTES=0. Reads only. */
+    if (rec->ExceptionCode == 0xc000001d)
+    {
+        static volatile int x64b_n;
+        const char *off = getenv( "MADEIRA_ILLEGAL_X64_BYTES" );
+        if ((!off || off[0] != '0') && __sync_add_and_fetch( &x64b_n, 1 ) <= 6)
+        {
+            mach_vm_size_t got = 0;
+            uint64_t cpuarea = 0, state = 0, rip = 0;
+            char line[48 * 3 + 1];
+            unsigned i;
+            uint64_t teb = (uint64_t)(uintptr_t)NtCurrentTeb();
+            if (!teb || mach_vm_read_overwrite( mach_task_self(), teb + 0x1788, 8, (mach_vm_address_t)&cpuarea, &got ) != KERN_SUCCESS || got != 8) cpuarea = 0;
+            if (cpuarea && (mach_vm_read_overwrite( mach_task_self(), cpuarea + 0x30, 8, (mach_vm_address_t)&state, &got ) != KERN_SUCCESS || got != 8)) state = 0;
+            if (state && (mach_vm_read_overwrite( mach_task_self(), state + 0x18, 8, (mach_vm_address_t)&rip, &got ) != KERN_SUCCESS || got != 8)) rip = 0;
+            for (i = 0; i < 48; i++)
+            {
+                unsigned char c = 0;
+                got = 0;
+                if (rip >= 16 && mach_vm_read_overwrite( mach_task_self(), rip - 16 + i, 1, (mach_vm_address_t)&c, &got ) == KERN_SUCCESS && got == 1)
+                    snprintf( line + i * 3, 4, "%02x ", c );
+                else memcpy( line + i * 3, "?? ", 3 );
+            }
+            line[48 * 3] = 0;
+            dprintf(2, "[illegal-x64] c000001d state.rip=%llx bytes(-16..+31, rip is 17th)=%s rev=illegal-x64-bytes\n",
+                    (unsigned long long)rip, line);
+        }
+    }
+    /* madeira-bcd [guest-data]: for an access violation, describe the address it
+     * touched (ios_describe_fault_data). Once per distinct fault (raise and
+     * dispatch both come here), the first 8 per session. */
+    if (rec->ExceptionCode == 0xc0000005 && rec->NumberParameters >= 2)
+    {
+        extern void ios_describe_fault_data( const void *addr, int access, char *buf, size_t len );
+        static ULONG_PTR last_addr, last_data;
+        static volatile int data_n;
+        if (((ULONG_PTR)rec->ExceptionAddress != last_addr || rec->ExceptionInformation[1] != last_data) &&
+            __sync_add_and_fetch( &data_n, 1 ) <= 8)
+        {
+            char line[400];
+            last_addr = (ULONG_PTR)rec->ExceptionAddress;
+            last_data = rec->ExceptionInformation[1];
+            ios_describe_fault_data( (const void *)rec->ExceptionInformation[1], (int)rec->ExceptionInformation[0],
+                                     line, sizeof(line) );
+            dprintf(2, "[guest-data] c0000005 tid=%04x %s | pc=%llx\n",
+                    (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, line, (unsigned long long)pc);
+        }
+    }
     if (rec->ExceptionCode == 0x40010006 && rec->NumberParameters >= 2 &&
         rec->ExceptionInformation[1])   /* DBG_PRINTEXCEPTION_C: [0]=len [1]=char* */
         dprintf(2, "[exc-disp]   OutputDebugStringA: \"%.*s\"\n",
@@ -9668,7 +9893,7 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     ios_log_guest_exception( "raise", rec, context->Pc );
     ios_note_guest_delivery( (uint64_t)pthread_mach_thread_np( pthread_self() ) );   /* restarts [fault-stuck] */
 
-    status = send_debug_event( rec, context, TRUE, TRUE );
+    status = send_debug_event( get_thread_data(), rec, context, TRUE );
     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
     {
         restore_context( context, sigcontext );
@@ -9681,7 +9906,7 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     /* fix up instruction pointer in context for EXCEPTION_BREAKPOINT */
     if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context->Pc -= 4;
 
-    stack = virtual_setup_exception( stack_ptr, sizeof(*stack), rec );
+    stack = virtual_setup_exception( get_thread_data(), stack_ptr, sizeof(*stack), rec );
     stack->rec = *rec;
     stack->context = *context;
     context_init_empty_xstate( &stack->context, stack->redzone );
@@ -9857,6 +10082,67 @@ static int ios_storm_end_child_only( thread_t thread, uintptr_t thread_teb, uint
     if (kr != KERN_SUCCESS) kr = thread_suspend( thread );
     __sync_fetch_and_add( &ended, 1 );
     dprintf( 2, "[redeliv] the storming thread is ended (kr=%d)\n", (int)kr );
+    return 1;
+}
+
+/* [syscall-guard] A GUARD page hit inside a system call that guards itself with __TRY.
+ *
+ * The Mach exception thread asks Wine's page machinery about every fault first. For a guard page that is not a stack
+ * guard it clears VPROT_GUARD and answers STATUS_GUARD_PAGE_VIOLATION, and the code below went straight to `dispatch`,
+ * skipping the guest-pc gate that every other fault passes. When the faulting code is a unix-side system call (a memmove
+ * of NtReadVirtualMemory on the process's own memory), that pushed a guest exception frame onto the kernel stack, where
+ * no guest frame is inside the stack limits: "call_seh_handlers invalid frame", "Exception frame is not in stack limits",
+ * NtTerminateProcess(0x1f), exit 31. Seen on The Binding of Isaac: Rebirth (Test 8, Nov 10): five probes of PROT_NONE
+ * pages failed cleanly through [syscall-fault], then the sixth landed on a guard page and ended the game.
+ *
+ * Decline instead (return 0), exactly as the gate does for an access violation at a host pc: the kernel then raises SIGBUS
+ * on the faulting thread, and bus_handler's [syscall-fault] returns to the __EXCEPT block, so the call fails with a status
+ * as it does on Windows. Only when the pc is outside guest code AND that thread's jmp_buf is set (a __TRY is active);
+ * a guard page hit by guest code, or by unix code without a __TRY, is dispatched as before. The jmp_buf is read with
+ * mach_vm_read_overwrite, since this thread must never fault. MADEIRA_GUARD_SYSCALL_FAULT=0 restores the old dispatch. */
+static int ios_mach_guard_in_syscall_try( uint64_t pc, uintptr_t rxb, size_t pool_size, uintptr_t teb_addr,
+                                          NTSTATUS st, uint64_t fault_addr )
+{
+    static int enabled = -1;
+    static int said;
+    struct thread_data *td = NULL;
+    void *jb = NULL;
+    mach_vm_size_t got = 0;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_GUARD_SYSCALL_FAULT" );
+        enabled = !(e && e[0] == '0');
+    }
+    if (!enabled) return 0;
+    if (st != STATUS_GUARD_PAGE_VIOLATION) return 0;
+    /* the same guest-side test as the gate after the page machinery */
+    if ((rxb && pc >= rxb && pc < rxb + pool_size) ||
+        ios_jit_low_contains( (uintptr_t)pc ) ||
+        pc < 0x100000000ULL ||
+        (pc >= 0x7000000000ULL && pc < 0x7400000000ULL))
+        return 0;
+    if (!teb_addr) return 0;
+    /* Wine 11.22: jmp_buf moved from the TEB to the thread data block. virtual_ios.c
+     * init_teb() keeps a back pointer to that block in the TEB (IOS_TEB_THREAD_DATA_SLOT),
+     * so another thread's block is found without walking the TEB list or taking a lock. */
+    if (mach_vm_read_overwrite( mach_task_self(),
+                                (mach_vm_address_t)(uintptr_t)&((struct teb_data *)&((TEB *)teb_addr)->GdiTebBatch)->cpu_data[IOS_TEB_THREAD_DATA_SLOT],
+                                sizeof(td), (mach_vm_address_t)(uintptr_t)&td, &got ) != KERN_SUCCESS
+        || got != sizeof(td) || !td)
+        return 0;
+    got = 0;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(uintptr_t)&td->jmp_buf, sizeof(jb),
+                                (mach_vm_address_t)(uintptr_t)&jb, &got ) != KERN_SUCCESS
+        || got != sizeof(jb) || !jb)
+        return 0;
+    if (said < 16)
+    {
+        said++;
+        dprintf( 2, "[syscall-guard] a guard page at 0x%llx was hit inside a system call with a __TRY (pc=0x%llx teb=0x%llx): "
+                    "declined to bus_handler so the call fails instead of the process ending\n",
+                 (unsigned long long)fault_addr, (unsigned long long)pc, (unsigned long long)teb_addr );
+    }
     return 1;
 }
 
@@ -10397,7 +10683,13 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
                 }
                 return 2;
             }
-            if (st != STATUS_ACCESS_VIOLATION) goto dispatch;
+            if (st != STATUS_ACCESS_VIOLATION)
+            {
+                /* [syscall-guard] a guard page hit by a system call's own __TRY goes to bus_handler, not the guest */
+                if (ios_mach_guard_in_syscall_try( pc, rxb, ios_jit_pool_size_global, (uintptr_t)teb, st, fault_addr ))
+                    return 0;
+                goto dispatch;
+            }
         }
     }
 
@@ -10768,7 +11060,7 @@ static int ios_mach_deliver_guest_exception( thread_t thread, arm_thread_state64
 NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3,
                                    PNTAPCFUNC func, NTSTATUS status )
 {
-    struct syscall_frame *frame = get_syscall_frame();
+    struct syscall_frame *frame = get_syscall_frame( get_thread_data() );
     ULONG64 sp = context ? context->Sp : frame->sp;
     struct apc_stack_layout *stack;
 
@@ -10804,18 +11096,18 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
 /***********************************************************************
  *           call_raise_user_exception_dispatcher
  */
-void call_raise_user_exception_dispatcher(void)
+void call_raise_user_exception_dispatcher( struct thread_data *data )
 {
-    get_syscall_frame()->pc = (UINT64)pKiRaiseUserExceptionDispatcher;
+    get_syscall_frame( data )->pc = (UINT64)pKiRaiseUserExceptionDispatcher;
 }
 
 
 /***********************************************************************
  *           call_user_exception_dispatcher
  */
-NTSTATUS call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context )
+NTSTATUS call_user_exception_dispatcher( struct thread_data *data, EXCEPTION_RECORD *rec, CONTEXT *context )
 {
-    struct syscall_frame *frame = get_syscall_frame();
+    struct syscall_frame *frame = get_syscall_frame( data );
     struct exc_stack_layout *stack;
     NTSTATUS status;
 
@@ -10991,11 +11283,11 @@ __ASM_GLOBAL_FUNC( user_mode_abort_thread,
  */
 NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_ptr, ULONG *ret_len )
 {
-    struct syscall_frame *frame = get_syscall_frame();
+    struct syscall_frame *frame = get_syscall_frame( get_thread_data() );
     ULONG64 sp = (frame->sp - offsetof( struct callback_stack_layout, args_data[len] ) - 16) & ~15;
     struct callback_stack_layout *stack = (struct callback_stack_layout *)sp;
 
-    if ((char *)ntdll_get_thread_data()->kernel_stack + min_kernel_stack > (char *)&frame)
+    if ((char *)get_kernel_stack( get_thread_data() ) + min_kernel_stack > (char *)&frame)
         return STATUS_STACK_OVERFLOW;
 
     stack->args = stack->args_data;
@@ -11035,7 +11327,7 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
  */
 NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status )
 {
-    if (!get_syscall_frame()->prev_frame) return STATUS_NO_CALLBACK_ACTIVE;
+    if (!get_syscall_frame( get_thread_data() )->prev_frame) return STATUS_NO_CALLBACK_ACTIVE;
     user_mode_callback_return( ret_ptr, ret_len, status, NtCurrentTeb() );
 }
 
@@ -11047,10 +11339,10 @@ NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status 
  */
 static BOOL handle_syscall_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
 {
-    struct syscall_frame *frame = get_syscall_frame();
+    struct syscall_frame *frame = get_syscall_frame( get_thread_data() );
     DWORD i;
 
-    if (!is_inside_syscall( SP_sig(context) )) return FALSE;
+    if (!is_inside_syscall( get_thread_data(), SP_sig(context) )) return FALSE;
 
     TRACE( "code=%x flags=%x addr=%p pc=%p tid=%04x\n",
            rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress,
@@ -11083,13 +11375,13 @@ static BOOL handle_syscall_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
           (DWORD64)REGn_sig(28, context), (DWORD64)FP_sig(context),
           (DWORD64)LR_sig(context), (DWORD64)SP_sig(context) );
 
-    if (ntdll_get_thread_data()->jmp_buf)
+    if (get_thread_data()->jmp_buf)
     {
         TRACE( "returning to handler\n" );
-        REGn_sig(0, context) = (ULONG_PTR)ntdll_get_thread_data()->jmp_buf;
+        REGn_sig(0, context) = (ULONG_PTR)get_thread_data()->jmp_buf;
         REGn_sig(1, context) = 1;
         PC_sig(context)      = (ULONG_PTR)longjmp;
-        ntdll_get_thread_data()->jmp_buf = NULL;
+        get_thread_data()->jmp_buf = NULL;
     }
     else
     {
@@ -11172,7 +11464,7 @@ static int ios_bus_syscall_fault( ucontext_t *ctx, EXCEPTION_RECORD *rec )
         enabled = !(e && e[0] == '0');
     }
     if (!enabled) return 0;
-    if (!NtCurrentTeb() || !ntdll_get_thread_data()->jmp_buf) return 0;
+    if (!NtCurrentTeb() || !get_thread_data()->jmp_buf) return 0;
     if (!handle_syscall_fault( ctx, rec )) return 0;
     if (said < 16 && __sync_add_and_fetch( &said, 1 ) <= 16)
         dprintf( 2, "[syscall-fault] a protection fault (SIGBUS) at %p inside a system call with a __TRY: the call fails (pc=%p lr=%p) "
@@ -11727,6 +12019,8 @@ static int ios_fault_is_foreign( const void *pc, const void *addr )
     extern void *ios_jit_rx_base_global;
     extern void *ios_jit_rw_base_global;
     extern size_t ios_jit_pool_size_global;
+    extern int ios_small_map;
+    extern uintptr_t ios_guest_band_lo, ios_guest_band_hi, ios_guest_band_pc_lo;   /* virtual_ios.c, ios26-small-map */
     uintptr_t p = (uintptr_t)pc, a = (uintptr_t)addr, tsd_base = 0;
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
     uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
@@ -11743,7 +12037,7 @@ static int ios_fault_is_foreign( const void *pc, const void *addr )
     if (sz && rx && p >= rx && p < rx + sz) return 0;
     if (sz && rw && p >= rw && p < rw + sz) return 0;
     if (ios_jit_low_contains( p ) || ios_jit_low_rw_contains( p )) return 0;   /* madeira-bcd pool-low */
-    if (p >= 0x7000000000ull && p < 0x8000000000ull) return 0;  /* guest | PA | FEX bands */
+    if (p >= ios_guest_band_pc_lo && p < ios_guest_band_hi) return 0;  /* guest | PA | FEX bands (ios26-small-map: the map's own on a small map) */
 
     /* host code, but touching emulator-managed memory (guard page, pool alias,
      * guest buffer handed to Metal): the repair paths below are still correct */
@@ -11752,7 +12046,19 @@ static int ios_fault_is_foreign( const void *pc, const void *addr )
         if (sz && rx && a >= rx && a < rx + sz) return 0;
         if (sz && rw && a >= rw && a < rw + sz) return 0;
         if (ios_jit_low_contains( a ) || ios_jit_low_rw_contains( a )) return 0;   /* madeira-bcd pool-low */
-        if (a >= 0x7000000000ull && a < 0x8000000000ull) return 0;
+        if (a >= ios_guest_band_lo && a < ios_guest_band_hi) return 0;
+    }
+    if (ios_small_map)
+    {
+        /* ios26-small-map: say which range the declined fault was tested against (capped) */
+        static int said;
+        if (said < 8)
+        {
+            said++;
+            dprintf( 2, "[small-map] declined fault pc=%p addr=%p: outside guest faults [%p,%p) and guest pcs from %p, "
+                        "thread %u has no TEB\n", pc, addr, (void *)ios_guest_band_lo, (void *)ios_guest_band_hi,
+                     (void *)ios_guest_band_pc_lo, (unsigned)pthread_mach_thread_np( pthread_self() ) );
+        }
     }
     return 1;
 }
@@ -13383,6 +13689,13 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 *cntp = 0;
             }
         }
+        else if (ios_segv_loop_same_thread_on())
+        {
+            /* [segv-loop-thread]: per-thread run, no time window (see ios_segv_loop_same_thread_on) */
+            struct ios_fgr_bsd_slot *st = ios_fgr_bsd_slot_get();
+            lastp = &st->pc;
+            cntp = &st->n;
+        }
         if (this_pc == *lastp)
         {
             (*cntp)++;
@@ -13485,7 +13798,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         }
     }
 #endif
-    if (!virtual_handle_fault( &rec, (void *)SP_sig(context) ))
+    if (!virtual_handle_fault( get_thread_data(), &rec, (void *)SP_sig(context) ))
     {
 #ifdef WINE_IOS
         ERR("virtual_handle_fault HANDLED addr=%p\n", siginfo->si_addr);
@@ -15607,7 +15920,7 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                     vrec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
             }
 
-            if (!virtual_handle_fault( &vrec, (void *)SP_sig(bus_ctx) ))
+            if (!virtual_handle_fault( get_thread_data(), &vrec, (void *)SP_sig(bus_ctx) ))
             {
                 static int bus_healed;
                 if (bus_healed < 16 && ++bus_healed <= 16)
@@ -16681,6 +16994,15 @@ static int ios_thread_ctl_has_teb( void )
 {
     return NtCurrentTeb() != NULL;
 }
+
+/* Wine 11.22 has system threads (PsCreateSystemThread; only the ICMP listener of
+ * nsiproxy uses one): a thread WITH unix thread data but WITHOUT a TEB. It has no
+ * guest context, so the control signals are handled the way upstream does for it. */
+static int ios_thread_ctl_is_system( void )
+{
+    struct thread_data *data = get_thread_data();
+    return data && !data->teb;
+}
 #endif
 
 /**********************************************************************
@@ -16693,6 +17015,7 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     ucontext_t *context = sigcontext;
 #ifdef WINE_IOS
     ios_track_signal( signal, context );
+    if (ios_thread_ctl_is_system()) abort_thread(0);
     if (!ios_thread_ctl_has_teb())
     {
         static int noteb_quit;
@@ -16701,7 +17024,7 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         return;
     }
 #endif
-    if (!is_inside_syscall( SP_sig(context) )) user_mode_abort_thread( 0, get_syscall_frame() );
+    if (!is_inside_syscall( get_thread_data(), SP_sig(context) )) user_mode_abort_thread( 0, get_syscall_frame( get_thread_data() ) );
     abort_thread(0);
 }
 
@@ -16717,6 +17040,11 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     CONTEXT context;
 #ifdef WINE_IOS
     ios_track_signal( signal, ucontext );
+    if (ios_thread_ctl_is_system())
+    {
+        server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL );   /* as Wine 11.22 */
+        return;
+    }
     if (!ios_thread_ctl_has_teb())      /* ml483 (#87) — see ios_thread_ctl_has_teb */
     {
         static int noteb_usr1;
@@ -16725,7 +17053,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         return;
     }
 #endif
-    if (is_inside_syscall( SP_sig(ucontext) ))
+    if (is_inside_syscall( get_thread_data(), SP_sig(ucontext) ))
     {
         context.ContextFlags = CONTEXT_FULL | CONTEXT_EXCEPTION_REQUEST;
         NtGetContextThread( GetCurrentThread(), &context );
@@ -16757,7 +17085,7 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                                       * check below — reading TEB+0x378 here is
                                       * what killed the ml482 run. */
 #else
-    struct syscall_frame *frame = get_syscall_frame();
+    struct syscall_frame *frame = get_syscall_frame( get_thread_data() );
 #endif
     ucontext_t *context = sigcontext;
     DWORD i;
@@ -16770,10 +17098,10 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             dprintf( 2, "[sig-noteb] SIGUSR2 (set-context) on a TEB-less thread — ignoring rev=ml483\n" ); }
         return;
     }
-    frame = get_syscall_frame();
+    frame = get_syscall_frame( get_thread_data() );
 #endif
 
-    if (!is_inside_syscall( SP_sig(context) ))
+    if (!is_inside_syscall( get_thread_data(), SP_sig(context) ))
     {
 #ifdef WINE_IOS
         ios_fixup_x18_for_return( context );
@@ -16818,7 +17146,7 @@ NTSTATUS get_thread_ldt_entry( HANDLE handle, THREAD_DESCRIPTOR_INFORMATION *inf
 /**********************************************************************
  *             signal_init_threading
  */
-void signal_init_threading(void)
+void signal_init_threading(void)   /* Wine 11.22 dropped it; kept as a no-op, nothing calls it */
 {
 }
 
@@ -16843,15 +17171,13 @@ void signal_free_thread( TEB *teb )
 /**********************************************************************
  *		signal_init_process
  */
-void signal_init_process(void)
+void signal_init_process( TEB *teb )
 {
     struct sigaction sig_act;
-    struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
-    void *kernel_stack = (char *)thread_data->kernel_stack + kernel_stack_size;
 
-    thread_data->syscall_frame = (struct syscall_frame *)kernel_stack - 1;
-
-    signal_alloc_thread( NtCurrentTeb() );
+    /* Wine 11.22: the kernel stack follows the signal stack in the thread data block */
+    alloc_syscall_frame( sizeof(struct syscall_frame) );
+    signal_alloc_thread( teb );
 
 #ifdef WINE_IOS
     /* Create TLS key for TEB storage (used by x18 binary patcher trampolines) */
@@ -16913,9 +17239,11 @@ static inline ULONG ios_wow_guest_in( const void *host, ULONG_PTR wow_base )
     return host ? (ULONG)((ULONG_PTR)host - wow_base) : 0;
 }
 
-void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, TEB *teb )
+void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
 {
-    struct syscall_frame *frame = ((struct ntdll_thread_data *)&teb->GdiTebBatch)->syscall_frame;
+    /* Wine 11.22: `suspend` comes from the thread data (set by server_ios.c) */
+    BOOL suspend = get_thread_data()->suspend;
+    struct syscall_frame *frame = ((struct teb_data *)&teb->GdiTebBatch)->syscall_frame;
     CONTEXT *ctx, context = { CONTEXT_ALL };
     I386_CONTEXT *i386_context;
     ARM_CONTEXT *arm_context;
@@ -16944,7 +17272,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     void *proc_wow_peb = (wow_child_peb && wow_base) ? (char *)teb->Peb + page_size : (void *)wow_peb;
 #define IOS_WOW_GUEST_IN(ptr) ios_wow_guest_in( (ptr), wow_base )
 
-    if ((i386_context = get_cpu_area( IMAGE_FILE_MACHINE_I386 )))
+    if ((i386_context = get_cpu_area( get_thread_data(), IMAGE_FILE_MACHINE_I386 )))
     {
         XMM_SAVE_AREA32 *fpu = (XMM_SAVE_AREA32 *)i386_context->ExtendedRegisters;
         i386_context->ContextFlags = CONTEXT_I386_ALL;
@@ -16963,7 +17291,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
         fpu->MxCsr = 0x1f80;
         fpux_to_fpu( &i386_context->FloatSave, fpu );
     }
-    else if ((arm_context = get_cpu_area( IMAGE_FILE_MACHINE_ARMNT )))
+    else if ((arm_context = get_cpu_area( get_thread_data(), IMAGE_FILE_MACHINE_ARMNT )))
     {
         arm_context->ContextFlags = CONTEXT_ARM_ALL;
         arm_context->R0 = IOS_WOW_GUEST_IN( entry );
@@ -17312,10 +17640,10 @@ __ASM_GLOBAL_FUNC( signal_start_thread,
                    __ASM_CFI(".cfi_rel_offset 28,0x58\n\t")
                    "add x5, x29, #0xc0\n\t"     /* syscall_cfa */
                    /* set syscall frame */
-                   "ldr x4, [x3, #0x378]\n\t"   /* thread_data->syscall_frame */
+                   "ldr x4, [x2, #0x378]\n\t"   /* thread_data->syscall_frame */
                    "cbnz x4, 1f\n\t"
                    "sub x4, sp, #0x330\n\t"     /* sizeof(struct syscall_frame) */
-                   "str x4, [x3, #0x378]\n\t"   /* thread_data->syscall_frame */
+                   "str x4, [x2, #0x378]\n\t"   /* thread_data->syscall_frame */
                    "1:\tstr wzr, [x4, #0x10c]\n\t" /* frame->restore_flags */
                    "stp xzr, x5, [x4, #0x110]\n\t" /* frame->prev_frame,syscall_cfa */
                    /* switch to kernel stack */

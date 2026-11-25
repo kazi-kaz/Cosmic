@@ -50,3 +50,4 @@ licence (MIT).
   queue that waits on a shared event, and logs pixel statistics as `[kk-present]`; the first probe
   of each layer also logs its state. `nextDrawable` time-outs are logged as `[kk-wsi]`.
   `MADEIRA_KK_PRESENT_PROBE=0` turns the readback off.
+- `0010-zink-moltenvk-int-vertex-attribs.patch`: Metal refuses a pipeline whose vertex shader reads an int or uint input from a float, normalized or scaled vertex format ("Cannot convert attribute from MTLAttributeFormatFloat to int1"), and Zink then skips those draws (Vintage Story). On MoltenVK, such attributes get the same-size SINT/UINT format. `MADEIRA_ZINK_INT_ATTRIBS=0` turns this off, and `=1` turns it on for other drivers.

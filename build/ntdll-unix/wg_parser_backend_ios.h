@@ -60,6 +60,11 @@ struct mav_video_backend
     /* after a seek: forget reference pictures; nothing is emitted */
     void (*flush)( void *dec );
     void (*close)( void *dec );
+    /* OPTIONAL (NULL: nothing is held back).  At end of stream: emit every
+     * picture the decoder still holds, the way decode() does.  Added for the
+     * core's own libavcodec backend (soft-video), whose decoders keep a
+     * picture back for B-frames. */
+    void (*drain)( void *dec, mav_vframe_emit emit, void *ctx );
 };
 
 struct mav_audio_backend

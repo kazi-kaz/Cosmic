@@ -664,23 +664,62 @@ enum SteamCloudTransfer {
         guard let url = info.url, info.fileSize <= UInt64(maxFileBytes), info.rawSize <= UInt64(maxFileBytes) else {
             throw SteamFileError.invalid("Steam gave no usable address for this Steam Cloud file.")
         }
+        let body = try await download(url, headers: info.headers)
+        let first = standardReading(body, info: info, expectedSHA: expectedSHA)
+        if case .ok(let file) = first { return file }
+        if repairEnabled {
+            // (cloud-repair) Only now, after the usual reading failed: a body shorter than the size Steam announced was cut
+            // off on the way, so ask once more. A second reply is checked the same way; a failed second request changes nothing.
+            var bodies = [body]
+            if body.count < Int(info.fileSize) {
+                LogStore.shared.log("[steam-cloud] repair: a download stopped at \(body.count) of \(info.fileSize) bytes; fetching it once more")
+                try Task.checkCancellation()
+                if let again = try? await download(url, headers: info.headers), again != body {
+                    if case .ok(let file) = standardReading(again, info: info, expectedSHA: expectedSHA) {
+                        LogStore.shared.log("[steam-cloud] repair: the second download checks out (\(again.count) bytes)")
+                        return file
+                    }
+                    bodies.append(again)
+                }
+            }
+            try Task.checkCancellation()
+            // The other ways a cloud file can be packed; a result counts only when its SHA-1 is the one Steam listed,
+            // so nothing unverified is ever returned.
+            for candidate in bodies {
+                if let hit = SteamCloudRepair.unpack(candidate, rawSize: Int(info.rawSize), expectedSHA: expectedSHA) {
+                    LogStore.shared.log("[steam-cloud] repair: file read as \(hit.how) (\(candidate.count) bytes in, \(hit.file.count) out); checksum matches")
+                    return hit.file
+                }
+            }
+            LogStore.shared.log("[steam-cloud] repair: no reading matched the checksum. " + SteamCloudRepair.describe(body, info: info), level: .error)
+        }
+        if case .unpackFailed = first { throw SteamFileError.invalid("A Steam Cloud file could not be unpacked.") }
+        throw SteamFileError.invalid("A Steam Cloud file did not match its checksum.")
+    }
+
+    /// The reading 0.2.47 always did: a one-entry ZIP when Steam says the served form differs, else the bytes as served.
+    private enum Reading { case ok(Data), unpackFailed, checksumFailed }
+    private static func standardReading(_ body: Data, info: SteamCloudDownloadInfo, expectedSHA: Data) -> Reading {
+        var file = body
+        if info.fileSize != info.rawSize || (body.count != Int(info.rawSize) && body.starts(with: [0x50, 0x4b, 0x03, 0x04])) {
+            guard let unpacked = unzipFirstEntry(body, rawSize: Int(info.rawSize)) else { return .unpackFailed }
+            file = unpacked
+        }
+        return Data(Insecure.SHA1.hash(data: file)) == expectedSHA ? .ok(file) : .checksumFailed
+    }
+
+    /// env.MADEIRA_CLOUD_REPAIR = 0 turns the retry and the other readings off (downloads then behave exactly as before).
+    /// On by default: both only run after the usual reading of a download failed.
+    static var repairEnabled: Bool { MadeiraConfig.flag("MADEIRA_CLOUD_REPAIR") }
+
+    private static func download(_ url: URL, headers: [(name: String, value: String)]) async throws -> Data {
         var request = URLRequest(url: url)
-        for header in info.headers { request.setValue(header.value, forHTTPHeaderField: header.name) }
+        for header in headers { request.setValue(header.value, forHTTPHeaderField: header.name) }
         let (body, response) = try await http.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else {
             throw SteamFileError.invalid("Steam Cloud download failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)).")
         }
-        var file = body
-        if info.fileSize != info.rawSize || (body.count != Int(info.rawSize) && body.starts(with: [0x50, 0x4b, 0x03, 0x04])) {
-            guard let unpacked = unzipFirstEntry(body, rawSize: Int(info.rawSize)) else {
-                throw SteamFileError.invalid("A Steam Cloud file could not be unpacked.")
-            }
-            file = unpacked
-        }
-        guard Data(Insecure.SHA1.hash(data: file)) == expectedSHA else {
-            throw SteamFileError.invalid("A Steam Cloud file did not match its checksum.")
-        }
-        return file
+        return body
     }
 
     /// Puts downloaded bytes in place. An existing file is first copied under
@@ -1039,5 +1078,71 @@ struct SteamCloudState: Equatable, Sendable {
         a.phase == b.phase && a.audit == b.audit && a.checked == b.checked && a.conflicts == b.conflicts
             && a.lastUpload == b.lastUpload && a.problem == b.problem
             && a.lastDownload?.files == b.lastDownload?.files && a.lastDownload?.backedUp == b.lastDownload?.backedUp
+    }
+}
+
+/// (cloud-repair) Other readings of a cloud download whose usual reading failed. Our own code, from the published formats:
+/// RFC 1950 (zlib), RFC 1952 (gzip) and RFC 1951 (deflate). Apple's COMPRESSION_ZLIB decodes a bare deflate stream.
+enum SteamCloudRepair {
+    /// The first reading whose result is exactly `rawSize` bytes with the expected SHA-1, and its name for the log.
+    static func unpack(_ body: Data, rawSize: Int, expectedSHA: Data) -> (file: Data, how: String)? {
+        guard rawSize >= 0, rawSize <= SteamCloudTransfer.maxFileBytes, !body.isEmpty else { return nil }
+        let bytes = [UInt8](body)
+        func matches(_ data: Data) -> Bool { data.count == rawSize && Data(Insecure.SHA1.hash(data: data)) == expectedSHA }
+        var tries: [(String, () -> Data?)] = [("as served", { body })]
+        if let start = zlibStart(bytes) { tries.append(("a zlib stream", { inflate(bytes, from: start, trailer: 4, rawSize: rawSize) })) }
+        if let start = gzipStart(bytes) { tries.append(("gzip", { inflate(bytes, from: start, trailer: 8, rawSize: rawSize) })) }
+        tries.append(("bare deflate", { inflate(bytes, from: 0, trailer: 0, rawSize: rawSize) }))
+        for (name, read) in tries { if let data = read(), matches(data) { return (file: data, how: name) } }
+        return nil
+    }
+
+    /// RFC 1950: CMF says deflate (low nibble 8, window at most 32 KB), CMF*256+FLG is a multiple of 31, and no preset dictionary.
+    static func zlibStart(_ b: [UInt8]) -> Int? {
+        guard b.count >= 6, b[0] & 0x0f == 8, b[0] >> 4 <= 7, (Int(b[0]) << 8 | Int(b[1])) % 31 == 0, b[1] & 0x20 == 0 else { return nil }
+        return 2
+    }
+
+    /// RFC 1952: 1f 8b, method 8, then the optional extra field, name, comment and header CRC the flags name.
+    static func gzipStart(_ b: [UInt8]) -> Int? {
+        guard b.count >= 18, b[0] == 0x1f, b[1] == 0x8b, b[2] == 8, b[3] & 0xe0 == 0 else { return nil }
+        let flags = b[3]
+        var at = 10
+        if flags & 0x04 != 0 {
+            guard at + 2 <= b.count else { return nil }
+            at += 2 + (Int(b[at]) | Int(b[at + 1]) << 8)
+        }
+        for bit: UInt8 in [0x08, 0x10] where flags & bit != 0 {   // zero-ended name, then comment
+            while at < b.count, b[at] != 0 { at += 1 }
+            at += 1
+        }
+        if flags & 0x02 != 0 { at += 2 }
+        return at < b.count ? at : nil
+    }
+
+    /// Decodes the deflate data between `from` and the format's `trailer` (zlib: Adler-32, 4 bytes; gzip: CRC-32 and
+    /// size, 8 bytes) into exactly `rawSize` bytes. The trailer is left out so the decoder sees deflate data only.
+    static func inflate(_ b: [UInt8], from: Int, trailer: Int, rawSize: Int) -> Data? {
+        let end = b.count - trailer
+        guard from < end else { return nil }
+        if rawSize == 0 { return Data() }
+        let capacity = rawSize + 64
+        var output = Data(count: capacity)
+        // Decode straight from the byte array into one output buffer (no second copy of the source slice).
+        let written = b.withUnsafeBufferPointer { input in
+            output.withUnsafeMutableBytes { out in
+                compression_decode_buffer(out.bindMemory(to: UInt8.self).baseAddress!, capacity,
+                                          input.baseAddress! + from, end - from, nil, COMPRESSION_ZLIB)
+            }
+        }
+        guard written == rawSize else { return nil }
+        output.count = rawSize
+        return output
+    }
+
+    /// For the log only: sizes and the first bytes, never the file's contents beyond eight bytes.
+    static func describe(_ body: Data, info: SteamCloudDownloadInfo) -> String {
+        let head = body.prefix(8).map { String(format: "%02x", $0) }.joined(separator: " ")
+        return "arrived \(body.count) bytes, Steam said \(info.fileSize) on the wire and \(info.rawSize) unpacked; first bytes \(head.isEmpty ? "none" : head)"
     }
 }

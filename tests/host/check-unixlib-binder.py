@@ -24,10 +24,10 @@ def function(source, start):
 # ---- Part A: the match chain
 chain = function(src, "static NTSTATUS load_builtin_unixlib(")
 upstream = [  # (match test, 64-bit table) in upstream order
+    # Wine 11.22: bcrypt has no unix library any more (PE-only on libs/symcrypt).
     ('strstr(match, "winemetal")', "dxmt_winemetal_unix_call_funcs"),
     ('strstr(match, "wineios.drv")', "audio_null_ios_unix_call_funcs"),
     ('strstr(match, "ws2_32")', "ws2_32_unix_call_funcs"),
-    ('strstr(match, "bcrypt")', "bcrypt_unix_call_funcs"),
     ('strstr(match, "secur32")', "secur32_unix_call_funcs"),
     ('strstr(match, "crypt32")', "crypt32_unix_call_funcs"),
     ('strstr(match, "dwrite")', "dwrite_unix_call_funcs"),
@@ -40,7 +40,6 @@ wow64 = {
     "dxmt_winemetal_unix_call_funcs": "dxmt_winemetal_unix_call_wow64_funcs",
     "audio_null_ios_unix_call_funcs": "audio_null_ios_unix_call_wow64_funcs",
     "ws2_32_unix_call_funcs": "ws2_32_unix_call_wow64_funcs",
-    "bcrypt_unix_call_funcs": "bcrypt_unix_call_wow64_funcs",
     "secur32_unix_call_funcs": "secur32_unix_call_wow64_funcs",
     "crypt32_unix_call_funcs": "crypt32_unix_call_wow64_funcs",
     "dwrite_unix_call_funcs": "dwrite_unix_call_wow64_funcs",

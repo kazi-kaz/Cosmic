@@ -24,6 +24,7 @@
 #include <d3d12.h>
 #include <dxgi1_5.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -350,6 +351,9 @@ struct mad_copy {
     UINT64 len;
 };
 
+struct mad_smp_cache_ent;
+static SRWLOCK g_smp_cache_lock = SRWLOCK_INIT;
+
 struct mad_device {
     ID3D12Device10Vtbl *vtbl;   /* ml877: full Device10 slot table, Device1..8 answered */
     LONG refs;
@@ -377,6 +381,8 @@ struct mad_device {
     volatile LONG64 aidx_ver;   /* ml1132: odd while a writer changes aidx; lets mad_resolve_address read it lock-free */
     obj_handle_t *samplers;      /* held for the process's life; see CreateSampler */
     unsigned nsamplers, samplers_cap;
+    struct mad_smp_cache_ent *smp_cache;
+    LONG smp_cache_n;
     /* Guards samplers, srv_res and uav_res. D3D12 device methods are
      * free-threaded: Ghost of Tsushima's streaming threads create samplers and
      * views at the same time, and two unlocked reallocs of one array corrupted
@@ -1151,15 +1157,16 @@ static int mad_smpdesc_get(UINT64 id, struct mad_smpdesc *out) {
     ReleaseSRWLockShared(&g_smpdesc_lock);
     return found;
 }
-static void mad_note_sampler(struct mad_device *d, obj_handle_t smp) {
+static int mad_note_sampler(struct mad_device *d, obj_handle_t smp) {
     int kept = 0;
-    if (!d || !smp) return;
+    if (!d || !smp) return 0;
     AcquireSRWLockExclusive(&d->list_lock);
     if (mad_grow((void **)&d->samplers, &d->samplers_cap, d->nsamplers + 1, sizeof *d->samplers)) {
         d->samplers[d->nsamplers++] = smp; kept = 1;
     }
     ReleaseSRWLockExclusive(&d->list_lock);
     if (!kept) NSObject_release(smp);
+    return kept;
 }
 
 /* ---- resources ----------------------------------------------------------
@@ -1250,10 +1257,20 @@ static void mad_view_list_del(struct mad_device *d, int uav, struct mad_resource
 }
 
 DEFINE_GUID(IID_IMTLDXGIDevice, 0x6bfa1657, 0x9cb1, 0x471a, 0xa4, 0xfb, 0x7c, 0xac, 0xf8, 0xa8, 0x12, 0x07);
+/* swap-factory: DXMT v0.80's dxgi.dll asks the device for this instead of IMTLDXGIDevice (dxmt/src/dxgi/dxgi_interfaces.h) */
+DEFINE_GUID(IID_IMTLSwapChainFactory, 0x6c030003, 0x460a, 0x4b19, 0x90, 0x9b, 0x38, 0xf9, 0x7d, 0x20, 0x3e, 0x45);
 /* ml1300: not in the toolchain's d3d12.h (it ends at List7); value from Microsoft's DirectX-Headers d3d12.idl */
 DEFINE_GUID(IID_ID3D12GraphicsCommandList8, 0xee936ef9, 0x599d, 0x4d28, 0x93, 0x8e, 0x23, 0xc4, 0xad, 0x05, 0xce, 0x51);
 
-#define MAD_ROOT_PARAM_MAX 32
+/* d3d12-root-params-64: was 32. D3D12 allows 64 root parameters (the 64-DWORD
+ * budget: a table costs 1 DWORD). Cyberpunk 2077 asks for 36 and was refused
+ * ("36 parameters exceeds the 32 this build handles"). Every array indexed by a
+ * root parameter is sized by this macro. What does NOT grow is the per-draw
+ * argument slot: root arguments must end before MAD_ARG_DRAWPARAMS_OFF (512),
+ * so mad_root_layout_fits() refuses a signature whose converter layout
+ * (8 bytes per table/descriptor, 4 per constant, + the static-sampler slot)
+ * would reach the draw parameters. */
+#define MAD_ROOT_PARAM_MAX 64
 #define MAD_ROOT_RANGE_MAX 32        /* ml1009: the OLD fixed cap; now only a log reference */
 #define MAD_ROOT_RANGE_SANE 8192     /* ml1009: refuse-a-corrupt-blob bound, not a capability limit */
 /* The parsed root signature, not the blob. The converter needs the layout at
@@ -1473,7 +1490,8 @@ static void mad_pl_del(struct mad_memheap *h, struct mad_resource *r);
 struct mad_device;
 static void mad_mheap_reclaim(struct mad_device *d, int all);   /* ml1148 */
 struct mad_rootsig;
-static UINT mad_root_layout(const struct mad_rootsig *rs, UINT offsets[32]);
+static UINT mad_root_layout(const struct mad_rootsig *rs, UINT offsets[MAD_ROOT_PARAM_MAX]);
+static int mad_root_layout_fits(const struct mad_rootsig *rs, const char *who);
 static int mad_tiled_on(void);   /* d3d12-tiled-resources (opt-in), see TILED RESOURCES */
 
 static HRESULT mad_creation_failure(struct mad_device *d, const char *what) {
@@ -2132,8 +2150,14 @@ struct mad_queue {
 };
 
 static HRESULT mad_queue_dxgi_tearoff(struct mad_queue *q, void **out);
+static HRESULT mad_queue_swapfactory_tearoff(struct mad_queue *q, void **out);
+static int mad_swapfactory_enabled(void);
 static HRESULT STDMETHODCALLTYPE queue_QI(ID3D12CommandQueue *This, REFIID riid, void **out) {
-    HRESULT hr = mad_qi((struct mad_obj *)This, riid, out, 1);
+    HRESULT hr;
+    /* checked before mad_qi so a working run doesn't log a "refused" line for it */
+    if (out && IsEqualGUID(riid, &IID_IMTLSwapChainFactory) && mad_swapfactory_enabled())
+        return mad_queue_swapfactory_tearoff((struct mad_queue *)This, out);
+    hr = mad_qi((struct mad_obj *)This, riid, out, 1);
     if (hr == E_NOINTERFACE && IsEqualGUID(riid, &IID_IMTLDXGIDevice))
         return mad_queue_dxgi_tearoff((struct mad_queue *)This, out);
     return hr;
@@ -6906,6 +6930,16 @@ static inline void mad_rs_step(int b, UINT64 *t0) {
     InterlockedIncrement(&g_rs_n[b]);
     *t0 = t1;
 }
+/* Indirect draw split (diagnostic, with replay-split): where one indirect draw's
+ * CPU time goes in exec_draw. Phases: 0 render pass open, 1 argument tables,
+ * 2 other state, 3 residency + encode. Draws that return early are not counted. */
+static volatile LONG64 g_ids_t[4]; static volatile LONG g_ids_n;
+static void mad_ids_report(double np, double tf) {
+    LONG n = InterlockedExchange(&g_ids_n, 0); int k; double ms[4];
+    for (k = 0; k < 4; k++) ms[k] = 1000.0 * (double)InterlockedExchange64(&g_ids_t[k], 0) / tf / np;
+    if (n) d3d12_log("[perf] indirect draw split per frame (%.0f draws): pass open %.2f ms, tables %.2f ms, state %.2f ms, residency+encode %.2f ms\n",
+                     n / np, ms[0], ms[1], ms[2], ms[3]);
+}
 static void mad_rs_report(double presents) {
     char buf[640];
     double tf = (double)mad_tick_freq(), np = presents > 0 ? presents : 1.0;
@@ -6919,6 +6953,7 @@ static void mad_rs_report(double presents) {
         pos += snprintf(buf + pos, sizeof buf - pos, " %s %.2f ms (%.0f)", g_rs_names[b], 1000.0 * (double)t / tf / np, n / np);
     }
     d3d12_log("%s\n", buf);
+    mad_ids_report(np, tf);
 }
 
 /* ---- madeira-bcd skin-check (diagnostic, opt-in) ------------------------------
@@ -8543,6 +8578,8 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_render_setbuffer sb[6 + 16 + 2];
     struct wmtcmd_render_setbufferoffset so[6 + 16 + 2];   /* madeira-bcd draw-dedup: sb[k] as an offset-only set */
     struct mad_dd *dd = NULL;                              /* madeira-bcd draw-dedup: what the encoder holds; NULL = send everything */
+    const int ids_on = g_replay_split > 0 && (c->kind == MC_DRAW_INDIRECT || c->kind == MC_DRAW_INDEXED_INDIRECT);   /* indirect draw split */
+    UINT64 ids_t0 = ids_on ? mad_tick() : 0, ids_p[4] = {0, 0, 0, 0};
     struct wmtcmd_render_useresource ur[256];
     struct wmtcmd_render_setdsso c_dss;
     struct wmtcmd_render_setrasterizerstate c_ras;
@@ -8612,6 +8649,7 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
         exec_end(e);
     }
     if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
+    if (ids_on) { UINT64 t = mad_tick(); ids_p[0] = t - ids_t0; ids_t0 = t; }
     if (g_skip_ps_state && mad_skip_ps_match(e->pso)) { MAD_SKIP(e); return; }   /* madeira-bcd: diagnostic, off unless skip-ps is set */
     g_dump_tables = 0;
     if (g_capture_on && g_capture_ps[0] && mad_name_in_list(g_capture_ps, e->pso->ps_name) && g_capture_ps_shots < 8) {   /* ml1106; ml1152: any listed ps, 8 shots; madeira-bcd: exact names (a substring match let ps_SetColor eat the shots meant for ps_SetColor_MultiLight) */
@@ -8779,6 +8817,7 @@ tess_go:
         MAD_SETBUF(WMTRenderCommandSetFragmentBuffer, e->smp->buffer, 0, 1);
     }
     }
+    if (ids_on) { UINT64 t = mad_tick(); ids_p[1] = t - ids_t0; ids_t0 = t; }
     /* Vertex buffers ride at kIRVertexBufferBindPoint (6) + slot -- for the
      * DXIL (MSC) backend only. ml1105: the DXBC backend pulls vertices through
      * its table at Metal index 16, and this loop bound D3D slot 10 at 6 + 10 =
@@ -9080,6 +9119,7 @@ tess_go:
      * buffer retains what it is given, so a release after the encode is safe.
      * Read here, after every early return above, so the lock is never left held. */
     int ml1302_held = 0;
+    if (ids_on) { UINT64 t = mad_tick(); ids_p[2] = t - ids_t0; ids_t0 = t; }
     if (!ml1060_skip_lists) {
         struct wmtcmd_base *dl_head = NULL, *dl_tail = NULL;
 #define MAD_USE_DL(h, u) do { if ((h) && nur < 256 && !mad_use_seen(e, e->renc, (h), (UINT32)(u), use_stages)) { \
@@ -9131,6 +9171,11 @@ tess_go:
     if (c_pso.type == WMTRenderCommandSetPSO && !tv && c_pso.pso != e->pso->rps) mad_eb_flush_cur(EBF_VARIANT);
     if (ml1302_held) { mad_eb_flush_cur(EBF_OTHER); ReleaseSRWLockShared(&dev->list_lock); }   /* ml1302: the batch is encoded */
     mad_use_commit(e);   /* this draw's useResource entries reached the encoder */
+    if (ids_on) {
+        int k; ids_p[3] = mad_tick() - ids_t0;
+        for (k = 0; k < 4; k++) InterlockedExchangeAdd64(&g_ids_t[k], (LONG64)ids_p[k]);
+        InterlockedIncrement(&g_ids_n);
+    }
 #undef MAD_APPEND
     e->draws++; e->pass_draws++;   /* ml1098 */
     if (e->nrt && e->rt[0] && e->rtp[0].layers > 1) {   /* ml926: layered draws */
@@ -9913,6 +9958,7 @@ static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
     if (dview) NSObject_release(dview);
 }
 
+static volatile LONG g_cs_concurrent = -1;   /* madeira-duo cs-concurrent, see exec_dispatch */
 static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_compute_setpso c_pso;
     e->wr_all = 1;   /* ml1116: a dispatch writes through UAVs we do not enumerate here */
@@ -9951,7 +9997,23 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     if (!e->cenc) {
         if (e->renc) InterlockedIncrement(&g_pass_end_dispatch);
         exec_end(e);
-        e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, false); if (e->cenc) g_enc_seq++;
+        /* madeira-duo cs-concurrent: D3D12 orders dispatches only at a UAV or
+         * transition barrier, and every barrier here ends the compute encoder
+         * (fence-chain 1..5; f6 keeps it open, so stays serial). Inside one
+         * encoder the dispatches are independent, so a concurrent encoder lets
+         * the GPU overlap them. PoE2 fights issue 2,500-5,300 dispatches a frame
+         * of ~4 threadgroups each in ~35 encoders; serial, each waits for the
+         * last to drain (text14: GPU 72-116 ms a frame). Opt-in:
+         * madeira.cfg cs-concurrent = 1 (default 0 = serial encoders, as before). */
+        LONG cs_concurrent = InterlockedCompareExchange(&g_cs_concurrent, 0, 0);
+        if (cs_concurrent < 0) {
+            LONG configured = mad_cfg_int_pe("cs-concurrent", 0) ? 1 : 0;
+            LONG previous = InterlockedCompareExchange(&g_cs_concurrent, configured, -1);
+            cs_concurrent = previous < 0 ? configured : previous;
+            if (previous < 0 && configured)
+                d3d12_log("[madeira-d3d12] cs-concurrent: compute encoders are concurrent between barriers (madeira.cfg cs-concurrent)\n");
+        }
+        e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, cs_concurrent > 0 && e->mode != 6); if (e->cenc) g_enc_seq++;
         e->cenc_pso = e->cpso; e->cenc_seq = g_enc_seq;
         if (g_fault_diag) mad_label(e->cenc, "C#%u %s fn=%llx:%s", g_enc_seq, e->cpso->vs_name,
                                     (unsigned long long)e->cpso->vs_fn, e->cpso->vs_name);
@@ -12051,6 +12113,7 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
         if (d->dsso) NSObject_release(d->dsso);
         if (d->mtl_queue) NSObject_release(d->mtl_queue);
         if (d->mtl_device) NSObject_release(d->mtl_device);
+        free(d->smp_cache);
         DeleteCriticalSection(&d->live_lock);
         DeleteCriticalSection(&d->view_lock); free(d->vmap);
         d3d12_log("[madeira-d3d12] destroyed %s\n", d->name);
@@ -12288,6 +12351,31 @@ static const D3D12_RESOURCE_DESC *mad_desc_mips(const D3D12_RESOURCE_DESC *in, D
     return tmp;
 }
 
+/* bc-footprint: a block-compressed footprint is whole blocks. D3D12 answers a
+ * BC texture's footprint Width and Height rounded up to the 4x4 block, so a 2x2
+ * or 1x1 mip reports 4x4, and Unreal checks it ("Footprint.Width %
+ * Format.BlockSizeX == 0", Satisfactory's first BC upload after the logo). The
+ * copy that comes back with that footprint is cut to the level again in
+ * CopyTextureRegion (mad_bc_clip), because Metal refuses a copy that runs past
+ * the level. madeira.cfg / the game's config bc-footprint-align = 0 restores
+ * the texel size. */
+static int g_bc_fp_align = -1;
+static int mad_bc_footprint_align(void) {
+    if (g_bc_fp_align < 0) {
+        g_bc_fp_align = mad_cfg_int_pe("bc-footprint-align", 1) ? 1 : 0;   /* fix: BC footprints in whole 4x4 blocks, as D3D12 reports them (Satisfactory / Unreal "Footprint.Width % Format.BlockSizeX" assert); 0 = the mip's texel size */
+        d3d12_log("[madeira-d3d12] bc-footprint-align = %d (BC footprints %s)\n", g_bc_fp_align,
+                  g_bc_fp_align ? "in whole 4x4 blocks, as D3D12" : "in texels");
+    }
+    return g_bc_fp_align;
+}
+/* A copy into or out of a BC level may name the block-rounded footprint (or a
+ * box out to the block edge); keep only the part inside the level. */
+static void mad_bc_clip(UINT block, UINT mw, UINT mh, UINT x, UINT y, UINT *w, UINT *h) {
+    if (block <= 1) return;
+    if (x < mw && *w > mw - x) *w = mw - x;
+    if (y < mh && *h > mh - y) *h = mh - y;
+}
+
 /* The standard subresource layout: rows padded to 256 bytes, each subresource
  * starting on a 512-byte boundary. Both constants are the API's own. */
 static void STDMETHODCALLTYPE device_GetCopyableFootprints(ID3D12Device *This,
@@ -12319,6 +12407,10 @@ static void STDMETHODCALLTYPE device_GetCopyableFootprints(ID3D12Device *This,
         rows = (h + block - 1) / block;
         pitch = mad_align(rowbytes, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
         offset = mad_align(offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+        if (block > 1 && desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && mad_bc_footprint_align()) {
+            w = mad_align(w, block);   /* bc-footprint: whole blocks; rowbytes and rows already are */
+            h = mad_align(h, block);
+        }
         if (layouts) {
             layouts[i].Offset = offset;
             layouts[i].Footprint.Format = desc->Format;
@@ -12346,7 +12438,7 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
         struct mad_device *md = (struct mad_device *)This;
         if (d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             bytes = d->Width;
-            MTLDevice_heapBufferSizeAndAlign(md->mtl_device, d->Width ? d->Width : 1, WMTResourceStorageModePrivate, &msz, &mal);   /* ml1145 */
+            MadeiraMTLDevice_heapBufferSizeAndAlign(md->mtl_device, d->Width ? d->Width : 1, WMTResourceStorageModePrivate, &msz, &mal);   /* ml1145 */
         } else {
             struct WMTTextureInfo ti; enum WMTPixelFormat pf; int isd;
             UINT subs = (d->MipLevels ? d->MipLevels : 1) *
@@ -12354,7 +12446,7 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
             device_GetCopyableFootprints(This, d, 0, subs, 0, NULL, NULL, NULL, &bytes);
             if (d->SampleDesc.Count > 1) a = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
             if (mad_texinfo_from_desc(d, &ti, &pf, &isd) && ((ti.width && ti.height) || !mad_zero_extent_guard()))   /* d3d12-zero-extent-guard: Metal aborts on a zero extent */
-                MTLDevice_heapTextureSizeAndAlign(md->mtl_device, &ti, &msz, &mal);   /* ml1145 */
+                MadeiraMTLDevice_heapTextureSizeAndAlign(md->mtl_device, &ti, &msz, &mal);   /* ml1145 */
         }
         /* ml1145: a placed resource is really placed now, so the application must
          * plan its heap with the size and alignment Metal needs, not the linear
@@ -15049,7 +15141,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         if ((!ti.width || !ti.height) && mad_zero_extent_guard()) { free(r); mad_refuse_log(desc, heap_type, "zero-size texture (Metal aborts the process on it)"); return E_INVALIDARG; }
         if (ph && ph->mtl) {   /* ml1145: inside the application's heap, at its offset */
             UINT64 psz = 0, pal = 0;
-            MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &psz, &pal);
+            MadeiraMTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &psz, &pal);
             if (psz && pal && !(poff % pal) && poff + psz <= ph->desc.SizeInBytes)
                 r->texture = MTLHeap_newTextureAtOffset(ph->mtl, &ti, poff);
             if (r->texture) { r->placed_heap = ph; r->placed_off = poff; r->placed_size = psz; mad_pl_add(ph, r); ID3D12Heap_AddRef((ID3D12Heap *)ph); InterlockedIncrement(&g_placed_in_heap); }
@@ -15058,7 +15150,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         if (!r->texture && !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
             && ti.sample_count <= 1) {   /* ml1072 */
             UINT64 hsz = 0, hal = 0, hoff = 0; int hidx;
-            MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &hsz, &hal);
+            MadeiraMTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &hsz, &hal);
             if (hsz && hsz <= MAD_HP_MAX_TEX && (hidx = mad_hp_alloc(d, hsz, hal, &hoff)) >= 0) {
                 r->texture = MTLHeap_newTextureAtOffset(d->theaps[hidx].heap, &ti, hoff);
                 if (r->texture) { r->hp_used = 1; r->hp_heap = (unsigned)hidx; r->hp_off = hoff; r->hp_size = hsz; InterlockedIncrement(&d->hp_textures); }
@@ -15098,7 +15190,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                         : (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? MAD_CAT_TEX_UAV : MAD_CAT_TEX_PLAIN, bytes, +1);
             if (!r->hp_used) {   /* madeira-bcd metal-gap: a standalone texture, as Metal sizes it */
                 UINT64 msz = 0, mal = 0;
-                MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &msz, &mal);
+                MadeiraMTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &msz, &mal);
                 if (msz) {
                     r->metal_bytes = msz;
                     InterlockedExchangeAdd64(&g_sa_tex_bytes, (LONG64)msz);
@@ -15132,7 +15224,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         info.memory.ptr = NULL;
         if (ph && ph->mtl && heap_type == D3D12_HEAP_TYPE_DEFAULT) {   /* ml1145: inside the application's heap */
             UINT64 psz = 0, pal = 0;
-            MTLDevice_heapBufferSizeAndAlign(d->mtl_device, info.length, info.options, &psz, &pal);
+            MadeiraMTLDevice_heapBufferSizeAndAlign(d->mtl_device, info.length, info.options, &psz, &pal);
             if (psz && pal && !(poff % pal) && poff + psz <= ph->desc.SizeInBytes)
                 r->buffer = MTLHeap_newBufferAtOffset(ph->mtl, &info, poff);
             if (r->buffer) { r->placed_heap = ph; r->placed_off = poff; r->placed_size = psz; mad_pl_add(ph, r); ID3D12Heap_AddRef((ID3D12Heap *)ph); InterlockedIncrement(&g_placed_in_heap); }
@@ -15783,6 +15875,10 @@ static HRESULT device_CreateRootSignature_impl(ID3D12Device *This, UINT node,
     d3d12_log("[madeira-d3d12] root signature parsed from the application blob: "
               "version 1.%u, %u parameter(s), %u descriptor range(s), %u static sampler(s)\n",
               version == 2 ? 1u : 0u, r->nparams, r->nranges, r->nsamplers); }
+    if (!mad_root_layout_fits(r, "CreateRootSignature")) {   /* d3d12-root-params-64 */
+        rootsig_Release((ID3D12RootSignature *)r);
+        return E_NOTIMPL;
+    }
     HRESULT hr = rootsig_QI((ID3D12RootSignature *)r, riid, out);
     rootsig_Release((ID3D12RootSignature *)r);
     return hr;
@@ -16584,6 +16680,32 @@ static void mad_sampler_info(struct WMTSamplerInfo *si, UINT filter, UINT au, UI
     if (red >= 2 || g_smp_census) mad_sampler_log(si, filter, cmp, who ? who : "?");
 }
 
+#define MAD_SMP_CACHE_N 512
+struct mad_smp_cache_ent { unsigned char key[offsetof(struct WMTSamplerInfo, gpu_resource_id)]; UINT64 id; obj_handle_t smp; };
+static LONG g_smp_cache_said;
+static int mad_smp_cache_get(struct mad_device *d, struct WMTSamplerInfo *si, obj_handle_t *out) {
+    LONG i, n; int hit = 0;
+    AcquireSRWLockShared(&g_smp_cache_lock);
+    n = d->smp_cache_n;
+    for (i = 0; i < n; i++)
+        if (!memcmp(d->smp_cache[i].key, si, sizeof d->smp_cache[i].key)) {
+            si->gpu_resource_id = d->smp_cache[i].id; *out = d->smp_cache[i].smp; hit = 1; break;
+        }
+    ReleaseSRWLockShared(&g_smp_cache_lock);
+    if (hit && !g_smp_cache_said && !InterlockedExchange(&g_smp_cache_said, 1))
+        d3d12_log("[madeira-d3d12] sampler-cache: identical CreateSampler descriptions share one Metal sampler\n");
+    return hit;
+}
+static void mad_smp_cache_put(struct mad_device *d, const struct WMTSamplerInfo *si, obj_handle_t smp) {
+    AcquireSRWLockExclusive(&g_smp_cache_lock);
+    if (!d->smp_cache) d->smp_cache = calloc(MAD_SMP_CACHE_N, sizeof *d->smp_cache);
+    if (d->smp_cache && d->smp_cache_n < MAD_SMP_CACHE_N) {
+        struct mad_smp_cache_ent *e = &d->smp_cache[d->smp_cache_n];
+        memcpy(e->key, si, sizeof e->key); e->id = si->gpu_resource_id; e->smp = smp;
+        d->smp_cache_n++;
+    }
+    ReleaseSRWLockExclusive(&g_smp_cache_lock);
+}
 static void STDMETHODCALLTYPE device_CreateSampler(ID3D12Device *This,
         const D3D12_SAMPLER_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     struct mad_device *d = (struct mad_device *)This;
@@ -16592,12 +16714,22 @@ static void STDMETHODCALLTYPE device_CreateSampler(ID3D12Device *This,
     if (g_sd_state > 0) mad_dg_write(e, 1, "CreateSampler");   /* madeira-bcd: desc-guard */
 
     struct WMTSamplerInfo si;
+    obj_handle_t smp = 0; int cached = 0;
+    memset(&si, 0, sizeof si);   /* madeira-duo sampler-cache: the padding takes part in the key */
     if (desc) {
         UINT border = (desc->BorderColor[0] > 0.5f) ? 2u : (desc->BorderColor[3] > 0.5f) ? 1u : 0u;
         mad_sampler_info(&si, desc->Filter, desc->AddressU, desc->AddressV, desc->AddressW, desc->MaxAnisotropy, desc->ComparisonFunc, border, desc->MinLOD, desc->MaxLOD, "CreateSampler");
     } else mad_sampler_info(&si, D3D12_FILTER_MIN_MAG_MIP_LINEAR, 3, 3, 3, 1, 0, 0, 0.0f, 1000.0f, "CreateSampler (no description)");
 
-    obj_handle_t smp = MTLDevice_newSamplerState(d->mtl_device, &si);
+    /* madeira-duo sampler-cache: PoE2 creates ~16 samplers a frame from a handful of
+     * descriptions; each was a new Metal sampler (a host call) kept for the process's
+     * life. Identical descriptions now share the first one (samplers are immutable). */
+    cached = mad_smp_cache_get(d, &si, &smp);
+    if (!cached) {
+        smp = MTLDevice_newSamplerState(d->mtl_device, &si);
+        if (smp && !mad_note_sampler(d, smp)) smp = 0;
+        if (smp && si.gpu_resource_id) mad_smp_cache_put(d, &si, smp);
+    }
     if (!smp || !si.gpu_resource_id) {
         d3d12_log("[madeira-d3d12] CreateSampler: the backend gave no argument-buffer sampler\n");
         memset(e, 0, sizeof *e);
@@ -16623,7 +16755,6 @@ static void STDMETHODCALLTYPE device_CreateSampler(ID3D12Device *This,
      * life. Samplers are few and immutable, and tying one to a descriptor slot
      * that the application may overwrite would need a lifetime story that this
      * milestone does not have. */
-    mad_note_sampler(d, smp);
 }
 
 /* ---- pipeline state -------------------------------------------------------
@@ -16750,7 +16881,7 @@ static const char *mad_ir_status_name(uint32_t st) {
 
 /* Convert one stage and build its MTLFunction. The metallib buffer is sized by
  * asking first, so a shader larger than any fixed guess still works. */
-#define MAD_LOC_MAX 64
+#define MAD_LOC_MAX 72   /* d3d12-root-params-64: 64 root parameters + the static-sampler table entry */
 /* What a DXIL hull or domain shader converted for the converter's tessellation
  * emulation reports (madeira_ir_convert_args ret_hs_* / ret_ds_*). */
 struct mad_dtess_refl {
@@ -18539,6 +18670,27 @@ static UINT mad_root_layout(const struct mad_rootsig *rs, UINT offsets[MAD_ROOT_
         }
     }
     return off;
+}
+
+/* d3d12-root-params-64: 1 when the root arguments (plus the converter's implicit
+ * static-sampler table slot) end at or before MAD_ARG_DRAWPARAMS_OFF, so they
+ * can never overlap the draw parameters in the 1088-byte argument slot. With
+ * 32 parameters this always held; with 64 an all-tables signature that also has
+ * static samplers (64 x 8 + 8 = 520 bytes) would not, and is refused. */
+static int mad_root_layout_fits(const struct mad_rootsig *rs, const char *who) {
+    UINT offsets[MAD_ROOT_PARAM_MAX], end = mad_root_layout(rs, offsets);
+    if (rs->nsamplers) end = ((end + 7) & ~7u) + 8;
+    if (end <= MAD_ARG_DRAWPARAMS_OFF) {
+        if (rs->nparams > 32) {
+            static LONG said; if (InterlockedIncrement(&said) <= 8)
+                d3d12_log("[d3d12-root-params-64] %s: %u parameters, root arguments end at %u of %u bytes\n",
+                          who, rs->nparams, end, (unsigned)MAD_ARG_DRAWPARAMS_OFF);
+        }
+        return 1;
+    }
+    d3d12_log("[d3d12-root-params-64] %s: %u parameters need %u bytes of root arguments, more than the %u this build has; refused\n",
+              who, rs->nparams, end, (unsigned)MAD_ARG_DRAWPARAMS_OFF);
+    return 0;
 }
 
 /* ml882: reconcile the computed layout with the converter's reflection. A
@@ -20400,6 +20552,7 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
             c->u.bt.w = box->right - box->left; c->u.bt.h = box->bottom - box->top; c->u.bt.d = box->back - box->front;
         }
         c->u.bt.x = x; c->u.bt.y = y; c->u.bt.z = z;
+        mad_bc_clip(block, w, h, x, y, &c->u.bt.w, &c->u.bt.h);   /* bc-footprint */
         return;
     }
     if (s->texture && !d->texture) {           /* readback: texture -> buffer */
@@ -20421,6 +20574,7 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
             c->u.bt.rows = (fh + block - 1) / block;
             c->u.bt.off += (UINT64)z * c->u.bt.row * c->u.bt.rows + (UINT64)(y / block) * c->u.bt.row + (UINT64)(x / block) * bytes;
         }
+        mad_bc_clip(block, w, h, c->u.bt.x, c->u.bt.y, &c->u.bt.w, &c->u.bt.h);   /* bc-footprint */
         return;
     }
     if (s->texture && d->texture) {            /* texture -> texture */
@@ -21491,7 +21645,7 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
     }
     if (d->mtl_device && d->mtl_queue) {
         struct WMTBufferInfo nbi;
-        d->resset = MTLDevice_newResidencySet(d->mtl_device, 4096);
+        d->resset = MadeiraMTLDevice_newResidencySet(d->mtl_device, 4096);
         if (d->resset) MTLCommandQueue_addResidencySet(d->mtl_queue, d->resset);
         d3d12_log("[madeira-d3d12] residency set: %s\n", d->resset ? "attached to the queue" : "UNAVAILABLE (per-draw lists only)");
         memset(&nbi, 0, sizeof nbi);
@@ -22281,18 +22435,66 @@ static HRESULT mad_swap_resize(struct mad_swapchain *s, UINT count, UINT w, UINT
 static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
     return mad_swap_resize((struct mad_swapchain *)T, count, w, h, fmt, flags, "ResizeBuffers");
 }
+/* resize-target: Windows' DXGI ResizeTarget, for a windowed swapchain, sizes
+ * the window so its client area is the requested mode (style kept, position
+ * kept). Resident Evil Village opens a 1920x1080 window on a 1408x648 desktop,
+ * then asks ResizeTarget(1408x648); as a no-op the window stayed 1920x1080 and
+ * the desktop fit shrank the picture (0.2.52 log 80c2496f). Done like
+ * fullscreen-window above: user32 looked up at the call, the move posted to the
+ * window's thread (SWP_ASYNCWINDOWPOS). Full screen stays a no-op (the display
+ * mode is not changed). env MADEIRA_D3D12_RESIZE_TARGET=0 = the old no-op.
+ * Returns 1 when SetWindowPos was posted, 0 when nothing was done, -1 on failure. */
+static int mad_swap_resize_window(struct mad_swapchain *s, UINT w, UINT h, RECT *out_rc) {
+    typedef BOOL (WINAPI *is_window_fn)(HWND);
+    typedef LONG (WINAPI *getlong_fn)(HWND, int);
+    typedef BOOL (WINAPI *adjust_fn)(RECT *, DWORD, BOOL, DWORD);
+    typedef BOOL (WINAPI *pos_fn)(HWND, HWND, int, int, int, int, UINT);
+    /* On by default: a windowed swap chain resize also sizes the target. 0 turns it off (the old no-op). state: 0 = not read yet, 1 = on, 2 = off */
+    static LONG state;
+    HMODULE u;
+    is_window_fn is_window; getlong_fn getlong; adjust_fn adjust; pos_fn pos;
+    DWORD style, exstyle;
+    RECT rc;
+    if (!state) {
+        char v[8];
+        DWORD n = GetEnvironmentVariableA("MADEIRA_D3D12_RESIZE_TARGET", v, sizeof v);
+        InterlockedExchange(&state, (n == 1 && v[0] == '0') ? 2 : 1);
+    }
+    if (state != 1 || !s->hwnd || !s->fs.Windowed || !w || !h) return 0;
+    if (!(u = GetModuleHandleW(L"user32.dll"))) return 0;   /* a process with a window has it loaded */
+    is_window = (is_window_fn)(void *)GetProcAddress(u, "IsWindow");
+    getlong = (getlong_fn)(void *)GetProcAddress(u, "GetWindowLongW");
+    adjust = (adjust_fn)(void *)GetProcAddress(u, "AdjustWindowRectEx");
+    pos = (pos_fn)(void *)GetProcAddress(u, "SetWindowPos");
+    if (!is_window || !getlong || !adjust || !pos || !is_window(s->hwnd)) return -1;
+    style = (DWORD)getlong(s->hwnd, GWL_STYLE);
+    exstyle = (DWORD)getlong(s->hwnd, GWL_EXSTYLE);
+    rc.left = 0; rc.top = 0; rc.right = (LONG)w; rc.bottom = (LONG)h;   /* not SetRect: user32 is only looked up */
+    if (!adjust(&rc, style, FALSE, exstyle)) return -1;
+    if (out_rc) *out_rc = rc;
+    return pos(s->hwnd, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+               SWP_NOMOVE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS) ? 1 : -1;
+}
 static HRESULT STDMETHODCALLTYPE swap_ResizeTarget(IDXGISwapChain4 *T, const DXGI_MODE_DESC *m) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     LONG seq;
-    /* madeira-bcd: [swap-diag] still a no-op: the window keeps its size and the
-     * display its mode, so no WM_SIZE or WM_DISPLAYCHANGE follows from it. */
+    RECT rc = {0, 0, 0, 0};
+    static volatile LONG rt_logs;
+    int resized = m ? mad_swap_resize_window(s, m->Width, m->Height, &rc) : 0;
+    if (resized && InterlockedIncrement(&rt_logs) <= 16)
+        d3d12_log("[madeira-d3d12] resize-target: window %p client -> %ux%u (window %ldx%ld)%s\n", (void *)s->hwnd,
+                  m->Width, m->Height, (long)(rc.right - rc.left), (long)(rc.bottom - rc.top),
+                  resized < 0 ? " -- FAILED" : "");
+    /* madeira-bcd: [swap-diag] the line below says "no-op" when resize-target did not
+     * act (full screen, off, zero size) and "resize was posted" when it did. */
     if (mad_swd_take(&g_swd_rt_n, &seq)) {
         if (m)
             mad_swd_log("[swap-diag] #%ld ResizeTarget(%ux%u, refresh %u/%u, format %u, scanline %u, scaling %u) on swapchain %p "
-                        "(hwnd %p, %ux%u, fullscreen %d) -> S_OK at once: a no-op, the window and the display mode keep "
-                        "their size; tid %04lx\n", (long)seq, m->Width, m->Height, m->RefreshRate.Numerator,
+                        "(hwnd %p, %ux%u, fullscreen %d) -> S_OK at once: %s; tid %04lx\n", (long)seq, m->Width, m->Height, m->RefreshRate.Numerator,
                         m->RefreshRate.Denominator, (unsigned)m->Format, (unsigned)m->ScanlineOrdering, (unsigned)m->Scaling,
                         (void *)s, (void *)s->hwnd, s->desc.Width, s->desc.Height, !s->fs.Windowed,
+                        resized > 0 ? "the window's resize was posted (see the resize-target line); the display mode keeps its size"
+                                    : "a no-op, the window and the display mode keep their size",
                         (unsigned long)GetCurrentThreadId());
         else
             mad_swd_log("[swap-diag] #%ld ResizeTarget(NULL) on swapchain %p -> S_OK at once (a no-op); tid %04lx\n",
@@ -22539,6 +22741,71 @@ static HRESULT mad_queue_dxgi_tearoff(struct mad_queue *q, void **out) {
     t->vtbl = &g_mdd_vtbl; t->refs = 1; t->queue = q;
     ID3D12CommandQueue_AddRef((ID3D12CommandQueue *)q);
     d3d12_log("[madeira-d3d12] dxgi asked the queue for its Metal device; swapchain bridge engaged\n");
+    *out = t;
+    return S_OK;
+}
+
+/* swap-factory: DXMT v0.80's dxgi.dll (CreateSwapChainForHwnd) no longer asks
+ * for IMTLDXGIDevice. It asks the queue for IMTLSwapChainFactory {6c030003-...},
+ * then for vkd3d's IDXGIVkSwapChainFactory, and fails with "Unsupported device
+ * type" / DXGI_ERROR_UNSUPPORTED when neither answers. The queue now answers
+ * the first with a tear-off: IUnknown plus CreateSwapChain, the same signature
+ * as IMTLDXGIDevice::CreateSwapChain, so it goes to the same bridge.
+ * env MADEIRA_D3D12_SWAP_FACTORY=0 refuses the query, as before. */
+struct mad_swap_factory;
+struct mad_swap_factory_vtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(struct mad_swap_factory *, REFIID, void **);
+    ULONG (STDMETHODCALLTYPE *AddRef)(struct mad_swap_factory *);
+    ULONG (STDMETHODCALLTYPE *Release)(struct mad_swap_factory *);
+    HRESULT (STDMETHODCALLTYPE *CreateSwapChain)(struct mad_swap_factory *, IDXGIFactory1 *, HWND,
+                                                 const DXGI_SWAP_CHAIN_DESC1 *, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *,
+                                                 IDXGISwapChain1 **);
+};
+struct mad_swap_factory {
+    const struct mad_swap_factory_vtbl *vtbl;
+    LONG refs;
+    struct mad_queue *queue;
+};
+static int mad_swapfactory_enabled(void) {
+    /* On by default; 0 turns off the swapchain-factory answer (a game's DX12 swapchain then fails as before).
+     * state: 0 = not read yet, 1 = on, 2 = off */
+    static LONG state;
+    if (!state) {
+        char v[8];
+        DWORD n = GetEnvironmentVariableA("MADEIRA_D3D12_SWAP_FACTORY", v, sizeof v);
+        InterlockedExchange(&state, (n == 1 && v[0] == '0') ? 2 : 1);
+    }
+    return state == 1;
+}
+static HRESULT STDMETHODCALLTYPE msf_QI(struct mad_swap_factory *T, REFIID riid, void **out) {
+    if (!out) return E_POINTER;
+    if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IMTLSwapChainFactory)) {
+        InterlockedIncrement(&T->refs); *out = T; return S_OK;
+    }
+    /* Anything else is the queue's business. */
+    return T->queue->vtbl->QueryInterface((ID3D12CommandQueue *)T->queue, riid, out);
+}
+static ULONG STDMETHODCALLTYPE msf_AddRef(struct mad_swap_factory *T) { return (ULONG)InterlockedIncrement(&T->refs); }
+static ULONG STDMETHODCALLTYPE msf_Release(struct mad_swap_factory *T) {
+    LONG n = InterlockedDecrement(&T->refs);
+    if (n == 0) { ID3D12CommandQueue_Release((ID3D12CommandQueue *)T->queue); free(T); }
+    return (ULONG)n;
+}
+static HRESULT STDMETHODCALLTYPE msf_CreateSwapChain(struct mad_swap_factory *T, IDXGIFactory1 *factory, HWND hwnd,
+        const DXGI_SWAP_CHAIN_DESC1 *desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs, IDXGISwapChain1 **out) {
+    HRESULT hr = mad_swapchain_create(T->queue, factory, hwnd, desc, fs, out);
+    d3d12_log("[madeira-d3d12] swap-factory: CreateSwapChain %ux%u fmt %u buffers %u -> hr %#lx\n",
+              desc ? desc->Width : 0, desc ? desc->Height : 0, desc ? (unsigned)desc->Format : 0,
+              desc ? desc->BufferCount : 0, (unsigned long)hr);
+    return hr;
+}
+static const struct mad_swap_factory_vtbl g_msf_vtbl = { msf_QI, msf_AddRef, msf_Release, msf_CreateSwapChain };
+static HRESULT mad_queue_swapfactory_tearoff(struct mad_queue *q, void **out) {
+    struct mad_swap_factory *t = calloc(1, sizeof *t);
+    if (!t) return E_OUTOFMEMORY;
+    t->vtbl = &g_msf_vtbl; t->refs = 1; t->queue = q;
+    ID3D12CommandQueue_AddRef((ID3D12CommandQueue *)q);
+    d3d12_log("[madeira-d3d12] swap-factory: dxgi asked the queue for IMTLSwapChainFactory; swapchain bridge engaged\n");
     *out = t;
     return S_OK;
 }

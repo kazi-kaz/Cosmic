@@ -93,7 +93,7 @@ final class MadeiraDockModel: ObservableObject {
         status = plan.map { $0 + "\n" + starting } ?? starting
         if let plan { LogStore.shared.log("[dock-installers] " + plan) }
         watch = Task { @MainActor in
-            var idle = 0, started = false, offered = false
+            var idle = 0, started = false, offered = false, hostWaited = 0, hostLate = false
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 let report = MadeiraDock.pollReport()
@@ -135,7 +135,21 @@ final class MadeiraDockModel: ObservableObject {
                     status = ended + "\n" + DockInstallers.restartWords
                     LogStore.shared.log("[dock-installers] the session still runs 45 s after the installs ended (a program they started); the restart is offered now")
                     LibraryModel.shared.restartNotice = DockInstallers.restartNotice(ended)
+                    LibraryModel.shared.installsRestartReady = true
                 }
+                // A start that runs installs first starts the host from the same cmd. If that host died at
+                // its start (the session itself keeps running), no field ever appears: say so, after 2 min.
+                if DockInstallers.script != nil, !DockInstallers.installsOnly, report.fields.isEmpty, report.result == nil,
+                   running, DockInstallers.installsIdle {
+                    hostWaited += 1
+                    if hostWaited >= 60 {   // kept on every pass: the installs poll above rewrites status each time
+                        status = "Madeira Dock's host did not start after the one-time installs. Press Stop and start the game again; the installs are skipped next time. Export the log if it repeats."
+                        if !hostLate {
+                            hostLate = true
+                            LogStore.shared.log("[madeira-dock] no host report 120 s after the one-time installs step; the host most likely died at its start", level: .error)
+                        }
+                    }
+                } else { hostWaited = 0 }
                 if started && idle >= 5 {
                     if DockInstallers.installsOnly {
                         // madeira-bcd: a session of one-time installs ends after its batch, and the
@@ -145,6 +159,7 @@ final class MadeiraDockModel: ObservableObject {
                         status = ended + "\n" + DockInstallers.restartWords
                         LogStore.shared.log("[dock-installers] the installs-only session ended; the game starts after Madeira is restarted")
                         LibraryModel.shared.restartNotice = DockInstallers.restartNotice(DockInstallers.poll(drive: MadeiraDock.drive))
+                        LibraryModel.shared.installsRestartReady = true
                     } else {
                         status = "Madeira Dock stopped before reporting a result. Export the log."
                         LogStore.shared.log("[madeira-dock] session ended without a host result", level: .error)

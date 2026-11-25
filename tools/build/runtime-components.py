@@ -89,6 +89,11 @@ def check_binary(path, data):
             expected = {0x8664}
         if machine not in expected:
             raise ValueError(f'wrong PE architecture 0x{machine:x}: {path}')
+        # Wine looks a builtin up by its lowercased name, and iOS file names are
+        # case-sensitive: a WLDAP32.dll in the farm is never found (c0000135).
+        name = PurePosixPath(path).name
+        if data[0x40:0x50] == b'Wine builtin DLL' and name != name.lower():
+            raise ValueError(f'Wine builtin must have a lowercase file name: {path}')
         if path.startswith(('arm64ec-windows/', 'aarch64-windows/')) and PurePosixPath(path).name in {'ucrtbase.dll', 'msvcrt.dll'}:
             spec = importlib.util.spec_from_file_location('wine_pe', ROOT / 'tools/check-wine-media-dlls.py')
             reader = importlib.util.module_from_spec(spec)

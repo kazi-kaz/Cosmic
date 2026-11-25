@@ -337,9 +337,9 @@ struct fd *load_intl_file(void)
         if (!nls_dirs[i]) continue;
         if (asprintf( &path, "%s/l_intl.nls", nls_dirs[i] ) == -1) continue;
         ws_log("[wineserver] load_intl_file: trying path[%u]='%s' (access=%d)", i, path, access(path, R_OK));
-        if ((fd = open_fd( NULL, path, nt_name, O_RDONLY, &mode, FILE_READ_DATA,
+        if ((fd = open_fd( NULL, path, nt_name, &mode, FILE_READ_DATA,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT ))) {
+                           FILE_OPEN, FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT ))) {
             ws_log("[wineserver] load_intl_file: SUCCESS with path='%s'", path);
             break;
         }

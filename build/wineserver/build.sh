@@ -101,7 +101,22 @@ PATCHED_FILES=(
     # lost) that every rebuild silently preserved — the #79 TCP-table
     # forensics were reading three-week-old mystery code. The submodule
     # copy adds the [srv-conn]/[tcp-state]/[tcp-enum] probes.
-    "sock:$WINE_SRC/server/sock.c:sock.o"
+    # [sock-census] (log only, Battle.net freeze): sock_census_ios.c #includes
+    # the submodule's sock.c unchanged and appends one read-only helper, so
+    # sock.o is the same code plus that helper. Same sock.o REPLACEMENTS entry.
+    "sock:sock_census_ios.c:sock.o"
+    # [pipe-census] (log only, Battle.net freeze): the archive's named_pipe.o and
+    # completion.o were checked byte-identical to fresh compiles of the pin
+    # (Nov 14), so building them from the submodule changes nothing but the log.
+    "named_pipe:$WINE_SRC/server/named_pipe.c:named_pipe.o"
+    "completion:$WINE_SRC/server/completion.c:completion.o"
+    # [stored-acl] (Battle.net launcher freeze): Wine Staging server-Stored_ACLs
+    # (bug 33576) keeps file/dir security descriptors in xattr user.wine.sd, so
+    # Battle.net Agent's one-time ACL fix on its install folder survives restarts.
+    # file.c + change.c carry the port; object.c (already listed) gets the
+    # set_sd_from_token_internal helper. Both lists, as for every entry here.
+    "file:$WINE_SRC/server/file.c:file.o"
+    "change:$WINE_SRC/server/change.c:change.o"
     # ml2101: the opt-in HID controller (MADEIRA_PAD_MODE = hid) and Wine's
     # hidparse.sys parser it builds its preparsed data with. New objects, not
     # replacements: both lists, as for every entry here.
@@ -198,6 +213,10 @@ REPLACEMENTS=(
     "winstation.o:winstation.o"
     "thread.o:thread.o"
     "sock.o:sock.o"
+    "named_pipe.o:named_pipe.o"   # [pipe-census]
+    "completion.o:completion.o"   # [pipe-census]
+    "file.o:file.o"               # [stored-acl]
+    "change.o:change.o"           # [stored-acl]
     "object.o:object.o"
     "async.o:async.o"
     # ml805: BOTH lists matter. PATCHED_FILES only compiles; REPLACEMENTS is what
@@ -256,6 +275,8 @@ COLLISIONS=(
     # every process hung in server_init_process() the moment a client
     # connected -- guest ntdll init is exactly when the pointer was stolen.
     user_shared_data
+    # madeira-wsl: lld duplicates (also defined in ntdll-unix server_ios.c)
+    supported_machines_count supported_machines native_machine server_start_time
 )
 RENAME_ARGS=()
 for s in "${COLLISIONS[@]}"; do

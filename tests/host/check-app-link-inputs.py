@@ -44,6 +44,9 @@ with tempfile.TemporaryDirectory(prefix='madeira-app-link-') as folder:
     tls_check = native_build[native_build.index('if [ ${#GNUTLS_DEFS[@]} -gt 0 ]; then'):
                              native_build.index('# OpenGL:')]
     tls_probe = 'set -euo pipefail\nOBJ_DIR=$1\nGNUTLS_DEFS=(enabled)\n' + tls_check
+    # Wine 11.22: bcrypt has no unix library any more (PE-only on libs/symcrypt),
+    # so build.sh checks the tables of secur32 and crypt32 only.
+    TLS_MODULES = ['secur32', 'crypt32']
 
     def compile_tls(module, missing=None):
         names = [f'{module}_{table}' for table in ['unix_call_funcs', 'unix_call_wow64_funcs']]
@@ -53,22 +56,22 @@ with tempfile.TemporaryDirectory(prefix='madeira-app-link-') as folder:
         subprocess.run(['xcrun', 'clang', '-x', 'c', '-c', '-', '-o', str(folder / f'{module}_unixlib.o')],
                        input=source, text=True, check=True)
 
-    for module in ['bcrypt', 'secur32', 'crypt32']:
+    for module in TLS_MODULES:
         compile_tls(module)
     result = subprocess.run(['bash', '-c', tls_probe, 'tls-probe', str(folder)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    for module in ['bcrypt', 'secur32', 'crypt32']:
+    for module in TLS_MODULES:
         for table in ['unix_call_funcs', 'unix_call_wow64_funcs']:
             compile_tls(module, f'{module}_{table}')
             result = subprocess.run(['bash', '-c', tls_probe, 'tls-probe', str(folder)], capture_output=True, text=True)
             assert result.returncode != 0 and f'{module} did not build its {table} table' in result.stderr, result.stderr
         compile_tls(module)
-    for module in ['bcrypt', 'secur32', 'crypt32']:
+    for module in TLS_MODULES:
         (folder / f'{module}_unixlib.o').unlink()
     result = subprocess.run(['bash', '-c', tls_probe.replace('GNUTLS_DEFS=(enabled)', 'GNUTLS_DEFS=()'),
                              'tls-probe', str(folder)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    print('PASS real TLS objects require all six defined backend tables; disabled GnuTLS skips the check')
+    print('PASS real TLS objects require all four defined backend tables; disabled GnuTLS skips the check')
 
     def run_probe(name, source, flags=()):
         path = folder / name
@@ -135,6 +138,16 @@ with tempfile.TemporaryDirectory(prefix='madeira-app-link-') as folder:
     typedef struct { PEB *Peb; struct { HANDLE UniqueProcess, UniqueThread; } ClientId; } TEB;
     static _Thread_local TEB *active_teb;
     static TEB *NtCurrentTeb(void) { return active_teb; }
+    /* Wine 11.22 (0.2.72): with no TEB the PEB and process id come from the unix
+     * lib's globals, and the thread id from the host thread's data (thread_data_key,
+     * one per pthread), which is the guest thread's own because each guest thread
+     * runs on its own host thread. */
+    #define ULongToHandle(x) ((HANDLE)(uintptr_t)(x))
+    static PEB fallback_peb, *peb = &fallback_peb;
+    static unsigned int pid = 4242;
+    struct thread_data { unsigned int tid; };
+    static _Thread_local struct thread_data host_data;
+    static struct thread_data *get_thread_data(void) { return &host_data; }
     ''' + '\n'.join(function(env_source, head) for head in heads) + '''
     static void *check_guest(void *arg)
     {
@@ -142,13 +155,18 @@ with tempfile.TemporaryDirectory(prefix='madeira-app-link-') as folder:
         PEB peb = {0};
         TEB first = { &peb, { (void *)(id * 10), (void *)(id * 10 + 1) } };
         TEB second = { &peb, { (void *)(id * 100), (void *)(id * 100 + 1) } };
+        host_data.tid = (unsigned int)(id * 1000 + 7);
         for (int i = 0; i < 10000; ++i)
         {
             active_teb = i & 1 ? &first : &second;
             assert(RtlGetCurrentPeb() == active_teb->Peb);
             assert(PsGetCurrentProcessId() == active_teb->ClientId.UniqueProcess);
-            assert(PsGetCurrentThreadId() == active_teb->ClientId.UniqueThread);
+            assert(PsGetCurrentThreadId() == ULongToHandle(host_data.tid));
         }
+        active_teb = 0;
+        assert(RtlGetCurrentPeb() == &fallback_peb);
+        assert(PsGetCurrentProcessId() == ULongToHandle(4242));
+        assert(PsGetCurrentThreadId() == ULongToHandle(id * 1000 + 7));
         return 0;
     }
     int main(void)
@@ -160,7 +178,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-app-link-') as folder:
         assert(!pthread_join(second, 0));
     }
     ''')
-        print('PASS Wine 11 exports follow guest TEB changes across threads; ALPC/input build inputs are present')
+        print('PASS Wine 11 exports: PEB and process id follow the guest TEB, thread id the host thread, globals without a TEB; ALPC/input build inputs are present')
 
     if 'static NSString *madeira_vulkan_library(' in bridge:
         vulkan = '''

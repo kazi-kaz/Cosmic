@@ -99,6 +99,103 @@ static int madeira_vulkan_pthread_once( pthread_once_t *once, void (*init)(void)
     return ret;
 }
 
+
+/* [vk-bc-probe] diagnostic only: does this session's Vulkan driver report
+ * block-compressed (BC) texture support? Godot 4 picks its s3tc/bptc texture
+ * variant only when the GPU reports BC; Buckshot Roulette on an A14 fails every
+ * texture load (Nov 15). Makes one throw-away instance, reads features and BC
+ * format properties of each GPU, logs them, destroys it. No behaviour change.
+ * Off with env.MADEIRA_VK_BC_PROBE = 0. */
+static void madeira_vk_bc_probe( void *handle )
+{
+    static int done;
+    PFN_vkGetInstanceProcAddr gipa;
+    PFN_vkCreateInstance create_instance;
+    PFN_vkEnumerateInstanceExtensionProperties enum_ext;
+    PFN_vkDestroyInstance destroy_instance;
+    PFN_vkEnumeratePhysicalDevices enum_gpu;
+    PFN_vkGetPhysicalDeviceFeatures get_features;
+    PFN_vkGetPhysicalDeviceProperties get_props;
+    PFN_vkGetPhysicalDeviceFormatProperties get_fmt;
+    VkInstanceCreateInfo ci = {0};
+    VkApplicationInfo app = {0};
+    VkExtensionProperties exts[128];
+    const char *enabled[1];
+    VkPhysicalDevice gpus[8];
+    VkInstance inst;
+    uint32_t n_ext = 128, n_gpu = 8, i, f;
+    VkResult res;
+    static const struct { VkFormat fmt; const char *name; } fmts[] =
+    {
+        { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "BC1" }, { VK_FORMAT_BC3_UNORM_BLOCK, "BC3" },
+        { VK_FORMAT_BC5_UNORM_BLOCK, "BC5" }, { VK_FORMAT_BC6H_UFLOAT_BLOCK, "BC6H" },
+        { VK_FORMAT_BC7_UNORM_BLOCK, "BC7" },
+        { VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, "ETC2" }, { VK_FORMAT_ASTC_4x4_UNORM_BLOCK, "ASTC4x4" },
+    };
+
+    if (done) return;
+    done = 1;
+    {
+        const char *v = getenv( "MADEIRA_VK_BC_PROBE" );
+        if (v && v[0] == '0') return;
+    }
+    if (!(gipa = (PFN_vkGetInstanceProcAddr)ios_vulkan_sym( handle, "vkGetInstanceProcAddr" ))) return;
+    create_instance = (PFN_vkCreateInstance)gipa( NULL, "vkCreateInstance" );
+    enum_ext = (PFN_vkEnumerateInstanceExtensionProperties)gipa( NULL, "vkEnumerateInstanceExtensionProperties" );
+    if (!create_instance || !enum_ext) return;
+
+    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.apiVersion = VK_API_VERSION_1_1;
+    ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ci.pApplicationInfo = &app;
+    if (enum_ext( NULL, &n_ext, exts ) >= 0)
+        for (i = 0; i < n_ext; i++)
+            if (!strcmp( exts[i].extensionName, "VK_KHR_portability_enumeration" ))
+            {
+                enabled[0] = "VK_KHR_portability_enumeration";
+                ci.enabledExtensionCount = 1;
+                ci.ppEnabledExtensionNames = enabled;
+                ci.flags = 0x1; /* VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR */
+                break;
+            }
+    if ((res = create_instance( &ci, NULL, &inst )) < 0)
+    {
+        dprintf( 2, "[vk-bc-probe] vkCreateInstance failed (%d)\n", (int)res );
+        return;
+    }
+    destroy_instance = (PFN_vkDestroyInstance)gipa( inst, "vkDestroyInstance" );
+    enum_gpu = (PFN_vkEnumeratePhysicalDevices)gipa( inst, "vkEnumeratePhysicalDevices" );
+    get_features = (PFN_vkGetPhysicalDeviceFeatures)gipa( inst, "vkGetPhysicalDeviceFeatures" );
+    get_props = (PFN_vkGetPhysicalDeviceProperties)gipa( inst, "vkGetPhysicalDeviceProperties" );
+    get_fmt = (PFN_vkGetPhysicalDeviceFormatProperties)gipa( inst, "vkGetPhysicalDeviceFormatProperties" );
+    if (enum_gpu && get_features && get_props && get_fmt && enum_gpu( inst, &n_gpu, gpus ) >= 0)
+    {
+        for (i = 0; i < n_gpu; i++)
+        {
+            VkPhysicalDeviceFeatures feat;
+            VkPhysicalDeviceProperties props;
+            char line[256];
+            int len;
+
+            get_features( gpus[i], &feat );
+            get_props( gpus[i], &props );
+            len = snprintf( line, sizeof(line), "[vk-bc-probe] gpu #%u \"%s\" api=%u.%u.%u textureCompressionBC=%u formats(sampled):",
+                            i, props.deviceName, (unsigned)VK_API_VERSION_MAJOR( props.apiVersion ),
+                            (unsigned)VK_API_VERSION_MINOR( props.apiVersion ),
+                            (unsigned)VK_API_VERSION_PATCH( props.apiVersion ), (unsigned)feat.textureCompressionBC );
+            for (f = 0; f < sizeof(fmts) / sizeof(fmts[0]) && len > 0 && len < (int)sizeof(line) - 16; f++)
+            {
+                VkFormatProperties fp;
+                get_fmt( gpus[i], fmts[f].fmt, &fp );
+                len += snprintf( line + len, sizeof(line) - len, " %s=%u", fmts[f].name,
+                                 !!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) );
+            }
+            dprintf( 2, "%s\n", line );
+        }
+    }
+    if (destroy_instance) destroy_instance( inst, NULL );
+}
+
 static void *madeira_vulkan_dlopen( const char *name, int flags )
 {
     const char *path = getenv( "MADEIRA_VULKAN_LIBRARY" );
@@ -115,7 +212,10 @@ static void *madeira_vulkan_dlopen( const char *name, int flags )
     if (!(handle = ios_vulkan_open( path, flags )))
         dprintf( 2, "[winios-vk] cannot load %s: %s\n", path, dlerror() );
     else
+    {
         dprintf( 2, "[winios-vk] Vulkan library %s loaded\n", path );
+        madeira_vk_bc_probe( handle );
+    }
     return handle;
 }
 

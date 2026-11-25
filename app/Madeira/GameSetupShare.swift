@@ -64,6 +64,7 @@ struct GameSetup {
         "folderBytes", "metadataChecked", "metadataRevision", "desktop", "steamAppID",
         "steamMetadataInstall", "gogProductID", "itchGameID", "epicAppName", "eaOfferID",
         "config", "avx", "reportNVIDIA", "controlLayout", "workingDirectory", "liveLogs",
+        "loadedDirectX",   // (dx-pill) what this device's last run loaded
     ]
     /// Fields that only mean something for the same Steam game: its chosen program.
     static let sameGameKeys: Set<String> = [
@@ -73,6 +74,7 @@ struct GameSetup {
     static let controlKeys: Set<String> = [
         "touchControls", "controls", "zones", "controlOpacity", "controlSize", "controllerMode",
         "controllerBinds", "padMouseVertical", "padAssist",
+        "mouseSpeed", "stickMouseSpeed", "mouseInvertY", "mouseSwapButtons",
     ]
 
     /// An entry's fields for a setup: everything but localKeys.

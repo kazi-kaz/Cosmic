@@ -151,6 +151,9 @@ final class JITCoordinator: ObservableObject {
         /// The device closed the connection, usually because it no longer accepts this
         /// pairing (every new pairing replaces the last).
         case pairing
+        /// LocalDevVPN is on and lockdownd answers, but the device does not answer on the JIT port
+        /// (env.MADEIRA_JIT_PORT_PROBE = 0 never reports this).
+        case device
 
         init?(helperMessage: String) {
             let text = helperMessage.lowercased()
@@ -171,6 +174,8 @@ final class JITCoordinator: ObservableObject {
                 return L("Madeira couldn't reach this device. Connect LocalDevVPN, then try again.")
             case .pairing:
                 return "This device closed the connection, which usually means it no longer accepts Madeira's pairing. Pair again, and check that LocalDevVPN is connected."
+            case .device:
+                return L("LocalDevVPN is on, but this device isn't answering for JIT. Turn LocalDevVPN off and on, use Wi-Fi instead of cellular, or pair again in Settings › JIT.")
             }
         }
     }
@@ -183,6 +188,8 @@ final class JITCoordinator: ObservableObject {
     /// lockdownd is a LocalDevVPN problem whatever the helper's message says: a network
     /// that accepts any connection makes the helper's read end early ("early eof").
     private var loopbackAnswered: Bool?
+    /// The port the JIT helper connects to on the device (the helper's "Timed out connecting to 10.7.0.1:49152").
+    private static let jitPort: UInt16 = 49152
     @Published var showSetup = false
     @Published private(set) var busy = false
     @Published private(set) var status: String?
@@ -469,7 +476,20 @@ final class JITCoordinator: ObservableObject {
     /// The helper's failure as shown: a connection problem gets its plain explanation
     /// (the helper's own message is already in the log).
     private func helperFailure(_ message: String) -> String {
-        connectionProblem = ConnectionProblem(helperMessage: message) ?? (loopbackAnswered == false ? .vpn : nil)
+        var problem = ConnectionProblem(helperMessage: message) ?? (loopbackAnswered == false ? .vpn : nil)
+        // (jit-port-probe) The helper timed out or was refused, yet LocalDevVPN is up and lockdownd answers (checked
+        // again now: the last loopback result may be old): "Connect LocalDevVPN" is never the right advice. Ask the JIT
+        // port itself (0.4 s, only here on a failure): no answer means the device is not answering for JIT; an answer
+        // means a one-off, and the helper's own words are shown.
+        if problem == .vpn, loopbackAnswered != false, MadeiraConfig.flag("MADEIRA_JIT_PORT_PROBE"), LoopbackProbe.vpnInterfaceUp,
+           LoopbackProbe.check(timeout: 0.4).reachable {
+            let probe = LoopbackProbe.check(timeout: 0.4, port: Self.jitPort)
+            LogStore.shared.log(String(format: "[jit-port-probe] port %d: %@ in %.0f ms (%@); helper said: %@",
+                                       Int(Self.jitPort), probe.reachable ? "answers" : "no answer", probe.milliseconds,
+                                       probe.detail, message))
+            problem = probe.reachable ? nil : .device
+        }
+        connectionProblem = problem
         return connectionProblem?.message ?? message
     }
 
@@ -515,7 +535,7 @@ enum LocalDevVPN {
                                      retry: (() -> Void)? = nil,
                                      then dismiss: @escaping () -> Void = {}) -> some View {
     Group {
-        if problem == .pairing {
+        if problem == .pairing || problem == .device {
             Button(OnDevicePairing.isSupported ? L("Pair Again") : L("Open JIT Setup")) {
                 dismiss()
                 if OnDevicePairing.isSupported { OnDevicePairing.shared.start() }
@@ -528,23 +548,101 @@ enum LocalDevVPN {
                 if let retry { retry() } else { JITCoordinator.shared.connectWithShortcut() }
             }
         } else {
-            Button(LocalDevVPN.actionTitle) { dismiss(); LocalDevVPN.open() }
+            Button(problem == .device ? L("Open LocalDevVPN") : LocalDevVPN.actionTitle) { dismiss(); LocalDevVPN.open() }
         }
+    }
+}
+
+/// Why Enable JIT failed, for the Settings › JIT row and the top banner (env.MADEIRA_JIT_ERROR_ROW).
+struct JITFailure: Equatable {
+    let message: String
+    /// One line saying what to do, when the failure has a known fix.
+    let fix: String?
+    let problem: JITCoordinator.ConnectionProblem?
+
+    /// The line shown under "Couldn't start": the known fix, else the error's own words.
+    var line: String {
+        if let fix { return L(fix) }
+        switch problem {
+        case .vpn: return L("Connect LocalDevVPN, then try again.")
+        case .pairing: return L("Pair this device again, and check that LocalDevVPN is connected.")
+        case .device: return L("Turn LocalDevVPN off and on, use Wi-Fi instead of cellular, or pair again.")
+        case nil: return message
+        }
+    }
+}
+
+/// The row at the top of Settings › JIT while the last Enable JIT failed.
+struct JITFailureRow: View {
+    let failure: JITFailure
+    @ObservedObject private var model = LibraryModel.shared
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Couldn't start", systemImage: "exclamationmark.triangle.fill")
+                .font(.headline).foregroundStyle(.red)
+            Text(failure.line).font(.subheadline).foregroundStyle(.secondary)
+            // Each button is its own tap target: a plain-style button in a Form row would
+            // otherwise fire every button in the row at once.
+            Group {
+                if let problem = failure.problem {
+                    jitConnectionActions(problem, retry: model.retryJIT) { model.jitFailure = nil }
+                }
+                Button("Try Again") { model.retryJIT?() }
+            }
+            .buttonStyle(.borderless).frame(minHeight: 44, alignment: .leading)
+        }
+        .accessibilityElement(children: .contain)
+    }
+}
+
+/// The fallback while Settings › JIT is not on screen: a banner at the top with the one line and Try Again.
+struct JITFailureBanner: View {
+    let failure: JITFailure
+    @ObservedObject private var model = LibraryModel.shared
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Couldn't start JIT").font(.subheadline.weight(.semibold))
+                Text(failure.line).font(.footnote).foregroundStyle(.secondary)
+                HStack(spacing: 16) {
+                    Button("Try Again") { model.retryJIT?() }
+                    if let problem = failure.problem {
+                        jitConnectionActions(problem, retry: model.retryJIT) { model.jitFailure = nil }
+                    }
+                }
+                .font(.subheadline.weight(.semibold)).frame(minHeight: 44, alignment: .leading)
+            }
+            Spacer(minLength: 0)
+            Button { model.jitFailure = nil } label: {
+                Image(systemName: "xmark").font(.footnote.weight(.semibold)).frame(width: 44, height: 44)
+            }
+            .accessibilityLabel(L("Dismiss"))
+        }
+        .padding(.leading, 14).padding(.vertical, 6)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .padding(.horizontal, 12).padding(.top, 6)
+        .transition(.move(edge: .top).combined(with: .opacity))
+        .accessibilityElement(children: .contain)
     }
 }
 
 struct JITSettingsSection: View {
     @ObservedObject private var coordinator = JITCoordinator.shared
+    @ObservedObject private var library = LibraryModel.shared
     @ObservedObject private var onboarding = OnboardingModel.shared
     @ObservedObject private var shortcut = JITNetworkShortcut.shared
 
     var body: some View {
         Section {
+            if let failure = library.jitFailure { JITFailureRow(failure: failure) }
             Picker("JIT method", selection: $coordinator.method) {
                 ForEach(JITMethod.allCases) { method in
                     Text(method.title).tag(method)
                 }
             }
+            .onAppear { library.jitRowVisible = true }
+            .onDisappear { library.jitRowVisible = false }
             Button {
                 coordinator.showSetup = true
             } label: {

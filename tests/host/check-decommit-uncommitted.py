@@ -83,6 +83,15 @@ static char *region;
 static size_t host;                   /* host page: 16 KB, or the real page size if larger */
 static BYTE vprot[NPAGES];
 
+/* [decommit-zero-prot] stand-ins: the host page is `host`; every page counts as writable here,
+ * so the unlock path is not taken and the zeroing is checked as before. */
+#define host_page_size host
+#define host_page_mask (host - 1)
+static int ios_decommit_zero_prot_on( void ) { return 1; }
+static int ios_range_writable( const void *addr, size_t size ) { (void)addr; (void)size; return 1; }
+static void mprotect_range( void *base, size_t size, BYTE set, BYTE clear ) { (void)base; (void)size; (void)set; (void)clear; }
+static BYTE get_host_page_vprot( const void *addr ) { (void)addr; return 0; }
+
 static BYTE get_page_vprot( const void *addr )
 {
     const char *p = addr;

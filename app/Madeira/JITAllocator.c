@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <mach-o/dyld.h>
+#include <crt_externs.h>
 #include <os/log.h>
 #include <os/proc.h>
 
@@ -912,6 +913,10 @@ unsigned long madeira_early_window_base, madeira_early_window_size;
 unsigned long madeira_early_pool_base, madeira_early_pool_size;
 unsigned long madeira_early_intruder_base, madeira_early_intruder_size;   /* ml1135 */
 unsigned madeira_early_intruder_tag, madeira_early_intruder_prot;
+/* [win-occupants] up to 6 mappings inside [0x140000000,+480MB) seen at image load when the
+ * window claim failed (FF Resonance, PEAK: a 4 MB tag-2 malloc region). Log-only. */
+struct madeira_win_occ madeira_early_win_occ[6];
+int madeira_early_win_occ_n;
 
 /* Read-only views of the above, for callers that cannot take a mutable global.
  * The values are written once by the constructor below, before main runs, and
@@ -936,6 +941,18 @@ __attribute__((constructor(101), used)) static void madeira_early_va_claim(void)
     if (vm_allocate(mach_task_self(), &a, winsz, VM_FLAGS_FIXED) == KERN_SUCCESS && a == win) {
         vm_protect(mach_task_self(), a, winsz, 0, VM_PROT_NONE);
         madeira_early_window_base = win; madeira_early_window_size = winsz;
+    } else {
+        /* [win-occupants] record what already sits in the window (read-only, no allocation). */
+        vm_address_t ra = win;
+        while (madeira_early_win_occ_n < 6) {
+            vm_size_t rs = 0; natural_t depth = 0;
+            vm_region_submap_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+            if (vm_region_recurse_64(mach_task_self(), &ra, &rs, &depth, (vm_region_recurse_info_t)&info, &cnt) != KERN_SUCCESS) break;
+            if (ra >= win + (480ul << 20)) break;
+            struct madeira_win_occ *o = &madeira_early_win_occ[madeira_early_win_occ_n++];
+            o->base = ra; o->size = rs; o->tag = info.user_tag; o->prot = (unsigned)info.protection;
+            ra += rs;
+        }
     }
     /* Largest no-overwrite run starting at the window's end, 16MB granularity. */
     for (sz = 1024ul << 20; sz >= (256ul << 20); sz -= (16ul << 20)) {
@@ -967,6 +984,39 @@ __attribute__((constructor(101), used)) static void madeira_early_va_claim(void)
             madeira_early_intruder_tag = info.user_tag; madeira_early_intruder_prot = (unsigned)info.protection;
         }
     }
+    /* [early-pool] when the run directly above the window is shorter than 256MB because a
+     * mapping was already there before this constructor (Sentry 8A, iOS 27: a VM tag 1 malloc
+     * region at 0x14bd00000, the pool SHRINKING from 1152MB to 592MB), hold the largest run ABOVE
+     * that mapping instead of none: StikJITHelper releases the placeholder before the debugger's
+     * first-fit RX request and plugs the lower holes, so the pool lands there. Below 0x190000000,
+     * like the intruder scan; up to 1152MB (the default pool), 16MB steps, at most 8 regions
+     * skipped. Nothing changes when the run above the window was obtained.
+     * Off: madeira.cfg early-pool-above = 0. */
+    if (!madeira_early_pool_size && madeira_cfg_bool("early-pool-above", 1)) {
+        vm_address_t probe = win + winsz;
+        int hop;
+        for (hop = 0; hop < 8 && !madeira_early_pool_size; hop++) {
+            vm_address_t ra = probe, start;
+            vm_size_t rs = 0;
+            natural_t depth = 0;
+            vm_region_submap_info_data_64_t info;
+            mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+            if (vm_region_recurse_64(mach_task_self(), &ra, &rs, &depth, (vm_region_recurse_info_t)&info, &cnt) != KERN_SUCCESS)
+                break;
+            start = (ra + rs + (16ul << 20) - 1) & ~(vm_address_t)((16ul << 20) - 1);
+            if (start >= 0x190000000ul) break;
+            for (sz = 1152ul << 20; sz >= (256ul << 20); sz -= (16ul << 20)) {
+                if (start + sz > 0x190000000ul) continue;
+                a = start;
+                if (vm_allocate(mach_task_self(), &a, sz, VM_FLAGS_FIXED) == KERN_SUCCESS && a == start) {
+                    vm_protect(mach_task_self(), a, sz, 0, VM_PROT_NONE);
+                    madeira_early_pool_base = a; madeira_early_pool_size = sz;
+                    break;
+                }
+            }
+            probe = start;
+        }
+    }
 }
 
 /* ml1249: METAL API VALIDATION ON DEMAND.
@@ -985,4 +1035,188 @@ __attribute__((constructor(102), used)) static void madeira_metal_validation_opt
     setenv("MTL_DEBUG_LAYER_ERROR_MODE", "nslog", 1);
     setenv("MTL_DEBUG_LAYER_WARNING_MODE", "nslog", 1);
     setenv("CFLOG_FORCE_STDERR", "1", 1);
+}
+
+/* [main-stack-move] OFF unless madeira.cfg says `main-stack-move = 1`.
+ *
+ * A fixed-base program bigger than ~730 MB (Civilization VII: 896 MB at 0x140000000) needs
+ * [0x140000000, 0x178000000) free, but the app's main thread stack (VM tag 30, 0x16c..0x16f
+ * 000 000 on every log) sits inside it, so "[exe-window] could NOT widen the window to 896MB
+ * (kr=3)" and the loader answers c0000018. The stack cannot be unmapped under a running
+ * thread, so main() calls madeira_run_on_new_stack() first thing: it copies argv/environ out of
+ * the old stack, switches this thread to an 8 MB stack placed BELOW the executable window
+ * ([0x119000000,0x140000000) is app-owned low gap), then frees the old stack mapping (guard +
+ * stack + the kernel's argv/env/apple strings above it). It never returns when it works.
+ * If anything fails before the switch it returns 0 and the caller runs on the old stack as
+ * before; madeira_stack_move_note() says what happened (the app logs it as [main-stack-move]).
+ *
+ * Known risk (why it is opt-in): dyld keeps pointers into the apple[] strings
+ * (executable_path etc.) and cannot be re-pointed; after the move those read freed memory
+ * only if something asks dyld for them late (no crash seen on host, device untested). */
+#define MSM_STACK_SIZE   (8ul << 20)
+#define MSM_GUARD_SIZE   (16ul << 10)
+static char madeira_msm_note[200] = "off";
+static void (*madeira_msm_fn)(void);
+static vm_address_t madeira_msm_old_lo, madeira_msm_old_hi;
+
+const char *madeira_stack_move_note(void) { return madeira_msm_note; }
+
+/* [main-stack-move] crash guard. A marker file, Documents/main-stack-move.trying, is written just
+ * before the stack switch and removed by madeira_stack_move_survived() once the app has been open a
+ * few seconds. If the marker is still there at the next start, the last start with the move died
+ * (decast25, iPhone19,4, Nov 15: black screen, app closed, every start), so the move is skipped and
+ * the app opens as before. Taking `main-stack-move` out of madeira.cfg removes the marker too, so
+ * adding it back later tries once more. env.MADEIRA_MSM_CRASH_GUARD = 0 turns the guard off. */
+static int madeira_msm_marker_path(char *out, size_t cap)
+{
+    if (!madeira_cfg__dir(out, cap - 32)) return 0;
+    strcat(out, "/main-stack-move.trying");
+    return 1;
+}
+
+static int madeira_msm_guard_on(void)
+{
+    const char *k = getenv("MADEIRA_MSM_CRASH_GUARD");
+    return !(k && (!strcmp(k, "0") || !strcmp(k, "off") || !strcmp(k, "no")));
+}
+
+int madeira_main_stack_move_wanted(void)
+{
+    char marker[1024];
+    int have = madeira_msm_marker_path(marker, sizeof marker);
+    if (!madeira_cfg_bool("main-stack-move", 0)) {
+        if (have) unlink(marker);
+        return 0;
+    }
+    if (have && madeira_msm_guard_on() && access(marker, F_OK) == 0) {
+        snprintf(madeira_msm_note, sizeof(madeira_msm_note),
+                 "skipped (crash guard): the last start with main-stack-move = 1 never finished opening; "
+                 "remove the line from madeira.cfg and add it again to retry");
+        return 0;
+    }
+    return 1;
+}
+
+void madeira_stack_move_survived(void)
+{
+    char marker[1024];
+    if (madeira_msm_marker_path(marker, sizeof marker)) unlink(marker);
+}
+
+static char **madeira_msm_dup_vec(char **v)
+{
+    size_t n = 0, i;
+    char **out;
+    while (v && v[n]) n++;
+    out = (char **)malloc((n + 1) * sizeof(char *));
+    if (!out) return v;
+    for (i = 0; i < n; i++) { out[i] = strdup(v[i]); if (!out[i]) out[i] = v[i]; }
+    out[n] = NULL;
+    return out;
+}
+
+__attribute__((noreturn, noinline)) static void madeira_msm_after_switch(void)
+{
+    /* On the NEW stack. Free the old stack run [lo,hi) (guard page, stack, strings). */
+    kern_return_t kr = vm_deallocate(mach_task_self(), madeira_msm_old_lo, madeira_msm_old_hi - madeira_msm_old_lo);
+    snprintf(madeira_msm_note, sizeof(madeira_msm_note),
+             "moved: old stack 0x%lx-0x%lx %s (kr=%d)", (unsigned long)madeira_msm_old_lo,
+             (unsigned long)madeira_msm_old_hi, kr == KERN_SUCCESS ? "freed" : "NOT freed", (int)kr);
+    madeira_msm_fn();
+    exit(0);   /* fn (UIApplicationMain) does not return */
+}
+
+int madeira_run_on_new_stack(void (*fn)(void))
+{
+    vm_address_t sp_here = (vm_address_t)__builtin_frame_address(0);
+    vm_address_t lo, hi, base, top;
+    vm_size_t sz = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+    vm_address_t a;
+    int tries;
+
+    /* 1. The old stack run: the region holding SP, the guard page below it, and every
+     * contiguous VM tag 30 region above it (the kernel puts argv/env/apple at the top). */
+    a = sp_here;
+    if (vm_region_recurse_64(mach_task_self(), &a, &sz, &depth, (vm_region_recurse_info_t)&info, &cnt) != KERN_SUCCESS
+        || a > sp_here || info.user_tag != 30) {
+        snprintf(madeira_msm_note, sizeof(madeira_msm_note), "skipped: SP 0x%lx is not in a VM tag 30 region", (unsigned long)sp_here);
+        return 0;
+    }
+    lo = a; hi = a + sz;
+    for (tries = 0; tries < 8; tries++) {           /* guard page(s) directly below, tag 30 too */
+        vm_address_t g = lo - 1; vm_size_t gs = 0; natural_t d = 0; mach_msg_type_number_t c = VM_REGION_SUBMAP_INFO_COUNT_64;
+        vm_region_submap_info_data_64_t gi;
+        if (vm_region_recurse_64(mach_task_self(), &g, &gs, &d, (vm_region_recurse_info_t)&gi, &c) != KERN_SUCCESS) break;
+        if (g + gs != lo || gi.user_tag != 30) break;
+        lo = g;
+    }
+    for (tries = 0; tries < 8; tries++) {           /* tag 30 regions directly above */
+        vm_address_t g = hi; vm_size_t gs = 0; natural_t d = 0; mach_msg_type_number_t c = VM_REGION_SUBMAP_INFO_COUNT_64;
+        vm_region_submap_info_data_64_t gi;
+        if (vm_region_recurse_64(mach_task_self(), &g, &gs, &d, (vm_region_recurse_info_t)&gi, &c) != KERN_SUCCESS) break;
+        if (g != hi || gi.user_tag != 30) break;
+        hi = g + gs;
+    }
+    if (hi - lo > (64ul << 20)) {
+        snprintf(madeira_msm_note, sizeof(madeira_msm_note), "skipped: stack run 0x%lx-0x%lx is implausibly large", (unsigned long)lo, (unsigned long)hi);
+        return 0;
+    }
+    /* Only worth doing when it actually sits in the executable window's way. */
+    if (!(hi > 0x148000000ul && lo < 0x180000000ul)) {
+        snprintf(madeira_msm_note, sizeof(madeira_msm_note), "skipped: stack 0x%lx-0x%lx is not in [0x148000000,0x180000000)", (unsigned long)lo, (unsigned long)hi);
+        return 0;
+    }
+
+    /* 2. The new stack, fixed BELOW the executable window, top-down from 0x13f000000. */
+    base = 0;
+    for (tries = 0; tries < 16 && !base; tries++) {
+        vm_address_t want = 0x13f000000ul - (vm_address_t)(tries + 1) * (MSM_STACK_SIZE + MSM_GUARD_SIZE);
+        a = want;
+        if (vm_allocate(mach_task_self(), &a, MSM_STACK_SIZE + MSM_GUARD_SIZE, VM_FLAGS_FIXED) == KERN_SUCCESS) {
+            if (a == want) base = a; else vm_deallocate(mach_task_self(), a, MSM_STACK_SIZE + MSM_GUARD_SIZE);
+        }
+    }
+    if (!base) {
+        snprintf(madeira_msm_note, sizeof(madeira_msm_note), "skipped: no free room for an 8MB stack below 0x140000000");
+        return 0;
+    }
+    vm_protect(mach_task_self(), base, MSM_GUARD_SIZE, 0, VM_PROT_NONE);   /* guard at the bottom */
+    top = (base + MSM_GUARD_SIZE + MSM_STACK_SIZE) & ~(vm_address_t)15;
+
+    /* 3. Copy everything the old stack's top holds that C code reads: environ, argv, progname. */
+    {
+        char ***pe = _NSGetEnviron();
+        char ***pv = _NSGetArgv();
+        *pe = madeira_msm_dup_vec(*pe);
+        *pv = madeira_msm_dup_vec(*pv);
+        if (*pv && (*pv)[0]) setprogname((*pv)[0]);
+    }
+
+    /* Crash guard: from here on a failure kills the app, so leave the marker first. */
+    {
+        char marker[1024];
+        if (madeira_msm_marker_path(marker, sizeof marker)) {
+            int fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) { (void)write(fd, "1\n", 2); fsync(fd); close(fd); }
+        }
+    }
+
+    madeira_msm_fn = fn;
+    madeira_msm_old_lo = lo;
+    madeira_msm_old_hi = hi;
+
+    /* 4. Switch this thread's SP and continue on the new stack; never returns here. */
+    __asm__ volatile(
+        "mov sp, %0\n"
+        "mov x29, xzr\n"
+        "mov x30, xzr\n"
+        "blr %1\n"
+        "brk #1\n"
+        :
+        : "r"(top), "r"(madeira_msm_after_switch)
+        : "memory");
+    __builtin_unreachable();
 }

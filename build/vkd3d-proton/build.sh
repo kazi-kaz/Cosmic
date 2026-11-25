@@ -29,7 +29,7 @@ set -euo pipefail
 
 BUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$BUILD_DIR/../.." && pwd)"
-VKD3D_COMMIT=750061ae2be846d19d6364628eaf5ea4beb8e619
+VKD3D_COMMIT=4522cc1a8b1347f1ab1b0f7b14a23ed9444d95d1   # v3.1 (what ships); the CONSERVATIVE_SSBO_VECTORIZATION string in d3d12core.dll is the build guard marker
 VKD3D_URL=https://github.com/HansKristian-Work/vkd3d-proton.git
 VKD3D_SRC="${VKD3D_SRC:-$REPO_ROOT/toolchains/vkd3d-proton}"
 VKD3D_WORK="${VKD3D_WORK:-$REPO_ROOT/toolchains/vkd3d-proton-build}"

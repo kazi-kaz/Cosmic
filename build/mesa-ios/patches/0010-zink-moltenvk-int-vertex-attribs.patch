@@ -1,0 +1,164 @@
+diff --git a/src/gallium/drivers/zink/zink_compiler.c b/src/gallium/drivers/zink/zink_compiler.c
+index aeb001f..9005472 100644
+--- a/src/gallium/drivers/zink/zink_compiler.c
++++ b/src/gallium/drivers/zink/zink_compiler.c
+@@ -6564,6 +6564,27 @@ zink_shader_init(struct zink_screen *screen, struct zink_shader *zs)
+    optimize_nir(nir, NULL, true);
+    prune_io(nir);
+ 
++   /* Madeira: remember which vertex inputs the shader reads as integers, so
++    * the pipeline can give Metal an integer vertex format for them
++    * (zink_pipeline.c, MADEIRA_ZINK_INT_ATTRIBS).
++    */
++   if (nir->info.stage == MESA_SHADER_VERTEX) {
++      nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
++         const struct glsl_type *type = glsl_without_array_or_matrix(var->type);
++         const enum glsl_base_type base = glsl_get_base_type(type);
++         const bool is_int = base == GLSL_TYPE_INT || base == GLSL_TYPE_INT16 || base == GLSL_TYPE_INT8;
++         const bool is_uint = base == GLSL_TYPE_UINT || base == GLSL_TYPE_UINT16 || base == GLSL_TYPE_UINT8;
++         if ((!is_int && !is_uint) || var->data.driver_location >= 32)
++            continue;
++         const unsigned slots = MAX2(glsl_count_attribute_slots(var->type, true), 1);
++         const uint32_t bits = BITFIELD_RANGE(var->data.driver_location, MIN2(slots, 32 - var->data.driver_location));
++         if (is_int)
++            zs->madeira_vs_int_inputs |= bits;
++         else
++            zs->madeira_vs_uint_inputs |= bits;
++      }
++   }
++
+    if (nir->info.stage == MESA_SHADER_KERNEL) {
+       NIR_PASS_V(nir, type_images);
+    }
+diff --git a/src/gallium/drivers/zink/zink_pipeline.c b/src/gallium/drivers/zink/zink_pipeline.c
+index a5f151f..324874a 100644
+--- a/src/gallium/drivers/zink/zink_pipeline.c
++++ b/src/gallium/drivers/zink/zink_pipeline.c
+@@ -35,6 +35,96 @@
+ 
+ #include "util/u_debug.h"
+ #include "util/u_prim.h"
++#include "util/log.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++/* Madeira: Metal refuses a pipeline whose vertex shader reads an integer input
++ * from a float, normalized or scaled vertex format ("Cannot convert attribute
++ * from MTLAttributeFormatFloat to int1 or uint1", Vintage Story through
++ * MoltenVK), and Zink then skips every draw that uses it. GL leaves the value
++ * undefined and desktop drivers read the data anyway. Such an attribute gets
++ * the integer format with the same channels and channel size: normalized and
++ * scaled formats keep their own signedness and give the stored integers;
++ * float formats take the shader's signedness and give their bits.
++ *
++ * MADEIRA_ZINK_INT_ATTRIBS=0 turns this off; =1 also turns it on for drivers
++ * other than MoltenVK.
++ */
++static VkFormat
++madeira_int_vertex_format(VkFormat format, bool is_signed)
++{
++#define MADEIRA_INT_FMT(f, s, u) case f: return is_signed ? s : u;
++#define MADEIRA_INT_FMTS(prefix, s, u) \
++   case VK_FORMAT_##prefix##_UNORM: case VK_FORMAT_##prefix##_USCALED: return u; \
++   case VK_FORMAT_##prefix##_SNORM: case VK_FORMAT_##prefix##_SSCALED: return s;
++   switch (format) {
++   MADEIRA_INT_FMTS(R8, VK_FORMAT_R8_SINT, VK_FORMAT_R8_UINT)
++   MADEIRA_INT_FMTS(R8G8, VK_FORMAT_R8G8_SINT, VK_FORMAT_R8G8_UINT)
++   MADEIRA_INT_FMTS(R8G8B8, VK_FORMAT_R8G8B8_SINT, VK_FORMAT_R8G8B8_UINT)
++   MADEIRA_INT_FMTS(R8G8B8A8, VK_FORMAT_R8G8B8A8_SINT, VK_FORMAT_R8G8B8A8_UINT)
++   MADEIRA_INT_FMTS(R16, VK_FORMAT_R16_SINT, VK_FORMAT_R16_UINT)
++   MADEIRA_INT_FMTS(R16G16, VK_FORMAT_R16G16_SINT, VK_FORMAT_R16G16_UINT)
++   MADEIRA_INT_FMTS(R16G16B16, VK_FORMAT_R16G16B16_SINT, VK_FORMAT_R16G16B16_UINT)
++   MADEIRA_INT_FMTS(R16G16B16A16, VK_FORMAT_R16G16B16A16_SINT, VK_FORMAT_R16G16B16A16_UINT)
++   MADEIRA_INT_FMT(VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16_SINT, VK_FORMAT_R16_UINT)
++   MADEIRA_INT_FMT(VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R16G16_SINT, VK_FORMAT_R16G16_UINT)
++   MADEIRA_INT_FMT(VK_FORMAT_R16G16B16_SFLOAT, VK_FORMAT_R16G16B16_SINT, VK_FORMAT_R16G16B16_UINT)
++   MADEIRA_INT_FMT(VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SINT, VK_FORMAT_R16G16B16A16_UINT)
++   MADEIRA_INT_FMT(VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SINT, VK_FORMAT_R32_UINT)
++   MADEIRA_INT_FMT(VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32_SINT, VK_FORMAT_R32G32_UINT)
++   MADEIRA_INT_FMT(VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32_SINT, VK_FORMAT_R32G32B32_UINT)
++   MADEIRA_INT_FMT(VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_SINT, VK_FORMAT_R32G32B32A32_UINT)
++   default:
++      return VK_FORMAT_UNDEFINED;
++   }
++#undef MADEIRA_INT_FMTS
++#undef MADEIRA_INT_FMT
++}
++
++/* the attribute list for the pipeline: 'state' itself, or 'out' with integer
++ * formats where the vertex shader reads an integer
++ */
++static const VkVertexInputAttributeDescription *
++madeira_int_vertex_attribs(struct zink_screen *screen, const struct zink_gfx_program *prog,
++                           const struct zink_vertex_elements_hw_state *state,
++                           VkVertexInputAttributeDescription *out)
++{
++   static int enabled = -1;
++   static unsigned logged;
++   if (enabled < 0) {
++      const char *env = getenv("MADEIRA_ZINK_INT_ATTRIBS");
++      enabled = env && *env ? strcmp(env, "0") != 0 :
++                screen->info.driver_props.driverID == VK_DRIVER_ID_MOLTENVK;
++   }
++   const struct zink_shader *vs = prog ? prog->shaders[MESA_SHADER_VERTEX] : NULL;
++   if (!enabled || !vs || !(vs->madeira_vs_int_inputs | vs->madeira_vs_uint_inputs))
++      return state->attribs;
++
++   bool changed = false;
++   for (unsigned i = 0; i < state->num_attribs && i < PIPE_MAX_ATTRIBS; i++) {
++      out[i] = state->attribs[i];
++      const unsigned loc = out[i].location;
++      if (loc >= 32)
++         continue;
++      const bool is_signed = vs->madeira_vs_int_inputs & BITFIELD_BIT(loc);
++      if (!is_signed && !(vs->madeira_vs_uint_inputs & BITFIELD_BIT(loc)))
++         continue;
++      const VkFormat format = madeira_int_vertex_format(out[i].format, is_signed);
++      if (format == VK_FORMAT_UNDEFINED)
++         continue;
++      if (logged < 8) {
++         logged++;
++         mesa_logw("[zink-madeira] vertex input %u: format %d read as integer format %d for an %s shader input "
++                   "(MADEIRA_ZINK_INT_ATTRIBS=0 turns this off)",
++                   loc, out[i].format, format, is_signed ? "int" : "uint");
++      }
++      out[i].format = format;
++      changed = true;
++   }
++   return changed ? out : state->attribs;
++}
+ 
+ VkPipeline
+ zink_create_gfx_pipeline(struct zink_screen *screen,
+@@ -47,13 +137,15 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
+ {
+    struct zink_rasterizer_hw_state *hw_rast_state = (void*)&state->dyn_state3;
+    VkPipelineVertexInputStateCreateInfo vertex_input_state;
++   VkVertexInputAttributeDescription madeira_attribs[PIPE_MAX_ATTRIBS];
+    bool needs_vi = !screen->info.have_EXT_vertex_input_dynamic_state;
+    if (needs_vi) {
+       memset(&vertex_input_state, 0, sizeof(vertex_input_state));
+       vertex_input_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+       vertex_input_state.pVertexBindingDescriptions = state->element_state->b.bindings;
+       vertex_input_state.vertexBindingDescriptionCount = state->element_state->num_bindings;
+-      vertex_input_state.pVertexAttributeDescriptions = state->element_state->attribs;
++      vertex_input_state.pVertexAttributeDescriptions =
++         madeira_int_vertex_attribs(screen, prog, state->element_state, madeira_attribs);
+       vertex_input_state.vertexAttributeDescriptionCount = state->element_state->num_attribs;
+       if (!screen->info.have_EXT_extended_dynamic_state || !state->uses_dynamic_stride) {
+          for (int i = 0; i < state->element_state->num_bindings; ++i) {
+diff --git a/src/gallium/drivers/zink/zink_types.h b/src/gallium/drivers/zink/zink_types.h
+index c34b9a2..c7ea521 100644
+--- a/src/gallium/drivers/zink/zink_types.h
++++ b/src/gallium/drivers/zink/zink_types.h
+@@ -800,6 +800,9 @@ struct zink_shader {
+    uint64_t arrayed_inputs; //mask of locations using arrayed io
+    uint64_t arrayed_outputs; //mask of locations using arrayed io
+    uint64_t flat_flags;
++   /* Madeira: vertex shader inputs (by Location) declared int / uint */
++   uint32_t madeira_vs_int_inputs;
++   uint32_t madeira_vs_uint_inputs;
+    bool bindless;
+    bool can_inline;
+    bool has_uniforms;

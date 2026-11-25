@@ -561,8 +561,13 @@ enum GameRecommendations {
     /// the session is the game's (ARM64EC), where that aarch64 program cannot run. In the
     /// desktop sechost starts it on demand, as for the launcher's own list (no services
     /// batch: it would write the Epic sign-in arguments to disk).
+    /// Version 11 (the old build line's device-tested Epic config, "v7", 2026-11-01..04): the Rockstar launcher's
+    /// Social Club browser (SocialClubHelper.exe) crashes in Wine's DXCore.dll on its GPU thread, which ended in
+    /// "Failed to initialize. Error code: 17"; turning dxcore off makes Chromium fall back to DXGI. The launcher
+    /// installer's 32-bit VC++ setup (Redistributables\VCRed\vc_redist.x86.exe) crashed the session, so it is not
+    /// started, and the Social Club and launcher processes get small argument rings, as in the launcher's own list.
     static let gta5EnhancedOther = GameRecommendation(
-        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 10,
+        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 11,
         config: """
         # Madeira's recommended settings for GTA V Enhanced outside Steam (Rockstar Games Launcher or another store).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -591,15 +596,16 @@ enum GameRecommendations {
         env.MADEIRA_POOL_LOW_IMAGES = 1
         env.MADEIRA_POOL_RECYCLE_IMAGES = 1
         env.MADEIRA_SC_PA_POOLS = 2
-        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;VCRed\\vc_redist;.be\\vc_redist
         env.MADEIRA_TOUCH_MOUSE = 1
         env.MADEIRA_WOW_MIN_FREE_GB = 2
         env.MADEIRA_X64_GRAPHICS_ENTRY = 1
         env.MADEIRA_X64_IMAGE_NOCOPY = 1
-        env.WINEDLLOVERRIDES = video64=
+        env.WINEDLLOVERRIDES = dxcore=;video64=
         env.MADEIRA_DEVICE_STATS = 1
         env.MADEIRA_PAD_MODE = hid
         env.MADEIRA_METAL_HUD_MAIN = 1
+        env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
         env.SteamDeck = 1
         env.MADEIRA_EC_HOOK_TRACE = 0
         # The defaults this list was tested with (upstream's differ).
@@ -1088,6 +1094,22 @@ enum GameRecommendations {
         """,
         avx: true, nvidia: false, wineVCRT: false, display: "fit")
 
+    /// Unity's menu needs gradual underflow for Mathf.Approximately. On hosts
+    /// with AFP, opt in so FEX can keep x86 FTZ and DAZ independent.
+    /// The 64-bit media parser supplies ARGB32 frames. Keep video samples
+    /// CPU-backed so Unity does not expect a D3D11 decoder transform.
+    static let aviciiInvector = GameRecommendation(
+        id: "avicii-invector", title: "AVICII Invector", version: 1,
+        config: """
+        # Madeira's recommended settings for AVICII Invector.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.FEX_HOSTFEATURES = enableafp
+        env.MADEIRA_WG_64BIT = 1
+        env.MADEIRA_WG_VIDEO_FORMAT = argb32
+        env.MADEIRA_D3D11_NO_VIDEO_DEVICE = 1
+        """)
+
     /// Every other game, and the Desktop (owner's decisions, 2026-10-12): most games
     /// the owner tried outside these lists closed at start until the [ec-hook]
     /// reporter was off. It reads code a game's protection rewrites at run time
@@ -1104,6 +1126,85 @@ enum GameRecommendations {
         # Madeira's recommended settings for a game without a list of its own.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
         env.MADEIRA_EC_HOOK_TRACE = 0
+        """)
+
+    // MARK: Engine presets (engine-auto-presets)
+
+    /// [engine-presets] An engine a game's own folder shows (by files only; nothing is run). Used for a game
+    /// with no list of its own and nothing written for it yet (GameRecommendationsApply.enginePreset), never
+    /// for a game that has a list, a config or a mark already.
+    enum Engine: String, CaseIterable {
+        case unity, mono, dotnet, jvm
+
+        /// Files beside the program (or in the game's folder) that show the engine, first match wins by case order.
+        var markers: [String] {
+            switch self {
+            case .unity: return ["UnityPlayer.dll"]
+            case .mono: return ["mono-2.0-bdwgc.dll", "mono-2.0-sgen.dll"]
+            case .dotnet: return ["coreclr.dll", "hostfxr.dll"]
+            case .jvm: return ["jvm.dll", "jre\\bin\\server\\jvm.dll", "runtime\\bin\\server\\jvm.dll", "jre\\bin\\client\\jvm.dll"]
+            }
+        }
+
+        /// The off switch: `env.MADEIRA_ENGINE_PRESET_<ENGINE> = 0` in madeira.cfg (and `MADEIRA_ENGINE_PRESETS = 0` for all).
+        var switchName: String { "MADEIRA_ENGINE_PRESET_" + rawValue.uppercased() }
+
+        /// The lines after the standard list's. None yet: no engine has a line proven for it (a Unity video line,
+        /// MADEIRA_WG_64BIT, is an open idea in INDEX, not a result). The preset is then the standard text with the
+        /// engine in the mark and the log; a proven line is added here, and the version bumped, when a game earns one.
+        var extraLines: [String] { [] }
+
+        var title: String {
+            switch self {
+            case .unity: return "Unity games without a list of their own"
+            case .mono: return "Mono games without a list of their own"
+            case .dotnet: return ".NET games without a list of their own"
+            case .jvm: return "Java games without a list of their own"
+            }
+        }
+    }
+
+    /// The preset for an engine: the standard line, then the engine's own.
+    static func enginePreset(_ engine: Engine) -> GameRecommendation {
+        let name = engine == .dotnet ? ".NET" : engine.rawValue.capitalized
+        // The standard list's own lines (so a newer standard list reaches presets: its version is the preset's).
+        let body = standard.config.split(separator: "\n").map(String.init).filter { !$0.hasPrefix("#") }
+        let lines = ["# Madeira's settings for a \(name) game without a list of its own.",
+                     "# Reset to Recommended, at the bottom of the game's settings, brings them back."] + body + engine.extraLines
+        return GameRecommendation(id: "engine-" + engine.rawValue, title: engine.title, version: standard.version,
+                                  config: lines.joined(separator: "\n"))
+    }
+
+    /// The engine a game's folder shows, nil for none. `windowsPath`: a program (its folder is looked at) or a
+    /// Steam game's install folder. Installers, redistributables and Unity's crash handler show nothing.
+    static func engine(windowsPath: String, fileExists: (String) -> Bool) -> Engine? {
+        let path = windowsPath.replacingOccurrences(of: "/", with: "\\").trimmingSuffix("\\")
+        guard let cut = path.lastIndex(of: "\\") else { return nil }
+        let last = path[path.index(after: cut)...].lowercased()
+        let isFile = last.hasSuffix(".exe") || last.hasSuffix(".bat")
+        if isFile, ["unitycrashhandler", "unins", "setup", "vc_redist", "dxsetup", "dotnet", "windowsdesktop"].contains(where: last.hasPrefix) {
+            return nil
+        }
+        let folder = isFile ? String(path[..<cut]) : path
+        guard !folder.isEmpty else { return nil }
+        return Engine.allCases.first { e in e.markers.contains { fileExists(folder + "\\" + $0) } }
+    }
+
+    /// [melonloader] A game modded with MelonLoader 0.7 (recognised by its version.dll proxy and
+    /// MelonLoader folder beside the program), when the game has no list of its own. A Test 8 Get Help
+    /// report (PvZ Fusion, PlantsVsZombiesRH.exe, iPhone12,1): ~4 s in, version.dll asks for an unhinted
+    /// ~256 GB reservation, which cannot fit the map (c0000017), and the game stops with c0000602 every run.
+    /// After the player turned on oversize-reserve (Get Help's line), the same reservation was served
+    /// ("real 0x7400000000+16384 MB") and the c0000602 was gone in both later runs. So: the standard list
+    /// plus that one line. To switch it off, delete the line (or turn off Game details > Large memory
+    /// reservations). NOT device-tested by Cameron; checked in the player's logs only.
+    static let melonLoader = GameRecommendation(
+        id: "melonloader", title: "games modded with MelonLoader", version: 1,
+        config: """
+        # Madeira's recommended settings for a game modded with MelonLoader.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        oversize-reserve = 1
         """)
 
     /// The Rockstar Games Launcher outside Steam (Launcher.exe in its own folder;
@@ -1157,6 +1258,78 @@ enum GameRecommendations {
         id: "rockstar-launcher-setup", title: "Rockstar Games Launcher installer", version: 1,
         config: """
         # Madeira's recommended settings for the Rockstar Games Launcher installer.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        launchMode: "desktop", startServices: true)
+
+    /// [battle-net] Blizzard's Battle.net app (Battle.net Launcher.exe, which starts
+    /// Battle.net.exe), our list version 4 from the old builds (63 and 67, 2026-11-01):
+    /// home page at 60 FPS, and it starts StarCraft. Battle.net.exe is a 32-bit
+    /// Chromium, so none of the 64-bit Chromium lines (no Social Club pool layout, no
+    /// pool-low): spare window slots instead (WOW placeholders, 2 GB margin), the swap
+    /// file, small DXMT rings for its three programs, and Windows services first for
+    /// its Agent. Its web pages get one renderer, in-process GPU and V8 interpreted
+    /// (--jitless gave a blank page); YouTube is blocked (its videos on the store
+    /// page ran out of memory) and videos don't play by themselves. locationapi off:
+    /// the app hung waiting for it under Wine (Lutris's line). Switch it all off by
+    /// removing the lines in the app's own settings (Reset to Recommended brings them back).
+    /// Version 5 (BattleNet Test 9, iPad, 2026-11-15): web fonts off (--disable-remote-fonts).
+    /// The home page and the sign-in page drew their images but none of their text (grey
+    /// boxes, buttons without labels) and stayed that way; without downloaded fonts the
+    /// pages use the installed ones and drew completely, and StarCraft started from Play.
+    /// Version 8 (Nightly 0.2.29 build 89): the list is exactly the config Cameron tested on the iPad (games/battlenet/try10-alert-recheck.txt).
+    /// v6 had dropped MADEIRA_X64_IMAGE_NOCOPY, every MADEIRA_POOL_* line, pool-low, MADEIRA_SPAWN_BLOCK and MADEIRA_ALERT_RECHECK_MS and changed
+    /// the child arguments, so Reset to Recommended broke Battle.net. MADEIRA_SHARED_SECTION_EXEC is not in this list (Overwatch 2 is not proven).
+    /// v9 (bnettest20): v8 plus env.MADEIRA_SHARED_SECTION_EXEC = 1, which is exactly the config Cameron tested for Overwatch 2
+    /// (games/battlenet/try11-ow2.txt). Overwatch_loader.dll maps one 1 MB section twice (an execute view and a write view); without
+    /// the switch the execute view is replaced by a JIT-pool copy, so the code written through the other view never reaches it.
+    /// env.MADEIRA_SHARED_SECTION_EXEC = 0 turns it off. Not in the Nightly list until an Overwatch 2 device run is clean.
+    static let battleNet = GameRecommendation(
+        id: "battle-net", title: "Battle.net", version: 9,
+        config: """
+        # Madeira's recommended settings for Battle.net.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        swap-mb = 4096
+        swap-min-mb = 1
+        pool-split = 1
+        pool-low = 1
+        env.MADEIRA_SWAP_COVERAGE = broad
+        env.MADEIRA_LOCK_ORPHAN = stamped
+        env.MADEIRA_TOUCH_MOUSE = 1
+        env.MADEIRA_WOW_MIN_FREE_GB = 2
+        env.MADEIRA_WOW_PLACEHOLDERS = 1
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.MADEIRA_POOL_BIG_MAX = 1
+        env.MADEIRA_POOL_CODE_KEEP_BIG = 0
+        env.MADEIRA_POOL_HEAD_RESERVE_MB = 256
+        env.MADEIRA_POOL_LOW_IMAGES = 1
+        env.MADEIRA_POOL_RECYCLE_IMAGES = 1
+        env.MADEIRA_SPAWN_BLOCK = ClientSdkFirewallHelper
+        env.DXMT_SMALL_RINGS = Battle.net Launcher.exe;Battle.net.exe;Agent.exe
+        env.WINEDLLOVERRIDES = locationapi=d
+        env.MADEIRA_ALERT_RECHECK_MS = 500
+        env.MADEIRA_SHARED_SECTION_EXEC = 1
+        env.MADEIRA_CHILD_ARGS = Battle.net.exe --enable-logging=stderr --v=0 --use-angle=d3d11 --in-process-gpu --renderer-process-limit=2 --disable-gpu-process-for-dx12-info-collection --js-flags="--no-opt --no-sparkplug" --disable-site-isolation-trials --autoplay-policy=user-gesture-required --host-resolver-rules="MAP youtube.com ~NOTFOUND, MAP *.youtube.com ~NOTFOUND, MAP youtube-nocookie.com ~NOTFOUND, MAP *.youtube-nocookie.com ~NOTFOUND, MAP *.googlevideo.com ~NOTFOUND, MAP *.ytimg.com ~NOTFOUND" --log-severity=info --disable-remote-fonts --disable-quic --disable-gpu-rasterization
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        fastSync: true, display: "fit", launchMode: "desktop", startServices: true)
+
+    /// [battle-net] Battle.net's installer (Battle.net-Setup.exe): it installs the Agent
+    /// and its service, so the Wine desktop with Windows services first, and the
+    /// standard line.
+    static let battleNetSetup = GameRecommendation(
+        id: "battle-net-setup", title: "Battle.net installer", version: 1,
+        config: """
+        # Madeira's recommended settings for the Battle.net installer.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
         env.MADEIRA_EC_HOOK_TRACE = 0
         # The defaults this list was tested with (upstream's differ).
@@ -1238,8 +1411,9 @@ enum GameRecommendations {
 
     static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, gta5LegacyOther, gta4Steam,
                       ghostOfTsushima, godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered,
-                      crysis2Remastered, crysis3Remastered, rockstarLauncher, rockstarLauncherSetup, steamBigPicture,
-                      darkSoulsRemastered, darkSoulsIII, falloutNewVegas, fallout3, blackOps1, blackOps2, borderlands2, standard]
+                      crysis2Remastered, crysis3Remastered, rockstarLauncher, rockstarLauncherSetup, battleNet, battleNetSetup,
+                      steamBigPicture,
+                      darkSoulsRemastered, darkSoulsIII, falloutNewVegas, fallout3, blackOps1, blackOps2, borderlands2, standard, melonLoader]
         + steamTitles.map(\.list)
 
     // MARK: Recognising a game
@@ -1307,6 +1481,11 @@ enum GameRecommendations {
         // A program, wherever it was installed: only the game's own programs, so a
         // redistributable inside a game's folder gets nothing.
         let inSteam = steamAppID != nil || steamFolder != nil
+        // The full game shares its launcher name with the demo.
+        if steamAppID == 3259780 || steamFolder == "final fantasy resonance",
+           last == "ffrs.exe" || last == "ffrs-win64-shipping.exe" {
+            return finalFantasyResonance
+        }
         switch last {
         case "playgtav.exe", "gta5_enhanced.exe":
             // GTA V Enhanced (the legacy edition has PlayGTAV.exe too, beside GTA5.exe):
@@ -1361,8 +1540,29 @@ enum GameRecommendations {
             return rockstarLauncher
         case "rockstar-games-launcher.exe":
             return rockstarLauncherSetup
+        case "battle.net launcher.exe", "battle.net.exe":
+            // [battle-net] Blizzard's Battle.net app, wherever it was installed.
+            return battleNet
+        case "battle.net-setup.exe":
+            return battleNetSetup
+        case "redprelauncher.exe":
+            // (cyberpunk-oversize-2gb) Cyberpunk 2077 started through its launcher (the GOG library entries in
+            // the reports): only when the game's program is under it; The Witcher 3 ships a REDprelauncher.exe too.
+            let folder = path.lastIndex(of: "\\").map { String(path[..<$0]) } ?? ""
+            return fileExists(folder + "\\bin\\x64\\Cyberpunk2077.exe") ? cyberpunk2077 : nil
         default:
-            return steamTitles.first { $0.programs.contains(last) || (inSteam && $0.steamPrograms.contains(last)) }?.list
+            if let list = steamTitles.first(where: { $0.programs.contains(last) || (inSteam && $0.steamPrograms.contains(last)) })?.list {
+                return list
+            }
+            // [melonloader] A game modded with MelonLoader 0.7 (its version.dll proxy beside the
+            // program, and a MelonLoader folder), when no list of its own matched; not Unity's
+            // crash handler beside it.
+            let folder = path.lastIndex(of: "\\").map { String(path[..<$0]) } ?? ""
+            if !folder.isEmpty, !last.hasPrefix("unitycrashhandler"),
+               fileExists(folder + "\\version.dll"), fileExists(folder + "\\MelonLoader") {
+                return melonLoader
+            }
+            return nil
         }
     }
 
@@ -1394,6 +1594,8 @@ extension GameRecommendations {
     }
 
     static let steamTitles: [SteamTitle] = [
+        SteamTitle(appIDs: [986800], folders: ["avicii - invector"],
+                   programs: ["avicii invector.exe"], steamPrograms: [], list: aviciiInvector),
         SteamTitle(appIDs: [2537590], folders: ["msfs2024"],
                    programs: ["flightsimulator2024.exe"], steamPrograms: [], list: msfs2024),
         SteamTitle(appIDs: [730], folders: ["counter-strike global offensive"],
@@ -1414,8 +1616,30 @@ extension GameRecommendations {
                    programs: ["swgr-win64-shipping.exe"], steamPrograms: [], list: starWarsGalacticRacer),
         SteamTitle(appIDs: [], folders: ["minecraft dungeons ii"],
                    programs: [], steamPrograms: [], list: minecraftDungeons2),
+        SteamTitle(appIDs: [71340], folders: ["sonic generations"],
+                   programs: ["sonicgenerations.exe"], steamPrograms: [], list: sonicGenerations),
+        SteamTitle(appIDs: [1222140], folders: ["detroit become human"],
+                   programs: ["detroitbecomehuman.exe"], steamPrograms: [], list: detroitBecomeHuman),
+        SteamTitle(appIDs: [1145350], folders: ["hades ii"],
+                   programs: ["hades2.exe"], steamPrograms: ["f10.exe"], list: hadesII),
+        SteamTitle(appIDs: [110800], folders: ["l.a.noire", "l.a. noire"],
+                   programs: ["lanoire.exe", "playlan.exe"], steamPrograms: [], list: laNoire),
         SteamTitle(appIDs: [2524850], folders: ["denshattack"],
                    programs: ["denshattack_proto.exe"], steamPrograms: [], list: denshattack),
+        SteamTitle(appIDs: [400], folders: ["portal"],
+                   programs: [], steamPrograms: [], list: portal),
+        SteamTitle(appIDs: [8190], folders: ["just cause 2"],
+                   programs: ["justcause2.exe"], steamPrograms: [], list: justCause2),
+        SteamTitle(appIDs: [460920], folders: ["steep"],
+                   programs: ["steep.exe"], steamPrograms: [], list: steep),
+        SteamTitle(appIDs: [242760], folders: ["the forest"],
+                   programs: ["theforest.exe"], steamPrograms: [], list: theForest),
+        SteamTitle(appIDs: [1569580], folders: ["blue prince"],
+                   programs: ["blue prince.exe"], steamPrograms: [], list: bluePrince),
+        SteamTitle(appIDs: [2679460], folders: ["metaphor refantazio", "metaphor: refantazio"],
+                   programs: ["metaphor.exe"], steamPrograms: [], list: metaphorReFantazio),
+        SteamTitle(appIDs: [3259780], folders: ["final fantasy resonance"],
+                   programs: [], steamPrograms: [], list: finalFantasyResonance),
         SteamTitle(appIDs: [4474710], folders: ["final fantasy resonance demo"],
                    programs: ["ffrs.exe"], steamPrograms: [], list: finalFantasyResonanceDemo),
         SteamTitle(appIDs: [1371980], folders: ["norestforthewicked"],
@@ -1430,6 +1654,10 @@ extension GameRecommendations {
                    programs: ["quaver.exe"], steamPrograms: [], list: quaver),
         SteamTitle(appIDs: [239140], folders: ["dying light"],
                    programs: ["dyinglightgame.exe"], steamPrograms: [], list: dyingLight),
+        SteamTitle(appIDs: [534380], folders: ["dying light 2"],
+                   programs: ["dyinglightgame_x64_rwdi.exe"], steamPrograms: [], list: dyingLight2),
+        SteamTitle(appIDs: [1086940], folders: ["baldurs gate 3"],
+                   programs: ["larilauncher.exe", "bg3.exe", "bg3_dx11.exe"], steamPrograms: [], list: baldursGate3),
         SteamTitle(appIDs: [284160], folders: ["beamng.drive"],
                    programs: ["beamng.drive.exe"], steamPrograms: [], list: beamngDrive),
         SteamTitle(appIDs: [3470630], folders: ["monster_hunter_stories_3_twisted_reflection_trial"],
@@ -1464,6 +1692,10 @@ extension GameRecommendations {
                    programs: [], steamPrograms: ["sora_1st.exe"], list: trailsInTheSky1stChapter),
         SteamTitle(appIDs: [1962700], folders: ["subnautica2"],
                    programs: [], steamPrograms: ["subnautica2-win64-shipping.exe"], list: subnautica2),
+        SteamTitle(appIDs: [962130], folders: ["grounded"],
+                   programs: [], steamPrograms: ["maine-win64-shipping.exe"], list: grounded),
+        SteamTitle(appIDs: [526870], folders: ["satisfactory"],
+                   programs: [], steamPrograms: [], list: satisfactorySteam),
         SteamTitle(appIDs: [2668510], folders: ["red dead redemption"],
                    programs: [], steamPrograms: ["playrdr.exe"], list: rdr1Steam),
         SteamTitle(appIDs: [3764200], folders: ["resident evil requiem biohazard requiem"],
@@ -1474,8 +1706,11 @@ extension GameRecommendations {
                    programs: [], steamPrograms: ["lis-win64-shipping.exe"], list: lifeIsStrangeRemastered),
         SteamTitle(appIDs: [532210], folders: ["life is strange 2"],
                    programs: [], steamPrograms: ["lis2-win64-shipping.exe"], list: lifeIsStrange2),
+        // (zomboid-any-store) Matched by program wherever it is installed: a copy outside Steam
+        // (C:\Project Zomboid\ProjectZomboid64.exe, 0.2.29 report) got no list, so Java's ZGC asked
+        // for 48 GB of address space and stopped ("Failed to reserve 3G address space for Java heap").
         SteamTitle(appIDs: [108600], folders: ["projectzomboid"],
-                   programs: [], steamPrograms: ["projectzomboid64.exe"], list: projectZomboid),
+                   programs: ["projectzomboid64.exe"], steamPrograms: [], list: projectZomboid),
         SteamTitle(appIDs: [1329500], folders: ["spiderheck"],
                    programs: [], steamPrograms: ["spiderheckapp.exe"], list: spiderheck),
         SteamTitle(appIDs: [1557740], folders: ["rounds"],
@@ -1494,12 +1729,41 @@ extension GameRecommendations {
                    programs: ["sekiro.exe"], steamPrograms: [], list: sekiroShadowsDieTwice),
         SteamTitle(appIDs: [413150], folders: ["stardew valley"],
                    programs: ["stardew valley.exe"], steamPrograms: [], list: stardewValley),
+        SteamTitle(appIDs: [2753000], folders: ["goals"],
+                   programs: ["goals.exe"], steamPrograms: [], list: goals),
+        SteamTitle(appIDs: [2868840], folders: ["slay the spire 2"],
+                   programs: ["slaythespire2.exe"], steamPrograms: [], list: slayTheSpire2),
         SteamTitle(appIDs: [2400160], folders: ["glyphica"],
                    programs: ["neosphere.exe"], steamPrograms: [], list: glyphicaTypingSurvival),
         SteamTitle(appIDs: [3483510], folders: ["the adventures of elliot the millennium tales"],
                    programs: ["elliot-win64-shipping.exe"], steamPrograms: [], list: theAdventuresOfElliot),
-
+        SteamTitle(appIDs: [], folders: [],
+                   programs: ["innerspace.exe"], steamPrograms: [], list: innerSpace),
+        SteamTitle(appIDs: [], folders: [],
+                   programs: ["emuera.exe"], steamPrograms: [], list: dotnetLargeHeap),
+        // (cyberpunk-oversize-2gb) By program too, for copies outside Steam; its launcher is matched in `match`.
+        SteamTitle(appIDs: [1091500], folders: ["cyberpunk 2077"],
+                   programs: ["cyberpunk2077.exe"], steamPrograms: [], list: cyberpunk2077),
     ]
+
+    /// [cyberpunk-oversize-2gb] Cyberpunk 2077 (Steam App ID 1091500, Cyberpunk2077.exe; also the GOG copy). Our own list,
+    /// from Get Help reports of Nov 16 (0.2.23, iPad15,3). The game asks for an unhinted 64 GB reservation at start. With
+    /// no line it is refused and the game reads a null pointer (0x28 at Cyberpunk2077.exe+0x1976CB6). With oversize-reserve
+    /// alone the real part is 8 GB, a later 4 GB reservation finds no room and REDengine stops itself (0x80000003). With a
+    /// 2 GB real part: "[oversize] ml1298 unhinted reserve of 65536 MB: real 0x7040000000+2048 MB" and "granted=35840 MB
+    /// ok=8 fail=1", and the game went on loading (report 7849845274-ecd40b58). That run drew no frame: what stops the game
+    /// after the memory step is NOT known, so this list is one step, not a working game. The standard line plus the two
+    /// lines that run had; no other game gets them (Bodycam, BIGFOOT, GTA V and .NET games ask for such a reservation,
+    /// are refused, and carry on with a smaller one). To switch it off, delete the two lines. NOT device-tested.
+    static let cyberpunk2077 = GameRecommendation(
+        id: "cyberpunk-2077", title: "Cyberpunk 2077", version: 1,
+        config: """
+        # Madeira's recommended settings for Cyberpunk 2077.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        oversize-reserve = 1
+        oversize-reserve-mb = 2048
+        """)
 
     /// Microsoft Flight Simulator 2024 (Steam App ID 2537590). Ported on 2026-10-26 from thebcd69's (BCD) tested list
     /// for it (its version 6); not device-tested here.
@@ -1521,14 +1785,17 @@ extension GameRecommendations {
         avx: true, nvidia: true, wineVCRT: false, display: "fit")
 
     /// Counter-Strike 2 (Steam App ID 730). Ported on 2026-10-26 from the tested list for it in thebcd69's BCD (its version
-    /// 2); not device-tested here.
+    /// 2); not device-tested here. Version 2: mouse-look keeps turning at the screen edge on an iPad whose pointer
+    /// iPadOS does not lock. CS2 turns SDL's relative mode on in a match but leaves its Windows arrow up, so the app
+    /// followed the pointer's position, which stops at the edge (MADEIRA_POINTER_RAW_LOOK, HardwareInput.swift).
     static let counterStrike2 = GameRecommendation(
-        id: "counter-strike-2", title: "Counter-Strike 2", version: 1,
+        id: "counter-strike-2", title: "Counter-Strike 2", version: 2,
         config: """
         # Madeira's recommended settings for Counter-Strike 2.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
         env.MADEIRA_EC_HOOK_TRACE = 0
         pool-split = 1
+        env.MADEIRA_POINTER_RAW_LOOK = 1
         # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
@@ -1743,6 +2010,114 @@ extension GameRecommendations {
         env.MADEIRA_JIT_DUMP = 0
         """)
 
+    /// Sonic Generations (Steam App ID 71340). Its start-up Configuration tool and the game itself look for a
+    /// controller only once, when they start (Discord report by SeeTheBridges, iPhone 17 Pro, 0.2.23, 2026-11-15/16:
+    /// the tool's Input Type list held only "Keyboard"; the log's dinput enumeration found "slot0=empty" about 13 s
+    /// before touch slot 0 connected, and the touch controller connects only once the landscape overlay shows).
+    /// Player 1 is published from the first frame (MADEIRA_PAD_EARLY_SLOT, as Dark Souls: Remastered).
+    /// NOT device-tested; checked in the player's logs only.
+    static let sonicGenerations = GameRecommendation(
+        id: "sonic-generations", title: "Sonic Generations", version: 1,
+        config: """
+        # Madeira's recommended settings for Sonic Generations.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_PAD_EARLY_SLOT = 1
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        """)
+
+
+    /// Detroit: Become Human (Steam 1222140) renders only through Vulkan, and Madeira keeps Vulkan off unless the game's
+    /// config asks for it: tsun's log (Test 18) shows "[winios-vk] Vulkan is off for this session", then the game's own
+    /// "Unable to find a suitable graphics card with Vulkan 1.1 support" and exit 0xFFFFFFFF (Sentry 7850385210 be90c32c,
+    /// bbdc4a0a; 7850383115 16a025e4). Off switch: put `vulkan = off` in the game's config. Not device-tested.
+    static let detroitBecomeHuman = GameRecommendation(
+        id: "detroit-become-human", title: "Detroit: Become Human", version: 1,
+        config: """
+        # Madeira's recommended settings for Detroit: Become Human.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        vulkan = moltenvk
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+
+    /// Hades II (Steam 1145350; Release/Hades2.exe is 64-bit, Release/F10.exe is a 32-bit .NET program Steam starts).
+    /// Sentry Nov 16 (0.2.26, iPhone19,4, iOS 27.2, thermal serious): "[wow-window] refused: map too small (5582 MB free VA; a
+    /// window needs 4096 MB plus MADEIRA_WOW_MIN_FREE_GB=8 left over)", then F10.exe "BOOT FAILED at stage
+    /// 'guest-window-reserve'" (0xc0000017). 5582 MB is 1486 MB above the window, so a 1 GB margin passes the rule (the
+    /// MIN_FREE_GB = 2 other lists use would still refuse). Whether F10.exe then runs is not known. Not device-tested.
+    static let hadesII = GameRecommendation(
+        id: "hades-ii", title: "Hades II", version: 1,
+        config: """
+        # Madeira's recommended settings for Hades II.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_WOW_MIN_FREE_GB = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// L.A. Noire (Steam 110800, 32-bit LANoire.exe started by PlayLAN.exe, Rockstar Games Launcher + Social Club).
+    /// Sentry Nov 16 (0.2.26, iPhone17,1): the launcher's x64 SocialClubHelper.exe fails to load libcef.dll (252 MB image,
+    /// "[jit-pool] EXHAUSTED", then 0xC0000135) and starts again about every 5 s. With the auto-added pool-split + NOCOPY lines the
+    /// next run loads libcef but Chromium's 32 GB PartitionAlloc pool is refused ("[brp-contain]", 5 large reservations
+    /// failed, SC_INIT_ERR_WEBSITE_FAILED_LOAD). So the Rockstar lines GTA IV's tested list uses (Social Club layout 2,
+    /// pool placement, helper block, Dock service manager), without its swap lines. Not device-tested.
+    static let laNoire = GameRecommendation(
+        id: "la-noire", title: "L.A. Noire", version: 1,
+        config: """
+        # Madeira's recommended settings for L.A. Noire.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        pool-low = 1
+        pool-page-fit = 1
+        pool-split = 1
+        env.MADEIRA_DOCK_GAME_SCM = 1
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_EXECREQ_LEAVE = 1
+        env.MADEIRA_LOCK_ORPHAN = stamped
+        env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
+        env.MADEIRA_POOL_LOW_IMAGES = 1
+        env.MADEIRA_POOL_RECYCLE_IMAGES = 1
+        env.MADEIRA_SC_PA_POOLS = 2
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist
+        env.MADEIRA_WOW_MIN_FREE_GB = 2
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+
+    /// Portal (Steam 400; hl2.exe is a 32-bit program).
+    /// Sentry Nov 16-17 (0.2.26, iPhone14,5, iOS 27.0.1; GET-HELP-LOGS-119 and -13J): when the map ended at 0x7180000000 (454 GB),
+    /// "[wow-window] refused: map too small (5893 MB free VA; a window needs 4096 MB plus MADEIRA_WOW_MIN_FREE_GB=8 left over)",
+    /// then "BOOT FAILED at stage 'guest-window-reserve'" (0xc0000017) and Dock code 45. 5893 MB is 1797 MB above the window,
+    /// so a 1 GB margin passes the rule (the MIN_FREE_GB = 2 other lists use would still refuse). The log also shows the JIT
+    /// pool's RW alias at 0x7000000000, the only slot a short map offers, so the window may still not fit: not proven that
+    /// Portal then runs. On a 512 GB map (report 13K) the line does nothing. Not device-tested.
+    static let portal = GameRecommendation(
+        id: "portal", title: "Portal", version: 1,
+        config: """
+        # Madeira's recommended settings for Portal.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_WOW_MIN_FREE_GB = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
     /// Denshattack! (Steam App ID 2524850). Ported on 2026-10-26 from the tested list for it in thebcd69's BCD (its version
     /// 1); not device-tested here.
     static let denshattack = GameRecommendation(
@@ -1759,6 +2134,116 @@ extension GameRecommendations {
         env.MADEIRA_JIT_DUMP = 0
         """,
         avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// The full game's captured runs exhaust the image pool loading AVRT for XAudio2.
+    /// Keep code buffers in the existing lower region; inferred from logs, not device-tested.
+    /// Baldur's Gate 3 (Steam): LariLauncher.exe runs CefSharp/libcef.dll inside its own process; its 32 GB
+    /// PartitionAlloc reserve was refused ("[jumbo] kernel-pick reserve failed ... top window is full"), then
+    /// CefSharp.Core.Runtime failed to load and .NET threw e0434352 (Sentry GET-HELP-LOGS-KX/KY). So the launcher
+    /// gets Social Club's CEF address space, the same switch BeamNG.drive uses. Not device-tested.
+    static let baldursGate3 = GameRecommendation(
+        id: "baldurs-gate-3", title: "Baldur's Gate 3", version: 1,
+        config: """
+        # Madeira's recommended settings for Baldur's Gate 3.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_CEF_PA_EXES = LariLauncher.exe
+        """)
+
+    /// Dying Light 2 (Steam): DyingLightGame_x64_rwdi.exe stopped ~40 s in with c000001d (illegal instruction)
+    /// while the library had AVX off ([bcd] ... avx=0, Sentry GET-HELP-LOGS-KN/KP). The standard line with the
+    /// game's AVX switch on (Game details). Not device-tested.
+    static let dyingLight2 = GameRecommendation(
+        id: "dying-light-2", title: "Dying Light 2", version: 1,
+        config: """
+        # Madeira's recommended settings for Dying Light 2.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        """,
+        avx: true)
+
+    /// Metaphor: ReFantazio (Steam): the exe stopped at its first instructions with "Unhandled illegal
+    /// instruction at 0x14000129B" while the library had AVX off ([bcd] ... avx=0, Sentry ER). The standard
+    /// line with the game's AVX switch on (Game details). Not device-tested; App ID 2679460 not checked here.
+    static let metaphorReFantazio = GameRecommendation(
+        id: "metaphor-refantazio", title: "Metaphor: ReFantazio", version: 2,
+        config: """
+        # Madeira's recommended settings for Metaphor: ReFantazio.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        pool-split = 1
+        exe-window-mb = 336
+        """,
+        avx: true)
+
+    /// Just Cause 2 (Steam 8190): Steam's CEG step for the game's exe ended with
+    /// code 55 on the default settings (three Get Help reports, Madeira Nightly 0.2.23,
+    /// iPhone16,1) and passed with the input-desktop keep switch off (two reports; the
+    /// game then ran 52 s and 203 s). Only this game's list turns it off: Counter-Strike 2
+    /// needs it on. The cause is not proven: no log shows the switch acting
+    /// (notes/jc2-ceg-55-2026-11-16.md).
+    static let justCause2 = GameRecommendation(
+        id: "just-cause-2", title: "Just Cause 2", version: 1,
+        config: """
+        # Madeira's recommended settings for Just Cause 2.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_KEEP_INPUT_DESKTOP = 0
+        """)
+
+    /// Steep (Ubisoft; Epic and Steam 460920): the session ended about 1 s after start because the
+    /// program it starts is a stub that hands off to Ubisoft Connect and exits at once (a community fork's
+    /// report from the Epic library; idea only). env.MADEIRA_WAIT_CHILDREN = 1 is our existing rule for that
+    /// (WineProcessBridge.m: a stub's live child keeps the session). Whether Ubisoft Connect then signs in
+    /// and starts the game here is unknown. Program name steep.exe not checked against one of our logs.
+    /// Not device-tested.
+    static let steep = GameRecommendation(
+        id: "steep", title: "Steep", version: 1,
+        config: """
+        # Madeira's recommended settings for Steep.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_WAIT_CHILDREN = 1
+        """)
+
+    /// The Forest (Steam 242760, Unity): its ~400 short-lived threads each load and unload avrt.dll, and
+    /// every load takes JIT pool space that comes back only when the game exits (~146 MB over a run), so the
+    /// pool runs out (a community fork's report; idea only). avrt.dll is optional for Unity (it only asks
+    /// for the "Games"/"Audio" thread class), so the list turns it off for this game: Wine then fails the
+    /// load and nothing is mapped. The other leak named there (OVRPlugin.dll tried six times) is not handled
+    /// here. Not device-tested.
+    static let theForest = GameRecommendation(
+        id: "the-forest", title: "The Forest", version: 1,
+        config: """
+        # Madeira's recommended settings for The Forest.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.WINEDLLOVERRIDES = avrt=
+        """)
+
+    /// Blue Prince (Steam 1569580, Unity IL2CPP): "Unhandled illegal instruction" 0xC000001D ~97 s in, the
+    /// bytes at the fault are a VEX (AVX) instruction, log avx=0 (Sentry, Test 18). The game's AVX switch on.
+    /// Not device-tested.
+    static let bluePrince = GameRecommendation(
+        id: "blue-prince", title: "Blue Prince", version: 1,
+        config: """
+        # Madeira's recommended settings for Blue Prince.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        """,
+        avx: true)
+
+    static let finalFantasyResonance = GameRecommendation(
+        id: "final-fantasy-resonance", title: "FINAL FANTASY RESONANCE", version: 1,
+        config: """
+        # Madeira's recommended settings for FINAL FANTASY RESONANCE.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        pool-split = 1
+        pool-low = 1
+        """)
 
     /// FINAL FANTASY RESONANCE DEMO (Steam App ID 4474710). Ported on 2026-10-26 from thebcd69's (BCD) tested list for
     /// it (its version 2); not device-tested here.
@@ -1834,15 +2319,27 @@ extension GameRecommendations {
         """,
         avx: false, nvidia: false, wineVCRT: false, display: "fit")
 
-    /// BeamNG.drive (Steam App ID 284160). Ported on 2026-10-26 from the tested list for it in thebcd69's BCD (its version
-    /// 2); not device-tested here. Left out: MADEIRA_X64_MACHINE (read by a Wine/tools patch that is not merged).
+    /// BeamNG.drive (Steam App ID 284160). Version 2 device-tested on an iPad (2026-11-03): in game, DirectX 11,
+    /// "emulated x86 mode" in BeamNG's launcher (native ARM64 mode lacks an aarch64 d3dcompiler_47.dll; Vulkan has
+    /// no driver here). Bin64\BeamNG.drive.x64.exe hosts CEF 150 (Chromium) in its own process:
+    /// MADEIRA_CEF_PA_EXES gives it Social Club's layout-2 PartitionAlloc/V8 room (MADEIRA_SC_PA_POOLS = 2), and
+    /// MADEIRA_CEF_CMDLINE lets CEF read the --single-process switch MADEIRA_CHILD_ARGS adds, since the
+    /// 512 GB address space holds one Chromium, not its gpu/utility/renderer children. Version 1 was ported on
+    /// 2026-10-26 from a community list and stopped in chrome_elf.dll.
     static let beamngDrive = GameRecommendation(
-        id: "beamng-drive", title: "BeamNG.drive", version: 1,
+        id: "beamng-drive", title: "BeamNG.drive", version: 2,
         config: """
         # Madeira's recommended settings for BeamNG.drive.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        pool-low = 1
+        env.MADEIRA_POOL_LOW_IMAGES = 1
+        env.MADEIRA_POOL_RECYCLE_IMAGES = 1
         env.MADEIRA_EC_HOOK_TRACE = 0
         env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.MADEIRA_SC_PA_POOLS = 2
+        env.MADEIRA_CEF_PA_EXES = BeamNG.drive.x64.exe
+        env.MADEIRA_CHILD_ARGS = BeamNG.drive.x64.exe --single-process --js-flags=--jitless --disable-features=PartitionAllocBackupRefPtr
+        env.MADEIRA_CEF_CMDLINE = 1
         # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
@@ -2135,6 +2632,68 @@ extension GameRecommendations {
         env.MADEIRA_JIT_DUMP = 0
         """)
 
+    /// Grounded (Steam App ID 962130, Unreal Engine 4; Maine-Win64-Shipping.exe). From the owner's device-tested
+    /// game config of the old build line (it got Grounded in game with the controller working, 2026-10-31/11-01):
+    /// the JIT pool and uncopied images make room for the 95 MB 64-bit libcef.dll; the swap file backs the game's
+    /// memory down to Unreal's 64 KB reservations, so iOS's 8 GB limit does not kill it while a world loads; the
+    /// game is told it has 1 GB of video memory so Unreal's texture pool starts smaller; and the game sees an
+    /// NVIDIA card. Not device-tested on this build line: the old line's Grounded fixes that are not in this tree
+    /// (narration through sapi.dll, a split-pool crash, the FEX free/code-lock freeze) may still stop it.
+    static let grounded = GameRecommendation(
+        id: "grounded", title: "Grounded", version: 1,
+        config: """
+        # Madeira's recommended settings for Grounded.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        pool = 896
+        pool-split = 1
+        swap-mb = 8192
+        swap-mode = 2
+        swap-images = 1
+        vram-mb = 1024
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.MADEIRA_SWAP_COVERAGE = broad
+        env.MADEIRA_SWAP_MIN_KB = 64
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        nvidia: true)
+
+    /// Satisfactory from Steam (App ID 526870, Unreal Engine 5, Direct3D 12). The owner's device-tested list for the
+    /// Epic copy (Wave 5, 2026-11-06: past the logo and in game, ~29 FPS on Low): the split JIT pool and uncopied
+    /// images make room for its ~300 module DLLs (the pool ran out without them), the ec-hook reporter is off, and
+    /// rp-carry/rp-discard skip the render-pass loads and stores it never uses. It was tested without the community
+    /// build's defaults, so none are added. A device with less than 10 GB of RAM also gets `satisfactorySmallRAMLines`:
+    /// a Test 8 report (Get Help, 2026-11-10, a 6 GB iPad, iOS's limit 4096 MB) reached the game window, then the
+    /// footprint climbed to 4053 MB and iOS ended Madeira. NOT device-tested from Steam or on a small device.
+    static let satisfactorySteam = GameRecommendation(
+        id: "satisfactory-steam", title: "Satisfactory (Steam)", version: 1,
+        config: """
+        # Madeira's recommended settings for Satisfactory (Steam).
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        pool-split = 1
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        rp-carry = 1
+        rp-discard = 1
+        """,
+        smallRAMConfig: satisfactorySmallRAMLines)
+
+    /// Satisfactory on a device with less than 10 GB of RAM: the swap file (broad coverage, down to Unreal's 64 KB
+    /// reservations) takes the game's data and its pure-x64 images out of the memory iOS counts, and the game is
+    /// told it has 768 MB of video memory (the automatic budget was 1024 MB on the 6 GB iPad and trimmed itself
+    /// to 768 MB before the end), so Unreal's texture pool starts smaller. The lines Grounded's tested list uses.
+    static let satisfactorySmallRAMLines = """
+        swap-mb = 8192
+        swap-mode = 2
+        swap-images = 1
+        vram-mb = 768
+        env.MADEIRA_SWAP_MIN_KB = 64
+        """
+
     /// Red Dead Redemption (Steam) (Steam App ID 2668510). Ported on 2026-10-26 from thebcd69's (BCD) tested list for
     /// it (its version 1); not device-tested here.
     static let rdr1Steam = GameRecommendation(
@@ -2224,12 +2783,12 @@ extension GameRecommendations {
     /// Project Zomboid (Steam App ID 108600). Ported on 2026-10-26 from the tested list for it in thebcd69's BCD (its
     /// version 1); not device-tested here.
     static let projectZomboid = GameRecommendation(
-        id: "project-zomboid", title: "Project Zomboid", version: 1,
+        id: "project-zomboid", title: "Project Zomboid", version: 2,
         config: """
         # Madeira's recommended settings for Project Zomboid.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
         env.MADEIRA_EC_HOOK_TRACE = 0
-        env._JAVA_OPTIONS = -XX:-UseZGC
+        env._JAVA_OPTIONS = -XX:-UseZGC -XX:+UseG1GC -XX:TieredStopAtLevel=1
         # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
@@ -2382,6 +2941,69 @@ extension GameRecommendations {
         env.MADEIRA_JIT_DUMP = 0
         """)
 
+    /// Slay the Spire 2 (Steam App ID 2868840). Our own list, device-tested 2026-11-07 (Test Wave 3/4, presents=2101):
+    /// SlayTheSpire2.exe is 855 MB, so a big pool split in two and no pool copy of x64 images, or the pool runs out
+    /// (code 45); .NET's GC reserves 256 GB of address space by default, which fails on iOS (Sentry GET-HELP-LOGS-56),
+    /// so a 16 GB region range; W^X off for .NET's JIT.
+    static let slayTheSpire2 = GameRecommendation(
+        id: "slay-the-spire-2", title: "Slay the Spire 2", version: 2,
+        config: """
+        # Madeira's recommended settings for Slay the Spire 2.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        pool = 896
+        pool-split = 1
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.DOTNET_GCRegionRange = 400000000
+        env.DOTNET_EnableWriteXorExecute = 0
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_RWX_PLAIN = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// GOALS (Steam App ID 2753000, GOALS.exe, a .NET game). Sentry GET-HELP-LOGS-14T (Nightly 0.2.29, iPhone14,8): CoreCLR asks for
+    /// its default 256 GB GC region ("[jumbo#1] ... size=0x3fe3754000 (261687 MB) ... st=0xc0000017"), then "GC heap
+    /// initialization failed with error 0x8007000E". The same line got Slay the Spire 2 past this. Not device-tested on GOALS.
+    /// v2: env.DOTNET_EnableWriteXorExecute = 0 too (a tester log on Mods Test 1: "CLR: Assert failure ... m_pRegionToGenTableImmediate", 0xC0000602 four seconds in; the run with the line worked; same line as Slay the Spire 2).
+    /// Off switch: delete the DOTNET_GCRegionRange and DOTNET_EnableWriteXorExecute lines (or Reset to Recommended after removing this list).
+    static let goals = GameRecommendation(
+        id: "goals", title: "GOALS", version: 2,
+        config: """
+        # Madeira's recommended settings for GOALS.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.DOTNET_GCRegionRange = 400000000
+        env.DOTNET_EnableWriteXorExecute = 0
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// A .NET 7+ program that is not on Steam (matched by program name, like InnerSpace). Sentry Nov 17 (Nightly 0.2.29,
+    /// iPhone19,4): CoreCLR asks for its default 256 GB GC region ("[jumbo#1] ... size=0x3fdd258000 (261586 MB) ... st=0xc0000017"),
+    /// then "GC heap initialization failed with error 0x8007000E"; 6 of 8 runs. Same line as GOALS and Slay the Spire 2. Not device-tested here.
+    /// v2: env.DOTNET_EnableWriteXorExecute = 0 too (the same CLR assert 0xC0000602 as in the GOALS note).
+    /// Off switch: delete the DOTNET_GCRegionRange and DOTNET_EnableWriteXorExecute lines.
+    static let dotnetLargeHeap = GameRecommendation(
+        id: "dotnet-large-heap", title: ".NET program", version: 2,
+        config: """
+        # Madeira's recommended settings for this .NET program.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.DOTNET_GCRegionRange = 400000000
+        env.DOTNET_EnableWriteXorExecute = 0
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
     /// Glyphica: Typing Survival (Steam App ID 2400160). Ported on 2026-10-26 from the tested list for it in thebcd69's BCD
     /// (its version 1); not device-tested here.
     static let glyphicaTypingSurvival = GameRecommendation(
@@ -2413,6 +3035,33 @@ extension GameRecommendations {
         pool-split = 1
         pool-low = 1
         pool-low-margin = 32
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// InnerSpace (Epic Games Store, by its program InnerSpace.exe). A Discord report (Wave 13, iPhone 18,2): it stops
+    /// after 5 s with exit code 0x80000003. The log's last lines are a Qt WebEngine (Chromium) thread named
+    /// Chrome_InProcGpuThread asking for a WGL pbuffer ("pbuffers are not supported", opengl_ios.c), then an int3 in
+    /// Qt5WebEngineCore.dll; memory is not the cause (79 of 896 MB of the JIT pool used). Qt WebEngine reads extra
+    /// Chromium switches from QTWEBENGINE_CHROMIUM_FLAGS (a name Wine's env_ios.c passes on; QT_* names it drops), so
+    /// this list turns Chromium's GPU path off and lets it draw in software. NOT device-tested: the other lines are
+    /// the ones the reporter already ran with. To switch the new line off, delete it from the game's settings.
+    static let innerSpace = GameRecommendation(
+        id: "innerspace", title: "InnerSpace", version: 1,
+        config: """
+        # Madeira's recommended settings for InnerSpace.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_LOCK_ORPHAN = stamped
+        env.MADEIRA_SC_PA_POOLS = 2
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        pool-low = 1
+        pool-page-fit = 1
+        pool-split = 1
+        env.QTWEBENGINE_CHROMIUM_FLAGS = --disable-gpu
         # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2

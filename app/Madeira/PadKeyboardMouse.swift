@@ -155,10 +155,11 @@ final class PadKeyboardMouse {
             // the 4 ms timer and from every controller change, so StickVelocity.frame's
             // 1/240 s floor would make the cursor faster the more often the pad reports.
             let v = StickVelocity.deflect(r.x, r.y)
-            let k = InputSettings.shared.sensRel * StickVelocity.fullRate * min(dt, 1.0 / 15.0)
+            let tuning = MouseTuning.current
+            let k = InputSettings.shared.sensRel * tuning.stickSpeed * StickVelocity.fullRate * min(dt, 1.0 / 15.0)
             let f = (dx: v.x * k, dy: -v.y * k)
             if f.dx != 0 || f.dy != 0 {
-                let d = carry.add(f.dx, f.dy * bindings.mouseVertical, gain: 1)
+                let d = carry.add(f.dx, f.dy * bindings.mouseVertical * tuning.yFactor, gain: 1)
                 if d.dx != 0 || d.dy != 0 {
                     if !mouseMoving {
                         mouseMoving = true
@@ -204,6 +205,10 @@ final class PadKeyboardMouse {
             winios_pointer(0, 0, down ? 0x0002 : 0x0004, 0)   // LEFTDOWN / LEFTUP
         case .mouseRight:
             winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)   // RIGHTDOWN / RIGHTUP
+        case .mouseMiddle:
+            winios_pointer(0, 0, down ? 0x0020 : 0x0040, 0)   // MIDDLEDOWN / MIDDLEUP
+        case .scrollUp, .scrollDown:
+            if down { winios_pointer(0, 0, 0x0800, action.wheelDelta) }   // one notch a press
         case .keyboardToggle:
             if down { DispatchQueue.main.async { MetalBackedView.toggleKeyboard() } }
         case .none, .joystickWASD, .joystickArrows, .pad:

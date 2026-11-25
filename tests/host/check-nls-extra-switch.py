@@ -5,7 +5,7 @@
 """[nls-extra] env.MADEIRA_NLS_EXTRA: a code page table that is missing from nls/ may come from nls/extra/
 (build/ntdll-unix/env_ios.c).
 
-Static anchors only: the switch is read at every request and only "1" turns it on, nls/ keeps priority, only code
+Static anchors only: the switch is read at every request and only "0" turns it off, nls/ keeps priority, only code
 page tables take the extra path, a missing extra file falls back to the original path, the log tags, and that
 the locale fallback to LC_ALL is Wine's own (not a switch of this port).
 """
@@ -25,13 +25,13 @@ extra = src[src.index('static char *nls_extra_path( const char *dir, const char 
 extra = extra[:extra.index('\n}\n')]
 check(re.search(r'const char \*e = getenv\( "MADEIRA_NLS_EXTRA" \);', extra) is not None and 'static int' not in extra,
       'the switch is read at every request, not cached')
-check('if (!e || strcmp( e, "1" ) || !access( path, R_OK )) return path;' in extra,
-      'only 1 turns it on, and a table present in nls/ always wins')
+check('if ((e && !strcmp( e, "0" )) || !access( path, R_OK )) return path;' in extra and 'static int nls_extra_always' not in src,
+      'default on: only 0 turns it off, and a table present in nls/ always wins')
 check('asprintf( &extra, "%s/nls/extra/%s.nls", dir, name )' in extra
       and 'if (access( extra, R_OK )) { free( extra ); return path; }' in extra,
       'the extra table is nls/extra/<name>.nls; when it is missing the original path is returned')
 check('free( path );' in extra and 'return extra;' in extra, 'the original path is freed when the extra one is used')
-check('"[nls-extra] %s.nls comes from nls/extra (MADEIRA_NLS_EXTRA=1)\\n"' in extra and 'reports++ < 16' in extra,
+check('"[nls-extra] %s.nls comes from nls/extra (MADEIRA_NLS_EXTRA=%s)\\n"' in extra and 'reports++ < 16' in extra,
       'each use is logged as [nls-extra], 16 lines at most')
 
 path = src[src.index('static char *get_nls_file_path( UINT type, UINT id )'):]
@@ -51,6 +51,15 @@ catalog = ROOT / 'app/Madeira/ConfigCatalog.generated.swift'
 if catalog.exists():
     text = catalog.read_text(encoding='utf-8')
     check('key: "env.MADEIRA_NLS_EXTRA"' in text, 'the config catalog documents env.MADEIRA_NLS_EXTRA')
+
+need = [932,936,949,950,10000,874,1250,1251,1253,1254,1255,1256,1257,1258,
+        720,737,775,850,852,855,857,860,861,862,863,864,865,866,869,20866]
+extra_dir = ROOT / 'app/Madeira/nls/extra'
+if extra_dir.exists():
+    miss = [n for n in need if not (extra_dir / f'c_{n}.nls').exists()]
+    check(not miss, 'nls/extra carries every ACP/OEM table a device language needs' + (f' (missing {miss})' if miss else ''))
+    base = ROOT / 'app/Madeira/nls'
+    check(all((base / f'c_{n}.nls').exists() for n in (437, 1252)), 'nls/ keeps 437 and 1252')
 
 print(f'check-nls-extra-switch: {"OK" if not failures else f"{failures} FAILED"}')
 sys.exit(1 if failures else 0)

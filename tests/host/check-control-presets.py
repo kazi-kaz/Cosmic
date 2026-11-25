@@ -107,8 +107,9 @@ require(ids.count == expected.count, "built-in controls have distinct ids")
 
 // --- The Xbox controller preset as data: what a user is offered and what each button does.
 let builtIn = ControlPresetStore.builtIns
-require(builtIn.count == 1 && builtIn[0].id == ControlPresetLayout.xboxID && builtIn[0].name == "Xbox controller",
-        "one built-in, listed as \"Xbox controller\"")
+require(builtIn.count == 2 && builtIn[0].id == ControlPresetLayout.xboxID && builtIn[0].name == "Xbox controller"
+        && builtIn[1].id == ControlPresetLayout.wasdID,
+        "two built-ins: \"Xbox controller\" first, then the WASD keyboard (touch-layout-copy-rename)")
 require(builtIn[0].controls.count == 18 && Set(builtIn[0].controls.compactMap { $0.action.padName }) == Set(expected),
         "the built-in binds the 18 controller inputs, none twice")
 require(builtIn[0].controls.allSatisfy { c in
@@ -216,10 +217,19 @@ def function(source, start):
 
 panel = content[content.index('struct MappingPanel: View {'):]
 setter = panel.split('set: { value in', 1)[1].split('}), in:', 1)[0]
-backdrop = content.split('Color.clear.contentShape(editorCanvas(geo.size))', 1)[1]
+backdrop = content.split('Color.clear.contentShape(editorCanvas(geo.size, top: geo.safeAreaInsets.top))', 1)[1]
 dismiss = function(backdrop, '.onTapGesture {').split('{', 1)[1][:-1]
 sizes = '\n'.join(function(content, signature) for signature in ('static func diameter(', 'static func size('))
 canvas = function(content, 'private func editorCanvas(')
+zones_src = (app / 'GestureZones.swift').read_text()
+panel_geometry = ('enum MappingPanel {\n    struct Placement { var center: CGPoint; var size: CGSize }\n'
+                  # 0.2.72: placement() picks its sizes by env.MADEIRA_CONTROL_PANEL_HIG
+                  + '    static var higEnabled = false\n'
+                  + function(content, 'static func frame(control: TouchControl, screen: CGSize) -> CGRect {') + '\n'
+                  + function(content, 'static func placement(control: TouchControl, screen: CGSize, radius r: CGFloat) -> Placement {')
+                  + '\n}\nenum GestureZonePanel {\n'
+                  + function(zones_src, 'private static func centerX(zone: GestureZone, screen: CGSize) -> CGFloat {') + '\n'
+                  + function(zones_src, 'static func column(zone: GestureZone, screen: CGSize) -> CGRect {') + '\n}\n')
 editor_tests = r'''
 final class EditorControls {
     static let shared = EditorControls()
@@ -235,6 +245,7 @@ final class EditorZones {
     static var enabled = true
     var selected: UUID? = UUID()
     var zones: [GestureZone] = []
+    func index(of id: UUID?) -> Int? { zones.firstIndex { $0.id == id } }
 }
 func setSize(_ control: TouchControl, _ value: Double, _ m: EditorControls) {
 ''' + setter + r'''
@@ -265,24 +276,42 @@ require(editor.controls == beforeDismiss, "dismissing the panel preserves contro
 typealias TouchControlsModel = EditorControls
 typealias GestureZonesModel = EditorZones
 let m = editor, zones = editorZones
-''' + canvas + r'''
+''' + panel_geometry + canvas + r'''
 let canvasScreen = CGSize(width: 800, height: 400)
 var canvasControl = TouchControl()
 editor.controls = [canvasControl]
 var canvasZone = GestureZone(); canvasZone.x = 0.4; canvasZone.w = 0.4
 editorZones.zones = [canvasZone]
-let area = editorCanvas(canvasScreen)
+let area = editorCanvas(canvasScreen, top: 0)
 require(!area.contains(CGPoint(x: 400, y: 200)), "a control overlapping a zone is excluded from canvas taps")
 require(!area.contains(CGPoint(x: 600, y: 300)), "zone taps stay with the zone editor")
 require(area.contains(CGPoint(x: 720, y: 380)), "empty space takes dismissal taps")
 EditorZones.enabled = false
-require(editorCanvas(canvasScreen).contains(CGPoint(x: 600, y: 300)), "disabled zones do not block dismissal")
+require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 600, y: 300)), "disabled zones do not block dismissal")
 EditorZones.enabled = true; editorZones.zones = []
-require(editorCanvas(canvasScreen).contains(CGPoint(x: 490, y: 200)), "canvas starts beyond a normal-size control")
+require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 490, y: 200)), "canvas starts beyond a normal-size control")
 editor.controls[0].scale = 3
-require(!editorCanvas(canvasScreen).contains(CGPoint(x: 490, y: 200)), "the tap exclusion follows a resized control")
+require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 490, y: 200)), "the tap exclusion follows a resized control")
 editor.controls[0].action = .pad("RT"); editor.controls[0].scale = 1
-require(!editorCanvas(canvasScreen).contains(CGPoint(x: 445, y: 200)), "wide shoulder controls keep their full touch region")
+require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 445, y: 200)), "wide shoulder controls keep their full touch region")
+editor.controls = []; editor.selected = nil; editorZones.selected = nil
+require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 400, y: 30)), "the top bar's taps never reach the dismissal")
+require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 10, y: 60)), "the top bar strip spans the screen")
+require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 400, y: 80)), "below the top bar dismisses")
+require(!editorCanvas(canvasScreen, top: 20).contains(CGPoint(x: 400, y: 80)), "the top bar grows by the safe-area inset")
+var panelControl = TouchControl(); panelControl.nx = 0.2; panelControl.ny = 0.2
+editor.controls = [panelControl]; editor.selected = panelControl.id
+let panelFrame = MappingPanel.frame(control: panelControl, screen: canvasScreen)
+require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: panelFrame.midX, y: panelFrame.midY)), "an open control panel's taps stay with the panel")
+require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: panelFrame.minX + 2, y: panelFrame.maxY - 2)), "the panel's corner stays with the panel")
+require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: 790, y: 390)), "outside the panel still dismisses")
+editor.selected = nil
+require(editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: panelFrame.midX, y: panelFrame.midY)), "a closed panel does not block dismissal")
+var panelZone = GestureZone(); panelZone.x = 0.0; panelZone.w = 0.2
+editorZones.zones = [panelZone]; editorZones.selected = panelZone.id
+let column = GestureZonePanel.column(zone: panelZone, screen: canvasScreen)
+require(column.minX > 400, "a zone on the left gets its panel on the right")
+require(!editorCanvas(canvasScreen, top: 0).contains(CGPoint(x: column.midX, y: 200)), "an open zone panel's taps stay with the panel")
 #endif
 '''
 tests = tests.replace('__EDITOR_SIZE_TESTS__', editor_tests)
@@ -302,8 +331,11 @@ for flag, where in (('MADEIRA_CONTROL_PRESETS', presets), ('MADEIRA_CONTROLS_EDI
     assert f'.flag("{flag}")' in where, flag + ' is a kill switch'
 # Defaults an existing user would notice are opt-in: the built-in is never applied
 # automatically and player 1 is not reserved unless the switch is set to 1.
-for flag, where in (('MADEIRA_CONTROLS_XBOX_DEFAULT', presets), ('MADEIRA_PAD_EARLY_SLOT', gamepad)):
-    assert f'.optIn("{flag}")' in where and f'.flag("{flag}")' not in where, flag + ' is opt-in'
+assert '.optIn("MADEIRA_CONTROLS_XBOX_DEFAULT")' in presets and '.flag("MADEIRA_CONTROLS_XBOX_DEFAULT")' not in presets, 'MADEIRA_CONTROLS_XBOX_DEFAULT is opt-in'
+# early-pad-default (Nov 19): MADEIRA_PAD_EARLY_SLOT is ON by default for a pad that is already paired when the game starts;
+# env.MADEIRA_PAD_EARLY_SLOT = 0 turns it off. A game folder's value wins, then madeira.cfg, then the process environment.
+assert 'MadeiraConfig.gameValue("env.MADEIRA_PAD_EARLY_SLOT")' in gamepad and 'MadeiraConfig.get("env.MADEIRA_PAD_EARLY_SLOT")' in gamepad \
+    and 'environment["MADEIRA_PAD_EARLY_SLOT"]' in gamepad and 'env.MADEIRA_PAD_EARLY_SLOT = 0 turns this off' in gamepad, 'MADEIRA_PAD_EARLY_SLOT is default-on with a 0 off switch'
 assert '!= "0"' in function(gamepad, 'static func flag('), 'only "0" disables'
 assert '== "1"' in function(gamepad, 'static func optIn('), 'only "1" enables'
 assert 'Self.xboxDefault' in function(presets, 'var defaultPending: Bool {'), 'the automatic built-in needs the opt-in'
@@ -318,8 +350,19 @@ default = function(presets, 'func applyDefaultIfNeeded(screen: ControlPresetScre
 assert 'm.controls.isEmpty' in default and 'm.needsDefaultLayout = false' in default, 'applied once, never over controls'
 assert 'Self.touchPad' in function(presets, 'var defaultPending: Bool {'), 'no controller default without touch XInput'
 overlay = function(content, 'struct TouchControlsOverlay: View {')
-assert overlay.index('Color.clear.contentShape(editorCanvas(geo.size))') < overlay.index('GestureZonesLayer('), 'dismissal stays behind editable controls'
-assert panel.index('.onTapGesture { }') < panel.index('.position(layout.center)'), 'only the panel consumes its background taps'
+assert overlay.index('Color.clear.contentShape(editorCanvas(geo.size, top: geo.safeAreaInsets.top))') < overlay.index('GestureZonesLayer('), 'dismissal stays behind editable controls'
+mapping_panel = function(content, 'struct MappingPanel: View {')
+zone_panel = function((app / 'GestureZones.swift').read_text(), 'struct GestureZonePanel: View {')
+for name, body in (('MappingPanel', mapping_panel), ('GestureZonePanel', zone_panel)):
+    # iOS 26: a tap gesture on the panel took taps from its own buttons; the panel's
+    # frame is left out of the dismissal area instead.
+    assert '.onTapGesture { }' not in body, name + ' has no tap gesture over its buttons'
+    # A measured frame published back into the model re-rendered the overlay from
+    # inside its own layout, and the editor stopped taking taps (device test, Nov 6).
+    assert 'onGeometryChange' not in body, name + ' publishes no measured frame'
+assert 'Self.placement(control: control, screen: screen' in mapping_panel, 'the panel and the dismissal area share one placement'
+assert 'Self.centerX(zone: zone, screen: screen)' in zone_panel, 'the zone panel and its column share one position'
+assert 'editorPanelFrame' not in content, 'no measured panel frame in the model'
 assert 'ControlPresetsModel.enabled && m.visible && !m.editing' in overlay, 'menu only while touch controls are shown'
 assert 'if m.editing && Self.editorDone {' in overlay and 'Text("Done")' in overlay
 assert 'TouchControlsOverlay.showsLayoutMenu(self) ? 3 : 2' in model, 'the menu button is hit-testable'
@@ -327,7 +370,7 @@ window = function(content, 'final class ControlsWindow: UIWindow {')
 assert window.index('if m.editing {') < window.index('!hit.isDescendant(of: root)') \
     < window.index('guard m.hitsInteractive('), 'menu and dialog presentations take their touches in play mode'
 reserve = function(gamepad, '@MainActor func reserveSessionSlot(touchControls: Bool) {')
-assert reserve.index('guard Self.enabled, Self.optIn("MADEIRA_PAD_EARLY_SLOT")') < reserve.index('touchState.reserved = true')
+assert reserve.index('if setting == "0" { return }') < reserve.index('touchState.reserved = true')   # early-pad-default: 0 is the off switch
 run = function(content, 'private func runWineFullSequence(profile: LibraryEntry? = nil) {')
 assert run.index('GamepadInput.shared.reserveSessionSlot(') < run.index('DispatchQueue.global'), 'reserved before Wine starts'
 
@@ -335,16 +378,19 @@ assert run.index('GamepadInput.shared.reserveSessionSlot(') < run.index('Dispatc
 # Session menu carries the same menu, and a game remembers the layout it was loaded from.
 lib = (app / 'Library.swift').read_text()
 hud = function(lib, 'struct LibraryHUD: View {')
-menu = function(hud, 'private var menu: some View {')
-row = menu.index('ControlLayoutMenu(style: .row)')
-assert 'if session && !m.editing { LibraryHUD() } else { topBar }' in overlay, 'a session shows the HUD instead of the top bar'
-assert menu.index('Toggle("Touch controls"') < row < menu.index('LabeledContent("Opacity")'), \
-    'the Session menu offers the layout menu with the touch-control settings'
-assert 'controls.visible && ControlPresetsModel.enabled' in menu[row - 80:row], \
+# (session-menu-rows) The layout menu is a "Touch layout" card on the Session menu's main page, above FPS and Aspect.
+main = function(hud, 'private var sessionMainScroll: some View {')
+row = main.index('ControlLayoutMenu(style: .card')
+assert 'if session && !m.editing { LibraryHUD() } else { topBar(top: geo.safeAreaInsets.top) }' in overlay, 'a session shows the HUD instead of the top bar'
+assert 'ControlLayoutMenu' not in function(hud, '@ViewBuilder private var touchLookRows: some View {'), 'no longer on the Touch button look page'
+assert main.index('LazyVGrid') < row < main.index('pickerBox("FPS limit")'), 'the card sits between the tiles and FPS / Aspect'
+assert 'controls.visible && ControlPresetsModel.enabled' in main[row - 80:row], \
     'only while touch controls are on and MADEIRA_CONTROL_PRESETS is not 0'
-assert 'model.saveCurrentProfile()' in menu[row:menu.index('LabeledContent("Opacity")')], 'a chosen layout is saved to the game'
+assert 'model.saveCurrentProfile()' in main[row:row + 400], 'a chosen layout is saved to the game'
+assert 'controls.editing = true' in main[row:row + 200], 'Edit this layout opens the editor like the Edit controls tile'
 layout_menu = function(presets, 'struct ControlLayoutMenu: View {')
-assert 'enum Style { case glass, row }' in layout_menu and 'LabeledContent("Controller layout")' in layout_menu
+assert 'enum Style { case glass, row, card }' in layout_menu and 'LabeledContent("Controller layout")' in layout_menu
+assert 'Button("Edit this layout"' in layout_menu and 'Text("Touch layout")' in layout_menu
 assert 'ControlLayoutMenu()' in overlay, 'the overlay keeps its top-bar button, unchanged'
 entry = function(lib, 'struct LibraryEntry: Codable, Identifiable {')
 assert 'var controlLayout: String?' in entry, 'optional, so older library files decode'
@@ -363,3 +409,19 @@ assert 'glyph: control.action.stickGlyph' in function(content, 'struct TouchCont
 assert 'JoystickFace(held: s.held, dir: s.dir)' in content and 'JoystickFace(held: false, dir: -1)' in content, 'the portrait pad passes none, drawn as before'
 assert '.opacity(glyph == nil || expanded ? 1 : 0)' in face, 'no glyph: the knob is always drawn'
 print('PASS: switches (opt-in built-in default and session slot), edit write-back, layout menu, session-menu layout choice and stick glyph wiring')
+
+# A touch key or mouse button stays down for the minimum hold, so a game that reads key
+# state once a frame sees a quick tap; a newer press or a removed control sends a
+# held-back release at once, and a stale delayed release does nothing.
+button = function(content, 'struct TouchControlButton: View {')
+press = function(button, 'private func press(_ down: Bool) {')
+assert 'releaseHeldNow()' in press.split('if down {', 1)[1].split('return', 1)[0], 'a new press releases a held-back one first'
+assert 'guard left > 0 else { send(control.action, down: false); return }' in press, 'a long press releases at once'
+assert 'guard holdToken == token, let action = heldAction else { return }' in press, 'a stale delayed release does nothing'
+held = function(button, 'private func releaseHeldNow() {')
+assert 'holdToken &+= 1' in held and 'send(action, down: false)' in held
+assert 'releaseHeldNow()' in function(button, '.onDisappear {'), 'a removed control leaves no key down'
+hold = function(button, 'static var minimumHold: Double {')
+assert '?? 60' in hold and 'min(max(ms, 0), 500)' in hold, '60 ms by default, 0 to 500'
+assert 'getenv("MADEIRA_TOUCH_KEY_MIN_HOLD_MS")' in hold, 'a game config can set it'
+print("PASS: touch keys keep a minimum hold")

@@ -115,9 +115,12 @@ void jit_set_log_callback(jit_log_callback_t callback);
  * own runtime allocations can fragment the scarce low gap. See JITAllocator.m. */
 extern unsigned long madeira_early_window_base;   /* 0x140000000 if held, else 0 */
 extern unsigned long madeira_early_window_size;
-extern unsigned long madeira_early_pool_base;     /* placeholder directly above the window, else 0 */
+extern unsigned long madeira_early_pool_base;     /* placeholder directly above the window (or, [early-pool], above the mapping that blocked it), else 0 */
 extern unsigned long madeira_early_intruder_base, madeira_early_intruder_size;   /* ml1135: first mapping above the window (above the placeholder when one was taken) */
 extern unsigned madeira_early_intruder_tag, madeira_early_intruder_prot;
+struct madeira_win_occ { unsigned long base, size; unsigned tag, prot; };
+extern struct madeira_win_occ madeira_early_win_occ[6];
+extern int madeira_early_win_occ_n;
 extern unsigned long madeira_early_pool_size;
 
 /* The same two facts, as functions. A C global `var` is shared mutable state
@@ -126,5 +129,14 @@ extern unsigned long madeira_early_pool_size;
  * thereafter, so no synchronisation is implied or needed. */
 void madeira_early_pool_placeholder(unsigned long *base, unsigned long *size);
 void madeira_early_pool_intruder(unsigned long *base, unsigned long *size, unsigned *tag);
+
+/* [main-stack-move] (opt-in, madeira.cfg main-stack-move = 1): run `fn` on a new main-thread stack
+ * below the executable window and free the old one, so a fixed-base program over ~730 MB (Civilization VII)
+ * can load. Returns 0 (nothing changed) when it cannot; does not return when it works. */
+int madeira_main_stack_move_wanted(void);
+int madeira_run_on_new_stack(void (*fn)(void));
+const char *madeira_stack_move_note(void);
+/* Removes the crash-guard marker; called a few seconds after the app has opened. */
+void madeira_stack_move_survived(void);
 
 #endif // JIT_ALLOCATOR_H

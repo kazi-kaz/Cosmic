@@ -112,6 +112,12 @@ remotecache synced=<n> device-only=<n> dropped=<n>`.
 `env.MADEIRA_STEAM_CLOUD_REMOTECACHE = 0` leaves the list as the client wrote
 it, as before; the log says `[steam-cloud] remotecache off` once per app run.
 
+Moving a game waits for its own cloud work only (not the launch-time check of
+the other games); removing a drive waits for all of it. A check left at
+"checking" without running no longer counts. A refusal logs
+`[move] blocked: download=<bool> cloudBusy=<ids> deleting=<ids> checking=<ids>`.
+`env.MADEIRA_MOVE_IGNORE_STALE_CLOUD = 0` brings the old, stricter wait back.
+
 ## Safety
 
 - A downloaded file is checked against the SHA-1 in Steam's list before

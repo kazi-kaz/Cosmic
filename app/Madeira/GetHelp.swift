@@ -1,0 +1,496 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright 2026 ft7t8drgwf-wq
+// Madeira Converter Exception: see LICENSE-EXCEPTION.md
+//
+//  madeira-get-help: the Get Help button's talk with Madeira's help server, and
+//  what Apply and Undo do to a game's own config. Foundation only, so the host
+//  check (tests/host/check-get-help.py) compiles this file with swiftc on Linux.
+//  The screens are in GetHelpView.swift.
+//
+//  A player taps Get Help on a game's page, or on the offer Madeira makes after
+//  a game stopped by itself. Madeira sends the same scrubbed report that Get
+//  Help from Claude shares (HelpReport.swift, PrivacyScrub.swift) to the server
+//  (get-help-server/ in the project files: a Cloudflare Worker that asks Claude
+//  Haiku with every known fix in its prompt). The server answers in plain words,
+//  with up to four steps and, sometimes, setting lines for that game. Each line
+//  was checked there against the per-game settings the app knows.
+//
+//  Apply adds the lines at the end of the game's own config (Game details ›
+//  Advanced › This game's config), under a comment that says Get Help added
+//  them; the last line wins, so they take over from earlier ones with the same
+//  key. Nothing in madeira.cfg changes. Undo takes exactly those lines out again.
+//
+//  POST /help     {install_id, game, app_version, reason, report, keep_report, keep_policy}
+//                 -> {ok, request_id, kind, answer, steps, config: {lines, text} | null, confidence}
+//                 (get-help-steam-starts) steam_starts: {program, plain} | absent: Madeira Dock's
+//                 "Steam starts" program for a Steam game (DockStartProgram), applied with the
+//                 lines and taken back by the same Undo. Older apps ignore it.
+//                 or {ok: false, error, message}: message is plain words, shown as is.
+//                 (get-help-files) can_send: the files the app can collect by itself; the answer's
+//                 need names up to 2, and the app asks again with follow_up + files (GetHelpFiles.swift).
+//  POST /feedback {request_id, helped}
+//  POST /upload   (sentry-full-log) a .zip of the full scrubbed logs, header x-request-id
+//                 -> 200 {ok:true} or {ok:true,late:true}; 404 {error:"unknown"}: the report is gone.
+//                 (late-zip) A zip that did not get there (Madeira closed first) is sent again on
+//                 the next open, up to 7 days later (GetHelpCore.Late, GetHelpUpload.resendLate).
+//
+
+import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
+enum GetHelpCore {
+    static let server = URL(string: "https://madeira-get-help.camhocnote4.workers.dev")!
+    /// The server takes reports up to 64 KB; this leaves room for the rest of the request.
+    static let maxReport = 60_000
+    /// Haiku answers in about 3 seconds; the server retries twice when the API is busy.
+    static let timeout: TimeInterval = 60
+
+    struct Request: Encodable {
+        var install_id: String
+        /// (player-id) The short code shown in Settings; sent beside install_id, never instead of it.
+        var player_id: String? = nil
+        var game: String
+        var app_version: String
+        var reason: String   // "crash" (after a game stopped by itself) or "player" (the game page)
+        var report: String
+        var keep_report: Bool
+        /// 2: the screen says reports are kept 30 days unless the player opts out (keep_report
+        /// false); the server keeps older apps' reports only when ticked, for 7 days.
+        var keep_policy: Int = 2
+        /// (get-help-files) Round 1: the kinds GetHelpFiles can collect on this device.
+        var can_send: [String]? = nil
+        /// Round 2: round 1's request id and the files its answer asked for.
+        var follow_up: String? = nil
+        var files: [ExtraFile]? = nil
+        /// (sentry-full-log) The app sends the full logs to POST /upload after a kept answer, so the
+        /// server waits for them before sending the report to Sentry.
+        var upload: Bool = true
+    }
+
+    struct ExtraFile: Codable, Equatable {
+        var kind: String
+        var text: String
+    }
+
+    struct ConfigLine: Codable, Hashable {
+        var key: String
+        var value: String
+        var plain: String
+        var line: String { "\(key) = \(value)" }
+    }
+
+    struct Answer: Decodable, Equatable {
+        struct Config: Decodable, Equatable { var lines: [ConfigLine]; var text: String? }
+        var ok: Bool
+        var request_id: String?
+        var kind: String?
+        var answer: String?
+        var steps: [String]?
+        var config: Config?
+        var confidence: String?
+        /// (get-help-files) The files that would settle it; the app collects them and asks again.
+        var need: [String]?
+        /// (get-help-steam-starts) Madeira Dock's "Steam starts" for this game ("7DaysToDie.exe").
+        var steam_starts: SteamStarts?
+        var error: String?
+        var message: String?
+    }
+
+    /// (get-help-steam-starts) The program, relative to the game's install folder, and plain words for it.
+    struct SteamStarts: Decodable, Equatable, Hashable {
+        var program: String
+        var plain: String?
+    }
+
+    enum Outcome: Equatable {
+        case answer(Answer)
+        case failed(String)
+    }
+
+    // Plain words for what the server can't say itself.
+    static let offlineMessage = "Get Help needs the internet. Check your Wi-Fi or mobile data and try again, or tap Save copy for Discord."
+    static let slowMessage = "Get Help took too long to answer. Try again in a minute, or tap Save copy for Discord."
+    static let notSetUpMessage = "Get Help isn't set up in this copy of Madeira. Tap Save copy for Discord instead."
+    static let badAnswerMessage = "Something went wrong reading the answer. Try again, or tap Save copy for Discord."
+    static let notMadeiraAnswer = "I can only help with games in Madeira."
+
+    /// The report cut to `max` UTF-16 units (the server measures it in JavaScript):
+    /// the start (device, settings, session summary) and the end (how it failed) stay,
+    /// the middle of the key lines goes.
+    static func clip(_ report: String, max: Int = maxReport) -> String {
+        guard report.utf16.count > max else { return report }
+        let note = "\n... part of the report left out here to keep it small ...\n"
+        let room = max - note.utf16.count
+        let headCount = room * 2 / 5
+        let head = prefix(report, utf16: headCount)
+        let tail = suffix(report, utf16: room - headCount)
+        return head + note + tail
+    }
+
+    private static func prefix(_ s: String, utf16 count: Int) -> String {
+        var used = 0, end = s.startIndex
+        for c in s {
+            let n = String(c).utf16.count
+            if used + n > count { break }
+            used += n; end = s.index(after: end)
+        }
+        return String(s[..<end])
+    }
+
+    private static func suffix(_ s: String, utf16 count: Int) -> String {
+        var used = 0, start = s.endIndex
+        for c in s.reversed() {
+            let n = String(c).utf16.count
+            if used + n > count { break }
+            used += n; start = s.index(before: start)
+        }
+        return String(s[start...])
+    }
+
+    static func body(_ request: Request) -> Data {
+        var r = request
+        r.report = clip(r.report)
+        r.game = String(r.game.prefix(120))
+        r.app_version = String(r.app_version.prefix(40))
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(r)) ?? Data()
+    }
+
+    static func urlRequest(_ path: String, key: String, body: Data) -> URLRequest {
+        var request = URLRequest(url: server.appendingPathComponent(path), timeoutInterval: timeout)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.setValue(key, forHTTPHeaderField: "x-madeira-key")
+        request.httpBody = body
+        return request
+    }
+
+    /// What to show for a reply (or a failure to get one).
+    static func outcome(data: Data?, status: Int?, error: Error?) -> Outcome {
+        if let error = error as? URLError, error.code == .timedOut { return .failed(slowMessage) }
+        if error != nil { return .failed(offlineMessage) }
+        guard let data, let answer = try? JSONDecoder().decode(Answer.self, from: data) else {
+            return .failed(badAnswerMessage)
+        }
+        guard answer.ok else {
+            let message = answer.message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return .failed(message.isEmpty ? badAnswerMessage : message)
+        }
+        let text = answer.answer?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if text.isEmpty { return .failed(badAnswerMessage) }
+        var shown = answer
+        shown.answer = text
+        shown.steps = (answer.steps ?? []).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        // A line the app can't write safely is dropped here too.
+        let lines = (answer.config?.lines ?? []).filter(safe)
+        shown.config = lines.isEmpty ? nil : Answer.Config(lines: lines, text: lines.map(\.line).joined(separator: "\n"))
+        shown.steam_starts = answer.steam_starts.flatMap { s in
+            safeProgram(s.program).map { SteamStarts(program: $0, plain: s.plain?.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        }
+        return .answer(shown)
+    }
+
+    /// (get-help-steam-starts) A program inside the game's folder: an .exe, a relative path with
+    /// no "..", no drive or line breaks. nil: dropped. DockStartProgram.apply checks it again.
+    static func safeProgram(_ raw: String) -> String? {
+        let p = raw.trimmingCharacters(in: .whitespaces)
+        guard !p.isEmpty, p.count <= 200, p.lowercased().hasSuffix(".exe"),
+              !p.contains(where: { $0.isNewline || $0 == ":" }), !p.hasPrefix("/"), !p.hasPrefix("\\") else { return nil }
+        let parts = p.split(whereSeparator: { $0 == "/" || $0 == "\\" })
+        return parts.contains(where: { $0 == ".." || $0 == "." }) ? nil : p
+    }
+
+    /// (get-help-steam-starts) What Undo sets "Steam starts" to: the choice before Apply, when the
+    /// choice is still the one Apply made; nil (leave it) when the player changed it since.
+    static func undoSteamStarts(_ record: Record.SteamStartsChange, current: String?) -> String?? {
+        current == record.set ? .some(record.before) : nil
+    }
+
+    /// One `key = value` line: no line breaks, no comment marks, a key with no spaces.
+    static func safe(_ line: ConfigLine) -> Bool {
+        let key = line.key.trimmingCharacters(in: .whitespaces)
+        let value = line.value.trimmingCharacters(in: .whitespaces)
+        guard !key.isEmpty, !value.isEmpty, key.count <= 80, value.count <= 300 else { return false }
+        if key.contains(where: { $0.isWhitespace || $0 == "=" || $0 == "#" }) { return false }
+        if value.contains(where: { $0.isNewline }) { return false }
+        return !key.hasPrefix(";")
+    }
+
+    // MARK: Apply and Undo
+
+    /// (auto-tune-writer) Who added a block of lines to a game's config. Get Help and auto-tune share this one
+    /// writer (apply / undo / Record), so neither ever takes out the other's lines.
+    enum Source: Equatable {
+        case getHelp
+        case autoTune(String)   // the rule's id
+        var tag: String {
+            switch self {
+            case .getHelp: return "get-help"
+            case .autoTune(let id): return "auto-tune:" + id
+            }
+        }
+        init(tag: String) { self = tag.hasPrefix("auto-tune:") ? .autoTune(String(tag.dropFirst("auto-tune:".count))) : .getHelp }
+        var isAutoTune: Bool { if case .autoTune = self { return true }; return false }
+    }
+
+    static let getHelpHeaderPrefix = "# Get Help added these"
+    static let autoTuneHeaderPrefix = "# Auto-tune added these"
+
+    /// The comment Apply writes above its lines.
+    static func header(date: String, source: Source = .getHelp) -> String {
+        switch source {
+        case .getHelp: return "\(getHelpHeaderPrefix) on \(date). Undo: Game details > Advanced > Undo Get Help"
+        case .autoTune(let id): return "\(autoTuneHeaderPrefix) on \(date) (rule \(id)). Undo: Game details > Advanced > Undo auto-tune"
+        }
+    }
+
+    /// The game's config with `lines` added at the end, and the lines that were added
+    /// (to take out again with `undo`). A line the config already ends up with (same key,
+    /// same value) is not added again; nil when nothing would change.
+    static func apply(_ lines: [ConfigLine], to text: String, date: String, source: Source = .getHelp) -> (text: String, added: [String])? {
+        let current = values(text)
+        let new = lines.filter { safe($0) && current[$0.key.trimmingCharacters(in: .whitespaces)] != $0.value.trimmingCharacters(in: .whitespaces) }
+        guard !new.isEmpty else { return nil }
+        var added = [header(date: date, source: source)]
+        for line in new {
+            let plain = line.plain.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+            if !plain.isEmpty { added.append("# " + plain) }
+            added.append("\(line.key.trimmingCharacters(in: .whitespaces)) = \(line.value.trimmingCharacters(in: .whitespaces))")
+        }
+        var out = text
+        if !out.isEmpty && !out.hasSuffix("\n") { out += "\n" }
+        if !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { out += "\n" }
+        out += added.joined(separator: "\n") + "\n"
+        return (out, added)
+    }
+
+    /// The config with the lines Apply added taken out (each once, from the end), and
+    /// the blank line Apply put before them. Lines the player changed since stay.
+    static func undo(_ added: [String], from text: String) -> String {
+        var rows = text.components(separatedBy: "\n")
+        if rows.last == "" { rows.removeLast() }
+        for line in added.reversed() {
+            guard let i = rows.lastIndex(where: { $0.trimmingCharacters(in: .whitespaces) == line }) else { continue }
+            rows.remove(at: i)
+            // The blank line Apply put before its comment goes with it.
+            if line.hasPrefix(getHelpHeaderPrefix) || line.hasPrefix(autoTuneHeaderPrefix), i > 0,
+               rows[i - 1].trimmingCharacters(in: .whitespaces).isEmpty {
+                rows.remove(at: i - 1)
+            }
+        }
+        while let last = rows.last, last.trimmingCharacters(in: .whitespaces).isEmpty { rows.removeLast() }
+        let out = rows.joined(separator: "\n")
+        return out.isEmpty ? "" : out + "\n"
+    }
+
+    /// key -> value, the last line winning, as GameProfile.parse and the native reader do.
+    static func values(_ text: String) -> [String: String] {
+        var out: [String: String] = [:]
+        for raw in text.split(whereSeparator: { $0 == "\n" || $0 == "\r\n" }) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty, !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") else { continue }
+            let k = line[..<eq].trimmingCharacters(in: .whitespaces)
+            if !k.isEmpty { out[k] = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces) }
+        }
+        return out
+    }
+
+    /// What Undo needs later (beside the game's config file).
+    struct Record: Codable, Equatable {
+        var game: String
+        var date: String
+        /// Every line Get Help and auto-tune added, in order (what Reset to clean state takes out).
+        var added: [String]
+        /// (auto-tune-writer) The same lines in blocks, one per Apply, each with who added it. A record written
+        /// before auto-tune has none: all of its lines are one Get Help block (`blocks(of:)`).
+        var blocks: [Block]? = nil
+        struct Block: Codable, Equatable {
+            var source: String   // Source.tag
+            var date: String
+            var added: [String]
+        }
+        /// (get-help-steam-starts) The "Steam starts" choice Apply made, and the one before it.
+        var steamStarts: SteamStartsChange? = nil
+        struct SteamStartsChange: Codable, Equatable {
+            var appID: Int
+            var before: String?
+            var set: String
+        }
+    }
+
+    // MARK: Shared writer (auto-tune-writer)
+
+    /// The record's blocks; a record from before auto-tune is one Get Help block.
+    static func blocks(of record: Record) -> [Record.Block] {
+        if let blocks = record.blocks { return blocks }
+        return record.added.isEmpty ? [] : [Record.Block(source: Source.getHelp.tag, date: record.date, added: record.added)]
+    }
+
+    /// The setting keys a list of added lines sets (comments skipped).
+    static func keys(_ added: [String]) -> Set<String> { Set(values(added.joined(separator: "\n")).keys) }
+
+    /// The record with one more block (what Apply just added).
+    static func adding(_ added: [String], source: Source, date: String, to record: Record) -> Record {
+        var out = record
+        out.blocks = blocks(of: record) + [Record.Block(source: source.tag, date: date, added: added)]
+        out.added = record.added + added
+        out.date = date
+        return out
+    }
+
+    /// Takes the picked blocks' lines out of `text`, by position: all blocks are walked newest first, and each line
+    /// takes the last copy in the file that no newer line took; only the picked blocks' copies go. So a line two
+    /// blocks share (the same setting, a comment, a header written in the same minute) leaves only from the block
+    /// being undone. With one block this is exactly `undo(_:from:)`. A line the player removed is skipped. The blank
+    /// line Apply put before a header goes with it.
+    static func undo(blocks all: [Record.Block], picked: (Record.Block) -> Bool, from text: String) -> String {
+        undo(blocks: all, pickedAt: { picked(all[$0]) }, from: text)
+    }
+
+    /// The same, picking blocks by their position in `all` (so two identical blocks can be told apart).
+    static func undo(blocks all: [Record.Block], pickedAt: (Int) -> Bool, from text: String) -> String {
+        var rows = text.components(separatedBy: "\n")
+        if rows.last == "" { rows.removeLast() }
+        var claimed = Set<Int>(), gone = Set<Int>()
+        for index in all.indices.reversed() {
+            let take = pickedAt(index)
+            for line in all[index].added.reversed() {
+                guard let i = rows.indices.last(where: { !claimed.contains($0) && rows[$0].trimmingCharacters(in: .whitespaces) == line }) else { continue }
+                claimed.insert(i)
+                guard take else { continue }
+                gone.insert(i)
+                // The blank line Apply put before its header goes with it (the nearest row above that is still there).
+                if line.hasPrefix(getHelpHeaderPrefix) || line.hasPrefix(autoTuneHeaderPrefix),
+                   let j = (0..<i).last(where: { !gone.contains($0) }), rows[j].trimmingCharacters(in: .whitespaces).isEmpty {
+                    gone.insert(j)
+                }
+            }
+        }
+        rows = rows.indices.filter { !gone.contains($0) }.map { rows[$0] }
+        while let last = rows.last, last.trimmingCharacters(in: .whitespaces).isEmpty { rows.removeLast() }
+        let out = rows.joined(separator: "\n")
+        return out.isEmpty ? "" : out + "\n"
+    }
+
+    /// The record without the blocks `which` picks: the record left (nil when nothing is left in it) and the
+    /// lines to take out of the config (take them out with `undo(blocks:picked:from:)`, by position).
+    /// `added` is rebuilt from the blocks that stay.
+    static func removing(_ which: (Record.Block) -> Bool, from record: Record) -> (record: Record?, lines: [String]) {
+        let all = blocks(of: record)
+        return removing(at: Set(all.indices.filter { which(all[$0]) }), from: record)
+    }
+
+    /// The same, for the blocks at these positions of `blocks(of: record)`.
+    static func removing(at picked: Set<Int>, from record: Record) -> (record: Record?, lines: [String]) {
+        let all = blocks(of: record)
+        let gone = all.indices.filter { picked.contains($0) }.map { all[$0] }
+        let kept = all.indices.filter { !picked.contains($0) }.map { all[$0] }
+        var out = record
+        out.blocks = kept
+        out.added = kept.flatMap(\.added)
+        let empty = kept.isEmpty && out.steamStarts == nil
+        return (empty ? nil : out, gone.flatMap(\.added))
+    }
+
+    /// Lines from one source that set a key another source's block already sets. Auto-tune never overrides
+    /// Get Help: those lines are dropped. Get Help's lines win over auto-tune's: the auto-tune blocks that set
+    /// the same keys are named so the caller takes them out first.
+    static func conflicts(_ lines: [ConfigLine], source: Source, record: Record?) -> (dropKeys: Set<String>, autoTuneBlocks: [Record.Block]) {
+        guard let record else { return ([], []) }
+        let wanted = Set(lines.map { $0.key.trimmingCharacters(in: .whitespaces) })
+        let all = blocks(of: record)
+        if source.isAutoTune {
+            let helpKeys = all.filter { !Source(tag: $0.source).isAutoTune }.reduce(into: Set<String>()) { $0.formUnion(keys($1.added)) }
+            return (wanted.intersection(helpKeys), [])
+        }
+        return ([], all.filter { Source(tag: $0.source).isAutoTune && !keys($0.added).isDisjoint(with: wanted) })
+    }
+
+    // MARK: Late zip (late-zip)
+
+    /// (late-zip) An upload that has not reached the server yet: Application Support/get-help-pending/
+    /// <request id>.json, written before the upload waits or zips, so the zip can be made again when
+    /// Madeira closed (or iOS ended it) first. The server takes a late zip for 7 days.
+    struct Pending: Codable, Equatable {
+        var requestID: String
+        var title: String
+        var windowsPath: String
+        var report: String
+        var gameText: String?
+        var device: String
+        var created: Date
+    }
+
+    /// (late-zip) The parts of the late zip that need no app: names, age, which answers are final.
+    enum Late {
+        static let folderName = "get-help-pending"
+        /// The server keeps a report waiting for its zip this long.
+        static let maxAge: TimeInterval = 7 * 24 * 60 * 60
+        /// At most this many late zips per launch, one at a time.
+        static let perLaunch = 3
+        /// Seconds after launch before the first late zip goes.
+        static let startDelay: TimeInterval = 5
+
+        /// A request id the server made (a UUID): letters, digits and "-" only, so it is safe as a file name.
+        static func safeID(_ id: String) -> Bool {
+            !id.isEmpty && id.count <= 80 && id.allSatisfy { ($0.isASCII && ($0.isLetter || $0.isNumber)) || $0 == "-" }
+        }
+        static func jsonName(_ id: String) -> String { id + ".json" }
+        static func zipName(_ id: String) -> String { id + ".zip" }
+        /// The request id from a pending file's name; nil for any other file.
+        static func id(fromFileName name: String) -> String? {
+            for ext in [".json", ".zip"] where name.hasSuffix(ext) {
+                let id = String(name.dropLast(ext.count))
+                return safeID(id) ? id : nil
+            }
+            return nil
+        }
+        /// The log's short form of an id.
+        static func short(_ id: String) -> String { String(id.prefix(8)) }
+
+        /// Still worth sending: under 7 days old (a date ahead of the clock by more than a day is not trusted).
+        static func fresh(_ created: Date, now: Date = Date()) -> Bool {
+            let age = now.timeIntervalSince(created)
+            return age < maxAge && age > -24 * 60 * 60
+        }
+
+        /// What an upload's answer means for the pending files. 2xx: it arrived. 404: the report is
+        /// gone for good. Any other 4xx (401, 400, 413...): sending again would get the same answer.
+        /// No answer (0), a time-out or a 5xx: keep them for the next open.
+        enum Verdict: Equatable { case done, keep }
+        static func verdict(status: Int?) -> Verdict {
+            guard let status, status > 0 else { return .keep }
+            if (200..<300).contains(status) || (400..<500).contains(status) { return .done }
+            return .keep
+        }
+
+        static func encode(_ pending: Pending) -> Data? {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            encoder.dateEncodingStrategy = .secondsSince1970
+            return try? encoder.encode(pending)
+        }
+        /// nil when the file can't be read or its id isn't safe (the caller deletes it).
+        static func decode(_ data: Data) -> Pending? {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .secondsSince1970
+            guard let pending = try? decoder.decode(Pending.self, from: data), safeID(pending.requestID) else { return nil }
+            return pending
+        }
+
+        /// Which pending ids to send this launch, oldest first, and which to delete (too old or unreadable).
+        /// `items`: id -> its Pending (nil when the .json is unreadable or missing).
+        static func plan(_ items: [String: Pending?], now: Date = Date()) -> (send: [Pending], delete: [String]) {
+            var send: [Pending] = [], delete: [String] = []
+            for (id, pending) in items {
+                guard let pending, pending.requestID == id, fresh(pending.created, now: now) else { delete.append(id); continue }
+                send.append(pending)
+            }
+            send.sort { $0.created < $1.created }
+            return (Array(send.prefix(perLaunch)), delete.sorted())
+        }
+    }
+}

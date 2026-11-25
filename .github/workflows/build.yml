@@ -48,10 +48,13 @@ jobs:
           python3 tests/host/check-build-inputs.py
           python3 tests/host/check-ci-component-keys.py
           python3 tests/host/check-ffmpeg-source-reuse.py
+          cc -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -pthread -I madeira-d3d12/src madeira-d3d12/tests/native/dxil_cache_test.c -o "$RUNNER_TEMP/dxil-cache-test"
+          "$RUNNER_TEMP/dxil-cache-test"
           python3 tests/host/check-ci-llvm-cache.py
           python3 tests/host/check-clean-bootstrap.py
           python3 tests/host/check-app-link-inputs.py
           python3 tests/host/check-runtime-components.py
+          python3 tests/host/check-ntdll-tls-sync.py
       - name: Check touch control layouts and editor
         run: python3 tests/host/check-control-presets.py
       - name: Check Steam connection recovery

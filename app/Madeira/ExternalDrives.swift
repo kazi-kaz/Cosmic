@@ -25,6 +25,8 @@ final class ExternalDrives: ObservableObject {
     @Published private(set) var folders: [ExternalFolder] = []
     /// Folders opened this launch, by id, with the path they resolved to.
     @Published private(set) var mounted: [UUID: URL] = [:]
+    /// The note shown after adding a folder where no Steam library was found.
+    @Published var steamNote: String?
 
     private static var store: URL { LibraryModel.documents.appendingPathComponent("madeira-external.json") }
     static var linkRoot: URL { MadeiraDock.drive.appendingPathComponent("External", isDirectory: true) }
@@ -38,6 +40,14 @@ final class ExternalDrives: ObservableObject {
     private static var installTarget: String?
     private static var installMissing: String?
     private static var opened: [String: (root: URL, identity: String?)] = [:]
+    /// When each opened root last passed validateRoot (a directory read and a
+    /// marker-file read on the drive). A drive busy with a download can take
+    /// seconds to answer, and the Steam cloud check asked on the main thread
+    /// (iOS killed Madeira for that, 0x8BADF00D, Nov 17). Only callers that pass
+    /// `cached: true` (read-only Steam cloud lookups) reuse a pass, for 30 s.
+    /// Off with `env.MADEIRA_EXTERNAL_VERIFY_CACHE = 0`.
+    private static var verifiedAt: [String: Date] = [:]
+    private static let verifyCacheSeconds: TimeInterval = 30
     private var loadFailure: Error?
     static var steamLibraries: [String] { lock.lock(); defer { lock.unlock() }; return libraries }
     /// The library Madeira's Steam downloads go to, or nil for drive_c's own.
@@ -82,14 +92,20 @@ final class ExternalDrives: ObservableObject {
         let next = Dictionary(uniqueKeysWithValues: folders.compactMap { folder in
             mounted[folder.id].map { (folder.name, (root: $0, identity: folder.libraryID)) }
         })
-        Self.lock.lock(); Self.opened = next; Self.lock.unlock()
+        Self.lock.lock(); Self.opened = next; Self.verifiedAt = [:]; Self.lock.unlock()
     }
 
-    static func externalRoot(for relative: String) throws -> (root: URL, identity: String?)? {
+    static func externalRoot(for relative: String, cached: Bool = false) throws -> (root: URL, identity: String?)? {
         guard let name = driveName(library: relative) else { return nil }
         lock.lock(); let folder = opened[name]; lock.unlock()
         guard let folder else { throw ExternalStorageError.unavailable }
+        let cacheOn = cached && MadeiraConfig.flag("MADEIRA_EXTERNAL_VERIFY_CACHE")
+        if cacheOn {
+            lock.lock(); let at = verifiedAt[folder.root.path]; lock.unlock()
+            if let at, Date().timeIntervalSince(at) < verifyCacheSeconds { return folder }
+        }
         try validateRoot(folder.root, identity: folder.identity)
+        if cacheOn { lock.lock(); verifiedAt[folder.root.path] = Date(); lock.unlock() }
         return folder
     }
 
@@ -99,9 +115,9 @@ final class ExternalDrives: ObservableObject {
         if let identity { try ExternalStorageIdentity.verify(identity, root: root) }
     }
 
-    static func nativeURL(_ relative: String, write: Bool = false) throws -> URL {
+    static func nativeURL(_ relative: String, write: Bool = false, cached: Bool = false) throws -> URL {
         _ = try ExternalStoragePath.components(relative)
-        guard let external = try externalRoot(for: relative) else { return MadeiraDock.drive.appendingPathComponent(relative) }
+        guard let external = try externalRoot(for: relative, cached: cached) else { return MadeiraDock.drive.appendingPathComponent(relative) }
         if write, try external.root.resourceValues(forKeys: [.volumeIsReadOnlyKey]).volumeIsReadOnly == true {
             throw CocoaError(.fileWriteVolumeReadOnly)
         }
@@ -148,10 +164,13 @@ final class ExternalDrives: ObservableObject {
     func refreshSteam() {
         let fm = FileManager.default
         var found: [String] = [], target: String?, missing: String?
+        var deepOnes: Set<String> = []          // libraries from the two-level search: kept out of the log loop below (no disk read)
+        loadDeepCacheOnce()
         for folder in folders {
             if folder.steamInstalls == true { target = "External/\(folder.name)/SteamLibrary/steamapps" }
             guard mounted[folder.id] != nil, Self.isConnected(folder.name) else {
                 if folder.steamInstalls == true { missing = folder.name }
+                deepCache[folder.id] = nil          // a drive that is not here has no libraries to keep
                 continue
             }
             if folder.steamInstalls == true {
@@ -168,9 +187,31 @@ final class ExternalDrives: ObservableObject {
                     found.append("External/\(folder.name)/" + apps)
                 }
             }
+            // The folder holds none of the usual libraries: a search one and two folders down for a real "steamapps"
+            // (a drive added from its root, or from a folder above Steam's) runs OFF the main thread; this pass only reads its
+            // kept result. env.MADEIRA_EXTERNAL_DEEP_SEARCH = 0 turns the search and its alert off.
+            // It runs for every folder (a library Madeira made itself, SteamLibrary, must not hide the others), and its result
+            // is kept until a newer successful search replaces it, so a refresh in between never drops those games.
+            if Self.deepSearchOn {
+                let cached = deepCache[folder.id]
+                if cached.map({ Date().timeIntervalSince($0.at) > Self.deepRecheckAfter }) ?? true { startDeepSearch(folder) }
+                let usual = found.filter { $0.hasPrefix("External/\(folder.name)/") }
+                for path in cached?.libraries ?? [] {
+                    let full = "External/\(folder.name)/" + path
+                    // Not one the usual places already gave, and not inside one of them.
+                    if usual.contains(where: { $0.caseInsensitiveCompare(full) == .orderedSame }) { continue }
+                    // A usual library at the folder's top (External/<name>/steamapps) is the one pair already allowed beside others.
+                    let rootDir = "External/\(folder.name)/".lowercased()
+                    if usual.contains(where: { u in
+                        let dir = String(u.dropLast("steamapps".count)).lowercased()
+                        return dir != rootDir && full.lowercased().hasPrefix(dir)
+                    }) { continue }
+                    found.append(full); deepOnes.insert(full)
+                }
+            }
         }
         // What each drive library holds, to tell a moved game's state from the log.
-        for library in found {
+        for library in found where !deepOnes.contains(library) {
             let apps = MadeiraDock.drive.appendingPathComponent(library)
             let records = ((try? fm.contentsOfDirectory(atPath: apps.path)) ?? []).filter { $0.hasPrefix("appmanifest_") }
             let folders = (try? fm.contentsOfDirectory(atPath: apps.appendingPathComponent("common").path)) ?? []
@@ -181,20 +222,176 @@ final class ExternalDrives: ObservableObject {
         LogStore.shared.log("[external] steam libraries=\(found.count) install=\(target ?? "drive_c")")
     }
 
-    /// Adds `C:\<folder>` entries for the libraries Valve's client does not list yet.
+    // MARK: Two-level Steam library search (off the main thread)
+
+    static var deepSearchOn: Bool { MadeiraConfig.flag("MADEIRA_EXTERNAL_DEEP_SEARCH", fallback: true) }
+    /// A search result is re-made (off the main thread, which also drops a library that went away) when it is older than this.
+    private static let deepRecheckAfter: TimeInterval = 20
+    /// Result of the last successful search per folder (libraries relative to the folder; empty = looked, found none).
+    /// A failed read never replaces it (a drive that is busy for a moment must not make its games vanish); it is dropped
+    /// when the folder is removed or unmounted.
+    private var deepCache: [UUID: (libraries: [String], at: Date)] = [:]
+    private var deepRunning: Set<UUID> = []
+    /// Folders just added whose "no Steam games" note has not been decided yet, and the ones already told (once each).
+    private var notePending: Set<UUID> = []
+    private var noteGiven: Set<UUID> = []
+
+    /// The last search results are kept in UserDefaults (no drive read), so the first scan after a launch already lists those
+    /// libraries; they count as old, so a new search starts at once and replaces them.
+    private static let deepKey = "madeiraExternalDeepLibraries.v1"
+    private var deepLoaded = false
+    private func loadDeepCacheOnce() {
+        guard !deepLoaded else { return }
+        deepLoaded = true
+        guard let stored = UserDefaults.standard.dictionary(forKey: Self.deepKey) as? [String: [String]] else { return }
+        for (key, libraries) in stored { if let id = UUID(uuidString: key) { deepCache[id] = (libraries, .distantPast) } }
+    }
+    private func saveDeepCache() {
+        var stored: [String: [String]] = [:]
+        for (id, value) in deepCache where !value.libraries.isEmpty { stored[id.uuidString] = value.libraries }
+        UserDefaults.standard.set(stored, forKey: Self.deepKey)
+    }
+
+    private func startDeepSearch(_ folder: ExternalFolder) {
+        guard !deepRunning.contains(folder.id) else { return }
+        deepRunning.insert(folder.id)
+        let id = folder.id, name = folder.name
+        let previous = deepCache[id]?.libraries ?? []
+        Task.detached(priority: .utility) { [weak self] in
+            let result = Self.deepSearch(name: name, previous: previous)
+            await MainActor.run { self?.finishDeepSearch(id: id, name: name, result: result) }
+        }
+    }
+
+    @MainActor private func finishDeepSearch(id: UUID, name: String, result: (libraries: [String], checked: Int, failed: Int)?) {
+        deepRunning.remove(id)
+        let decide = notePending.remove(id) != nil          // the note is decided once, by the first search that ends
+        guard folders.contains(where: { $0.id == id && $0.name == name }), mounted[id] != nil else { deepCache[id] = nil; return }
+        guard let result else {
+            // The drive could not be read at all: the last good result stays, and nothing is searched again before the next refresh.
+            LogStore.shared.log("[external] \(name): the two-level search could not read the drive; the last result is kept")
+            return
+        }
+        var libraries = result.libraries
+        if result.failed > 0 {
+            // Some folders could not be read: keep what was known before, so a library in one of them is not lost.
+            for old in deepCache[id]?.libraries ?? [] where !libraries.contains(old) { libraries.append(old) }
+        }
+        let before = deepCache[id]?.libraries
+        deepCache[id] = (libraries, Date())
+        saveDeepCache()
+        if before != libraries {
+            LogStore.shared.log("[external] \(name): two-level search for 'steamapps' looked in \(result.checked) places (\(result.failed) unreadable), found \(libraries.isEmpty ? "none" : libraries.joined(separator: ", "))")
+            refreshSteam()
+            SteamGamesModel.shared.refresh()
+        }
+        guard decide, libraries.isEmpty, result.failed == 0, !noteGiven.contains(id) else { return }
+        // After the picker and the Find games sheet have closed: an alert shown now can be dropped. Re-checked then.
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            guard Self.deepSearchOn, !self.noteGiven.contains(id),
+                  let folder = self.folders.first(where: { $0.id == id }), self.mounted[id] != nil,
+                  let cached = self.deepCache[id], cached.libraries.isEmpty,
+                  !Self.steamLibraries.contains(where: { $0.hasPrefix("External/\(folder.name)/") }) else { return }
+            self.noteGiven.insert(id)
+            self.steamNote = String(format: L("No Steam games found in '%@'. If your Steam games are on this drive, remove it and add the folder that contains 'steamapps'."), folder.name)
+        }
+    }
+
+    /// Words in a folder name that mark a copy rather than a live library.
+    private static let copyWords: Set<String> = ["backup", "backups", "bak", "old", "copy", "trash", "recycle", "archive", "archived"]
+    private static func looksLikeCopy(_ name: String) -> Bool {
+        name.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).contains { copyWords.contains(String($0)) }
+    }
+    /// Folders no library is looked for in (hidden, the recycle bin, system folders).
+    private static func skipped(_ name: String) -> Bool {
+        name.hasPrefix(".") || name.hasPrefix("$") || name.contains(":") || ["system volume information", "lost+found", "found.000", "common", "recovery"].contains(name.lowercased())
+    }
+
+    /// The libraries one and two folders below External/<name>, or nil when the folder itself cannot be read; a folder below that
+    /// cannot be read is skipped and counted in `failed`. Disk reads: off the main thread only.
+    /// A library is a plain Steam one: a folder called steamapps that holds a "common" folder and an appmanifest_*.acf, in a path
+    /// whose names do not say backup/old/copy/trash. Never a library and one inside it. No cap on how many folders are looked at.
+    nonisolated private static func deepSearch(name: String, previous: [String]) -> (libraries: [String], checked: Int, failed: Int)? {
+        let fm = FileManager.default
+        guard let root = try? nativeURL("External/\(name)"), let top = try? fm.contentsOfDirectory(atPath: root.path) else { return nil }
+        func folderNames(_ url: URL) -> [String]? {
+            guard let names = try? fm.contentsOfDirectory(atPath: url.path) else { return nil }
+            return names.sorted().filter { child in
+                var isDir: ObjCBool = false
+                return !skipped(child) && fm.fileExists(atPath: url.appendingPathComponent(child).path, isDirectory: &isDir) && isDir.boolValue
+            }
+        }
+        var libraries: [String] = [], checked = 0, failed = 0
+        for first in top.sorted() where !skipped(first) {
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: root.appendingPathComponent(first).path, isDirectory: &isDir), isDir.boolValue else { continue }
+            let seconds: [String] = folderNames(root.appendingPathComponent(first)) ?? { failed += 1; return [] }()
+            for path in [first + "/steamapps"] + seconds.map({ first + "/" + $0 + "/steamapps" }) {
+                checked += 1
+                if path.split(separator: "/").contains(where: { looksLikeCopy(String($0)) }) { continue }
+                let url = root.appendingPathComponent(path)
+                var apps: ObjCBool = false
+                guard fm.fileExists(atPath: url.path, isDirectory: &apps), apps.boolValue else { continue }
+                guard let inside = try? fm.contentsOfDirectory(atPath: url.path) else { failed += 1; continue }
+                var common: ObjCBool = false
+                guard inside.contains(where: { $0.hasPrefix("appmanifest_") && $0.hasSuffix(".acf") }),
+                      fm.fileExists(atPath: url.appendingPathComponent("common").path, isDirectory: &common), common.boolValue else { continue }
+                if libraries.contains(where: { path.hasPrefix($0.dropLast("steamapps".count)) }) { continue }
+                libraries.append(path)
+            }
+        }
+        // A library found last time and not now: it is dropped only when it is really gone. A stat that failed for another
+        // reason (the drive hiccuped) counts as unreadable, which keeps it.
+        for old in previous where !libraries.contains(old) {
+            do { _ = try fm.attributesOfItem(atPath: root.appendingPathComponent(old).path) }
+            catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { continue }
+            catch { failed += 1 }
+        }
+        return (libraries, checked, failed)
+    }
+
+    /// Adds `C:\<folder>` entries for the libraries Valve's client does not list yet, and
+    /// drops a leftover External entry above one of them (ExternalSteamLibraries.staleParents).
+    /// Both of the client's libraryfolders.vdf files are written: config/ is the one Valve's
+    /// client reads, steamapps/ its copy (the same pair Big Picture's ml2230 writes).
     private static func listInSteamClient(_ relative: [String]) {
         guard !relative.isEmpty else { return }
-        let vdf = MadeiraDock.drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot + "/steamapps/libraryfolders.vdf")
-        do {
-            let existing: Data?
-            do { existing = try Data(contentsOf: vdf) }
-            catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { existing = nil }
-            let paths = [SteamRuntimeFiles.relativeRoot] + relative
-            let data = try ExternalSteamLibraries.add(paths: paths, to: existing)
-            guard data != existing else { return }
-            try FileManager.default.createDirectory(at: vdf.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try data.write(to: vdf, options: .atomic)
-        } catch { LogStore.shared.log("[external] Steam library metadata was kept: \(error.localizedDescription)") }
+        let paths = [SteamRuntimeFiles.relativeRoot] + relative
+        // DJMAX RESPECT V (Sentry Nov 16, 0.2.26): a drive held a library at its top (SteamLibrary_Win) and Madeira's
+        // own one inside it (SteamLibrary_Win/SteamLibrary); both were written, but Valve's client later listed only the
+        // top one and the game in the inner one stopped with code 41. Log such pairs so the next report shows whether
+        // the client dropped the inner library (cause not proven).
+        // env.MADEIRA_EXTERNAL_NESTED_LOG = 0 turns the line off.
+        for outer in relative where MadeiraConfig.flag("MADEIRA_EXTERNAL_NESTED_LOG", fallback: true) {
+            for inner in relative where inner.hasPrefix(outer + "/") {
+                LogStore.shared.log("[external] nested libraries: C:\\\(outer.replacingOccurrences(of: "/", with: "\\")) holds C:\\\(inner.replacingOccurrences(of: "/", with: "\\")); both are listed in libraryfolders.vdf")
+            }
+        }
+        // Drive libraries: a leftover entry above a drive's Steam library (C:\External\steam
+        // when the games are in C:\External\steam\SteamLibrary) is removed from Steam's
+        // libraryfolders.vdf, so Valve's client lists the real library and Dock does not stop
+        // with code 41. 0 keeps every entry.
+        let prune = MadeiraConfig.flag("MADEIRA_EXTERNAL_PRUNE_PARENT_LIBRARIES", fallback: true)
+        // Drive libraries: Madeira also lists them in Steam's config/libraryfolders.vdf (the
+        // file Valve's client reads), when it exists, beside steamapps/libraryfolders.vdf.
+        // 0 writes steamapps/ only.
+        let subfolders = MadeiraConfig.flag("MADEIRA_EXTERNAL_STEAM_CONFIG_VDF", fallback: true) ? ["config", "steamapps"] : ["steamapps"]
+        for sub in subfolders {
+            let vdf = MadeiraDock.drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot + "/" + sub + "/libraryfolders.vdf")
+            do {
+                let existing: Data?
+                do { existing = try Data(contentsOf: vdf) }
+                catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { existing = nil }
+                // config/ is Valve's own: only an existing one is updated, never created.
+                if sub == "config" && existing == nil { continue }
+                let data = try ExternalSteamLibraries.add(paths: paths, to: existing, pruneParents: prune)
+                guard data != existing else { continue }
+                try FileManager.default.createDirectory(at: vdf.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try data.write(to: vdf, options: .atomic)
+                LogStore.shared.log("[external] \(sub)/libraryfolders.vdf updated (libraries=\(relative.count) prune=\(prune ? 1 : 0))")
+            } catch { LogStore.shared.log("[external] Steam \(sub) library metadata was kept: \(error.localizedDescription)") }
+        }
     }
 
     /// "External/<name>/..." -> "<name>", or nil for drive_c.
@@ -258,6 +455,8 @@ final class ExternalDrives: ObservableObject {
             mounted[folder.id] = url
         } catch { url.stopAccessingSecurityScopedResource(); throw error }
         publishOpened()
+        // The two-level search (off the main thread) decides, when it ends, whether this folder gets a "no Steam games" note.
+        if Self.deepSearchOn { notePending.insert(folder.id) }
         refreshSteam()
         LogStore.shared.log("[external] added \(letter.uppercased()): \(name) -> \(url.path)")
     }
@@ -267,7 +466,7 @@ final class ExternalDrives: ObservableObject {
     @MainActor func remove(_ id: UUID) {
         guard let folder = folders.first(where: { $0.id == id }) else { return }
         guard wine_process_is_running() == 0, GameMover.shared.moving == nil,
-              !SteamOwnedLibrary.shared.hasStorageWork else {
+              SteamOwnedLibrary.shared.moveBlocker("external") == nil else {
             LogStore.shared.log("[external] drive kept while a game, download or cloud operation uses storage")
             return
         }
@@ -280,6 +479,7 @@ final class ExternalDrives: ObservableObject {
         }
         unlink(folder)
         mounted.removeValue(forKey: id)?.stopAccessingSecurityScopedResource()
+        deepCache[id] = nil; notePending.remove(id); saveDeepCache()
         publishOpened()
         refreshSteam()
         Task { @MainActor in SteamGamesModel.shared.refresh() }
@@ -429,6 +629,14 @@ struct ExternalDrivesSection: View {
     @State private var removing: ExternalFolder?
 
     var body: some View {
+        Group {
+            // The dialogs and the sheet go on ONE view (a modifier on the Group would attach them to both).
+            drivesSection.batchMoveDialogs()
+            BatchMoveSection()      // BatchMove.swift: Move Games… and Move All Games to <drive>…
+        }
+    }
+
+    private var drivesSection: some View {
         Section {
             ForEach(drives.folders) { folder in
                 HStack {
@@ -504,7 +712,7 @@ struct ExternalDrivesSection: View {
     func move(_ entry: LibraryEntry, toSteamLibrary target: String? = nil, toRoot root: String? = nil) async throws -> LibraryEntry {
         guard moving == nil else { throw Failure(errorDescription: "Another game is being moved.") }
         guard wine_process_is_running() == 0 else { throw Failure(errorDescription: "Close the running game first.") }
-        guard !SteamOwnedLibrary.shared.hasStorageWork else { throw Failure(errorDescription: "Wait for downloads and cloud operations to finish.") }
+        guard SteamOwnedLibrary.shared.moveBlocker("move", scoped: true, appID: entry.steamAppID) == nil else { throw Failure(errorDescription: "Wait for downloads and cloud operations to finish.") }
         var entry = entry
         var items: [(from: URL, to: URL)] = []
         var newPath: String
@@ -512,6 +720,10 @@ struct ExternalDrivesSection: View {
             guard SteamOwnedLibrary.shared.downloads[appID] == nil else { throw Failure(errorDescription: "Wait for the download to finish or cancel it first.") }
             guard let target, let game = SteamGamesModel.shared.games.first(where: { $0.id == appID }) else {
                 throw Failure(errorDescription: "Steam does not list this game as installed.")
+            }
+            // An empty name or one of only spaces, dots and slashes would point at the whole "common" folder.
+            guard !game.installDir.trimmingCharacters(in: CharacterSet(charactersIn: " \t\r\n./\\")).isEmpty else {
+                throw Failure(errorDescription: "This game's Steam install record has no usable folder name, so it was not moved.")
             }
             guard game.library.caseInsensitiveCompare(target) != .orderedSame else { return entry }
             guard SteamInstallPaths.isManaged(library: target) else { throw ExternalStorageError.invalidRecord }
@@ -635,15 +847,35 @@ struct ExternalDrivesSection: View {
                     guard copied == size else { throw Failure(errorDescription: "The copy of \(file.lastPathComponent) does not match.") }
                 }
             }
-            // Check the whole copy before anything is deleted.
+            // Check the whole copy before anything is deleted. Both sides are listed by
+            // path relative to their own folder (no shared path prefix to mismatch, such
+            // as /private/var vs /var through the drive's link) and by Unicode-normalized
+            // name, so a drive that stores names in another form is not a false mismatch.
             for (index, item) in items.enumerated() {
-                func listing(_ list: [(URL, Int64)], base: URL) -> [String: Int64] {
-                    Dictionary(list.map { (String($0.0.path.dropFirst(base.path.count)), $0.1) }, uniquingKeysWith: { a, _ in a })
+                func tree(_ root: URL) -> [String: Int64] {
+                    var out: [String: Int64] = [:], isDir: ObjCBool = false
+                    guard fm.fileExists(atPath: root.path, isDirectory: &isDir) else { return out }
+                    func size(_ path: String) -> Int64 { ((try? fm.attributesOfItem(atPath: path))?[.size] as? NSNumber)?.int64Value ?? -1 }
+                    if !isDir.boolValue { out[""] = size(root.path); return out }
+                    guard let walker = fm.enumerator(atPath: root.path) else { return out }
+                    while let relative = walker.nextObject() as? String {
+                        let full = root.appendingPathComponent(relative).path
+                        guard (try? fm.attributesOfItem(atPath: full))?[.type] as? FileAttributeType == .typeRegular else { continue }
+                        out[relative.precomposedStringWithCanonicalMapping] = size(full)
+                    }
+                    return out
                 }
-                let copied = listing(files(item.to), base: item.to)
+                let copied = tree(item.to)
                 // The original is listed again, in case it changed or was only partly read.
-                let original = listing(files(item.from), base: item.from)
-                guard failure == nil, copied == original, original == listing(sources[index], base: item.from) else {
+                let original = tree(item.from)
+                guard copied == original, original.count == sources[index].count else {
+                    let missing = original.keys.filter { copied[$0] == nil }.sorted()
+                    let extra = copied.keys.filter { original[$0] == nil }.sorted()
+                    let sizes = original.keys.filter { copied[$0] != nil && copied[$0] != original[$0] }.sorted()
+                    LogStore.shared.log("[move] check failed for \(item.from.lastPathComponent): copy \(copied.count) files, original \(original.count), first listing \(sources[index].count); missing \(missing.count) extra \(extra.count) size-differs \(sizes.count)")
+                    for name in missing.prefix(5) { LogStore.shared.log("[move] check: missing from the copy: \(name) (\(original[name] ?? -1) bytes)") }
+                    for name in extra.prefix(5) { LogStore.shared.log("[move] check: only in the copy: \(name) (\(copied[name] ?? -1) bytes)") }
+                    for name in sizes.prefix(5) { LogStore.shared.log("[move] check: size differs: \(name) copy \(copied[name] ?? -1) original \(original[name] ?? -1)") }
                     throw Failure(errorDescription: "The copy is incomplete (\(copied.count) of \(original.count) files).")
                 }
             }
@@ -748,51 +980,99 @@ extension URL {
 /// identifier "<bundle id>.download.move" is covered by Info.plist's
 /// `.download.*` entry.
 @MainActor final class MoveBackground {
-    static let shared = MoveBackground()
+    static let shared = MoveBackground(suffix: "move")
+    /// The batch uninstall's task ("<bundle id>.download.uninstall"); the batch
+    /// move uses `shared` too, held across its games with batchStarted.
+    static let uninstall = MoveBackground(suffix: "uninstall")
+    private let suffix: String
+    private init(suffix: String) { self.suffix = suffix }
     private var task: AnyObject?
     private var registered = false
     private var title = ""
     private var fraction = 0.0
+    /// A batch holds the task from its first game to its last: one game ending
+    /// does not end it, so it is not lost when Madeira is in the background.
+    private var batch = false
+    private var batchDone = 0
+    private var batchTotal = 1
+    private var onExpire: (@MainActor () -> Void)?
+    private var tag: String { suffix == "move" ? "move" : "batch-" + suffix }
 
     private var identifier: String? {
         let permitted = Bundle.main.object(forInfoDictionaryKey: "BGTaskSchedulerPermittedIdentifiers") as? [String] ?? []
-        return permitted.first { $0.hasSuffix(".download.*") }.map { String($0.dropLast()) + "move" }
+        return permitted.first { $0.hasSuffix(".download.*") }.map { String($0.dropLast()) + suffix }
     }
 
     func started(_ name: String) {
-        title = "Moving \(name)"; fraction = 0
+        guard !batch else { return }
+        begin("Moving \(name)")
+    }
+
+    /// `onExpire` runs if iOS ends the task (or the user stops it from the system UI): the batch stops after its current game.
+    func batchStarted(_ name: String, total: Int, onExpire: (@MainActor () -> Void)? = nil) {
+        batch = true; batchDone = 0; batchTotal = max(1, total); self.onExpire = onExpire
+        begin(name)
+    }
+
+    /// The batch moved on: `done` games are finished; `title` names the next.
+    func batchStep(done: Int, title: String) {
+        batchDone = done; self.title = title
+        fraction = Double(done) / Double(batchTotal)
+        if #available(iOS 26.0, *), let task = task as? BGContinuedProcessingTask {
+            task.progress.completedUnitCount = Int64(min(1, fraction) * 1000)
+            task.updateTitle(title, subtitle: "Madeira")
+        }
+    }
+
+    func batchEnded() {
+        batch = false
+        onExpire = nil
+        finish()
+    }
+
+    private func begin(_ newTitle: String) {
+        title = newTitle; fraction = 0
         guard #available(iOS 26.0, *), let identifier else { return }
         if !registered {
             registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: .main) { [weak self] task in
                 guard let task = task as? BGContinuedProcessingTask else { task.setTaskCompleted(success: false); return }
                 MainActor.assumeIsolated { self?.attach(task) }
             }
-            guard registered else { LogStore.shared.log("[move] background task refused"); return }
+            guard registered else { LogStore.shared.log("[\(tag)] background task refused"); return }
         }
         let request = BGContinuedProcessingTaskRequest(identifier: identifier, title: title, subtitle: "Madeira")
         request.strategy = .fail
-        do { try BGTaskScheduler.shared.submit(request) } catch { LogStore.shared.log("[move] background task not submitted") }
+        do { try BGTaskScheduler.shared.submit(request) } catch { LogStore.shared.log("[\(tag)] background task not submitted") }
     }
 
     @available(iOS 26.0, *)
     private func attach(_ task: BGContinuedProcessingTask) {
-        guard GameMover.shared.moving != nil else { task.setTaskCompleted(success: true); return }
+        guard batch || GameMover.shared.moving != nil else { task.setTaskCompleted(success: true); return }
         self.task = task
         task.progress.totalUnitCount = 1000
         task.progress.completedUnitCount = Int64(fraction * 1000)
         task.updateTitle(title, subtitle: "Madeira")
-        task.expirationHandler = { LogStore.shared.log("[move] background time ended") }
+        let tag = self.tag, expire = onExpire
+        task.expirationHandler = {
+            LogStore.shared.log("[\(tag)] background time ended")
+            Task { @MainActor in expire?() }
+        }
     }
 
     func progress(_ value: Double) {
-        fraction = value
+        fraction = batch ? (Double(batchDone) + min(1, value)) / Double(batchTotal) : value
         if #available(iOS 26.0, *), let task = task as? BGContinuedProcessingTask {
-            task.progress.completedUnitCount = Int64(min(1, value) * 1000)
-            task.updateTitle(title, subtitle: "\(Int(min(1, value) * 100))% · Madeira")
+            task.progress.completedUnitCount = Int64(min(1, fraction) * 1000)
+            task.updateTitle(title, subtitle: "\(Int(min(1, fraction) * 100))% · Madeira")
         }
     }
 
     func ended() {
+        guard !batch else { return }
+        finish()
+    }
+
+    private func finish() {
         if #available(iOS 26.0, *), let task = task as? BGContinuedProcessingTask { task.setTaskCompleted(success: true) }
         task = nil
     }
